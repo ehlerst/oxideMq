@@ -1,0 +1,4 @@
+FROM maven:3.9-eclipse-temurin-17-alpine
+WORKDIR /app
+COPY target/client-runner.jar /app/client-runner.jar
+ENTRYPOINT ["java", "-jar", "/app/client-runner.jar"]

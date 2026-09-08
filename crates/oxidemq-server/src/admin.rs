@@ -138,6 +138,10 @@ mod tests {
 
     #[tokio::test]
     async fn test_admin_router_routes() {
+        use axum::body::Body;
+        use axum::http::{Request, StatusCode};
+        use tower::ServiceExt;
+
         let wal = Arc::new(MemoryWal::new());
         let storage = Arc::new(MemoryObjectStorage::new());
         let log_cache = Arc::new(LogCache::new(1024 * 1024));
@@ -161,7 +165,181 @@ mod tests {
             start_time: Instant::now(),
         };
 
-        let _router = create_admin_router(app_state);
-        // Router created successfully with all routes registered
+        let app = create_admin_router(app_state.clone());
+
+        // GET /
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // GET /ui
+        let res = app
+            .clone()
+            .oneshot(Request::builder().uri("/ui").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // GET /_oxidemq/health
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/_oxidemq/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // GET /_oxidemq/version
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/_oxidemq/version")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // GET /_oxidemq/status
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/_oxidemq/status")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // GET /_oxidemq/state/dump
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/_oxidemq/state/dump")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // POST /_oxidemq/state/reset
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_oxidemq/state/reset")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // POST /_oxidemq/state/load
+        let snapshot = ClusterStateSnapshot {
+            cluster_id: "test-cluster".into(),
+            node_id: 1,
+            partitions: vec![],
+            consumer_groups: vec![],
+            timestamp_ms: 123456789,
+        };
+        let snapshot_json = serde_json::to_string(&snapshot).unwrap();
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_oxidemq/state/load")
+                    .header("content-type", "application/json")
+                    .body(Body::from(snapshot_json))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // POST /_oxidemq/chaos/rules
+        let rule = json!({
+            "id": "chaos-1",
+            "target": "Produce",
+            "latency_ms": 10,
+            "error_probability": 0.0,
+            "error_message": null
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_oxidemq/chaos/rules")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&rule).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // GET /_oxidemq/chaos/rules
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/_oxidemq/chaos/rules")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // POST /_oxidemq/chaos/clear
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_oxidemq/chaos/clear")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+
+        // POST /_oxidemq/advertised
+        let adv = json!({
+            "host": "broker.example.com",
+            "port": 9094
+        });
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/_oxidemq/advertised")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_string(&adv).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(app_state.cluster_state.host(), "broker.example.com");
+        assert_eq!(app_state.cluster_state.port(), 9094);
     }
 }

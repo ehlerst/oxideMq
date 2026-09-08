@@ -205,10 +205,12 @@ mod tests {
         let list_header = RequestHeader::new(ApiKey::ListOffsets, 0, 4, Some("client-app"));
         let list_req = ListOffsetsRequest {
             replica_id: -1,
+            isolation_level: 0,
             topics: vec![ListOffsetsTopic {
                 topic: "orders".to_string(),
                 partitions: vec![ListOffsetsPartition {
                     partition: 0,
+                    current_leader_epoch: -1,
                     timestamp: -1,
                 }],
             }],

@@ -109,4 +109,29 @@ mod tests {
         let decoded = ResponseHeader::decode(&mut read_buf).unwrap();
         assert_eq!(decoded, header);
     }
+
+    #[test]
+    fn test_header_errors_and_edge_cases() {
+        let mut short_req = Bytes::from_static(&[0x00, 0x01, 0x00]);
+        assert!(RequestHeader::decode(&mut short_req).is_err());
+
+        let mut bad_key =
+            Bytes::from_static(&[0xFF, 0xFF, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0xFF, 0xFF]);
+        assert!(RequestHeader::decode(&mut bad_key).is_err());
+
+        // ApiVersions v3 with tagged buffer
+        let mut api_versions_v3 = BytesMut::new();
+        api_versions_v3.put_i16(18); // ApiKey::ApiVersions
+        api_versions_v3.put_i16(3); // version 3
+        api_versions_v3.put_i32(100);
+        KafkaEncoder::write_string(&mut api_versions_v3, Some("client"));
+        KafkaEncoder::write_unsigned_varint(&mut api_versions_v3, 0); // 0 tagged fields
+        let mut buf = api_versions_v3.freeze();
+        let hdr = RequestHeader::decode(&mut buf).unwrap();
+        assert_eq!(hdr.api_key, ApiKey::ApiVersions);
+        assert_eq!(hdr.api_version, 3);
+
+        let mut short_resp = Bytes::from_static(&[0x00, 0x01]);
+        assert!(ResponseHeader::decode(&mut short_resp).is_err());
+    }
 }

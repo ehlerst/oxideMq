@@ -286,5 +286,48 @@ mod tests {
             retryable.get_object("test-key").unwrap(),
             Bytes::from_static(b"resilient-payload")
         );
+
+        // Test other operations delegated by RetryableObjectStorage
+        let range = retryable.get_object_range("test-key", 0, 8).unwrap();
+        assert_eq!(range.as_ref(), b"resilient");
+
+        let list = retryable.list_objects("test").unwrap();
+        assert_eq!(list.len(), 1);
+
+        retryable.delete_object("test-key").unwrap();
+        assert!(retryable.get_object("test-key").is_err());
+
+        // Batch delete via retryable
+        let storage = MemoryObjectStorage::new();
+        storage.put_object("k1", Bytes::from_static(b"v1")).unwrap();
+        storage.put_object("k2", Bytes::from_static(b"v2")).unwrap();
+        assert_eq!(storage.bytes_stored.load(Ordering::Relaxed), 4);
+        assert_eq!(storage.get_count(), 0);
+
+        let retryable2 = RetryableObjectStorage::new(storage, 2, 1);
+        retryable2
+            .delete_objects(&["k1".into(), "k2".into()])
+            .unwrap();
+        let remaining = retryable2.list_objects("").unwrap();
+        assert!(remaining.is_empty());
+
+        // MemoryObjectStorage clear & out of bounds range
+        let mem = MemoryObjectStorage::new();
+        mem.put_object("small", Bytes::from_static(b"12345"))
+            .unwrap();
+        let oob_range = mem.get_object_range("small", 10, 20).unwrap();
+        assert!(oob_range.is_empty());
+        mem.clear();
+        assert_eq!(mem.bytes_stored.load(Ordering::Relaxed), 0);
+
+        // Permanent error through retryable
+        let failing_perm = FailingStorage {
+            failures_remaining: std::sync::atomic::AtomicUsize::new(10),
+            inner: MemoryObjectStorage::new(),
+        };
+        let retryable_exhaust = RetryableObjectStorage::new(failing_perm, 1, 1);
+        assert!(retryable_exhaust
+            .put_object("k", Bytes::from_static(b"v"))
+            .is_err());
     }
 }

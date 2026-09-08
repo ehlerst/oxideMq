@@ -2,12 +2,36 @@ use bytes::{Bytes, BytesMut};
 use std::alloc::{alloc, dealloc, Layout};
 use std::ops::{Deref, DerefMut};
 
-/// Calculate CRC32C using hardware-accelerated instructions where available.
+const CRC32C_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let poly = 0x82F63B78;
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut j = 0;
+        while j < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ poly;
+            } else {
+                crc >>= 1;
+            }
+            j += 1;
+        }
+        table[i] = crc;
+        i += 1;
+    }
+    table
+};
+
+/// Calculate CRC32C (Castagnoli) using the standard Kafka polynomial 0x1EDC6F41 (reversed 0x82F63B78).
 #[inline]
 pub fn compute_crc32c(data: &[u8]) -> u32 {
-    let mut hasher = crc32fast::Hasher::new();
-    hasher.update(data);
-    hasher.finalize()
+    let mut crc = 0xFFFFFFFFu32;
+    for &b in data {
+        let index = ((crc ^ (b as u32)) & 0xFF) as usize;
+        crc = (crc >> 8) ^ CRC32C_TABLE[index];
+    }
+    crc ^ 0xFFFFFFFF
 }
 
 /// An aligned memory buffer suitable for Linux `O_DIRECT` raw device I/O.
@@ -167,6 +191,7 @@ mod tests {
 
     #[test]
     fn test_crc32c() {
+        assert_eq!(compute_crc32c(b"123456789"), 0xE3069283);
         let data = b"oxideMq-streaming-storage";
         let crc1 = compute_crc32c(data);
         let crc2 = compute_crc32c(data);
@@ -179,19 +204,56 @@ mod tests {
         let mut buf = AlignedBuffer::with_default_alignment(8192);
         assert_eq!(buf.capacity() % 4096, 0);
         assert_eq!((buf.as_ptr() as usize) % 4096, 0);
+        assert!(buf.is_empty());
+        assert_eq!(buf.len(), 0);
 
         let test_data = b"hello direct io world";
         assert!(buf.extend_from_slice(test_data));
+        assert!(!buf.is_empty());
+        assert_eq!(buf.len(), test_data.len());
         assert_eq!(&buf[..], test_data);
         assert_eq!(buf.to_bytes().as_ref(), test_data);
+
+        // Mutate through DerefMut
+        buf[0] = b'H';
+        assert_eq!(&buf[0..1], b"H");
+
+        // Pointer manipulation
+        assert!(!buf.as_mut_ptr().is_null());
+        unsafe {
+            buf.set_len(5);
+        }
+        assert_eq!(buf.len(), 5);
+        assert_eq!(&buf[..], b"Hello");
+
+        buf.clear();
+        assert!(buf.is_empty());
+
+        // Capacity overflow
+        let large = vec![0u8; buf.capacity() + 1];
+        assert!(!buf.extend_from_slice(&large));
     }
 
     #[test]
     fn test_byte_accumulator() {
         let mut acc = ByteAccumulator::with_capacity(64);
+        assert!(acc.is_empty());
         acc.extend_from_slice(b"record-batch-1");
+        assert_eq!(acc.len(), 14);
+        assert!(!acc.is_empty());
         let frozen = acc.freeze();
         assert_eq!(frozen.as_ref(), b"record-batch-1");
         assert_eq!(acc.len(), 0);
+        assert!(acc.is_empty());
+
+        let default_acc = ByteAccumulator::default();
+        assert!(default_acc.is_empty());
+    }
+
+    #[test]
+    fn test_slice_range() {
+        let b = Bytes::from_static(b"0123456789");
+        let sliced = slice_range(&b, 2, 4);
+        assert_eq!(sliced.as_ref(), b"2345");
     }
 }

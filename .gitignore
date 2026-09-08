@@ -9,3 +9,4 @@ target/
 .idea/
 .vscode/
 docker-bin/
+dependency-reduced-pom.xml

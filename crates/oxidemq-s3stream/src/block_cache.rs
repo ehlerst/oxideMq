@@ -142,5 +142,25 @@ mod tests {
         assert_eq!(cache.get(&k2), None);
         assert!(cache.get(&k1).is_some());
         assert!(cache.get(&k3).is_some());
+
+        assert!(cache.hit_count() > 0);
+        assert!(cache.miss_count() > 0);
+        assert!(cache.current_size_bytes() <= 50);
+
+        // Overwriting existing key
+        cache.put(k1.clone(), Bytes::from(vec![9u8; 20]));
+        assert_eq!(cache.get(&k1).unwrap().len(), 20);
+
+        // Oversized entry evicts previous entries
+        let huge = Bytes::from(vec![0u8; 100]);
+        cache.put(BlockKey::new("huge", 1, 0), huge);
+        assert!(cache.get(&BlockKey::new("huge", 1, 0)).is_some());
+        assert_eq!(cache.get(&k1), None);
+        assert_eq!(cache.get(&k3), None);
+
+        // Clear
+        cache.clear();
+        assert_eq!(cache.current_size_bytes(), 0);
+        assert_eq!(cache.get(&k1), None);
     }
 }

@@ -268,5 +268,36 @@ mod tests {
         // 5. Leave group
         let leave_err = coord.handle_leave_group("analytics-group", &member_id);
         assert_eq!(leave_err, KafkaErrorCode::None);
+
+        // Error code checks
+        assert_eq!(
+            coord.handle_heartbeat("unknown-group", gen, &member_id),
+            KafkaErrorCode::InvalidGroupId
+        );
+        assert_eq!(
+            coord.handle_heartbeat("analytics-group", 999, &member_id),
+            KafkaErrorCode::IllegalGeneration
+        );
+        assert_eq!(
+            coord.handle_heartbeat("analytics-group", gen, "non-member"),
+            KafkaErrorCode::UnknownMemberId
+        );
+        assert_eq!(
+            coord.handle_leave_group("unknown-group", &member_id),
+            KafkaErrorCode::InvalidGroupId
+        );
+        let (sync_err, _) =
+            coord.handle_sync_group("unknown-group", gen, &member_id, HashMap::new());
+        assert_eq!(sync_err, KafkaErrorCode::InvalidGroupId);
+        assert_eq!(coord.fetch_offset("unknown-group", &tp), None);
+
+        // Group snapshots and count
+        assert_eq!(coord.group_count(), 1);
+        let snaps = coord.dump_group_snapshots();
+        assert_eq!(snaps.len(), 1);
+        assert_eq!(snaps[0].group_id, "analytics-group");
+
+        coord.reset();
+        assert_eq!(coord.group_count(), 0);
     }
 }

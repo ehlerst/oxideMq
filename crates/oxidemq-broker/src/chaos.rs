@@ -167,9 +167,33 @@ mod tests {
 
         // Disable chaos
         chaos.set_enabled(false);
+        assert!(!chaos.is_enabled());
         assert!(chaos.check_fault(FaultTarget::Wal).is_ok());
+
+        chaos.set_enabled(true);
+        assert!(chaos.is_enabled());
+
+        // Remove rule
+        chaos.remove_rule("fail-wal");
+        assert_eq!(chaos.list_rules().len(), 1);
+
+        // Update rule with same id
+        chaos.add_rule(ChaosRule {
+            id: "slow-s3".to_string(),
+            target: FaultTarget::S3Storage,
+            latency_ms: 100,
+            error_probability: 0.5,
+            error_message: None,
+        });
+        assert_eq!(chaos.list_rules().len(), 1);
+
+        // Check fault with 0.5 probability (may return error or latency)
+        let _ = chaos.check_fault(FaultTarget::S3Storage);
 
         chaos.clear_rules();
         assert_eq!(chaos.list_rules().len(), 0);
+
+        let default_chaos = ChaosEngine::default();
+        assert!(default_chaos.is_enabled());
     }
 }

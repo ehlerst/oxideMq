@@ -66,12 +66,12 @@ impl ApiVersionsResponse {
             ApiVersionKey {
                 api_key: 1,
                 min_version: 0,
-                max_version: 11,
+                max_version: 6,
             }, // Fetch
             ApiVersionKey {
                 api_key: 2,
                 min_version: 0,
-                max_version: 6,
+                max_version: 5,
             }, // ListOffsets
             ApiVersionKey {
                 api_key: 3,
@@ -81,22 +81,22 @@ impl ApiVersionsResponse {
             ApiVersionKey {
                 api_key: 8,
                 min_version: 0,
-                max_version: 7,
+                max_version: 2,
             }, // OffsetCommit
             ApiVersionKey {
                 api_key: 9,
                 min_version: 0,
-                max_version: 7,
+                max_version: 5,
             }, // OffsetFetch
             ApiVersionKey {
                 api_key: 10,
                 min_version: 0,
-                max_version: 3,
+                max_version: 2,
             }, // FindCoordinator
             ApiVersionKey {
                 api_key: 11,
                 min_version: 0,
-                max_version: 8,
+                max_version: 5,
             }, // JoinGroup
             ApiVersionKey {
                 api_key: 12,
@@ -106,12 +106,12 @@ impl ApiVersionsResponse {
             ApiVersionKey {
                 api_key: 13,
                 min_version: 0,
-                max_version: 4,
+                max_version: 3,
             }, // LeaveGroup
             ApiVersionKey {
                 api_key: 14,
                 min_version: 0,
-                max_version: 4,
+                max_version: 3,
             }, // SyncGroup
             ApiVersionKey {
                 api_key: 18,
@@ -893,6 +893,7 @@ impl FindCoordinatorResponse {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListOffsetsPartition {
     pub partition: i32,
+    pub current_leader_epoch: i32,
     pub timestamp: i64,
 }
 
@@ -905,12 +906,14 @@ pub struct ListOffsetsTopic {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListOffsetsRequest {
     pub replica_id: i32,
+    pub isolation_level: i8,
     pub topics: Vec<ListOffsetsTopic>,
 }
 
 impl ListOffsetsRequest {
-    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
         let replica_id = src.get_i32();
+        let isolation_level = if version >= 2 { src.get_i8() } else { 0 };
         let topic_count = src.get_i32() as usize;
         let mut topics = Vec::with_capacity(topic_count);
         for _ in 0..topic_count {
@@ -919,25 +922,37 @@ impl ListOffsetsRequest {
             let mut partitions = Vec::with_capacity(p_count);
             for _ in 0..p_count {
                 let partition = src.get_i32();
+                let current_leader_epoch = if version >= 4 { src.get_i32() } else { -1 };
                 let timestamp = src.get_i64();
                 partitions.push(ListOffsetsPartition {
                     partition,
+                    current_leader_epoch,
                     timestamp,
                 });
             }
             topics.push(ListOffsetsTopic { topic, partitions });
         }
-        Ok(Self { replica_id, topics })
+        Ok(Self {
+            replica_id,
+            isolation_level,
+            topics,
+        })
     }
 
-    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
         dst.put_i32(self.replica_id);
+        if version >= 2 {
+            dst.put_i8(self.isolation_level);
+        }
         dst.put_i32(self.topics.len() as i32);
         for t in &self.topics {
             KafkaEncoder::write_string(dst, Some(&t.topic));
             dst.put_i32(t.partitions.len() as i32);
             for p in &t.partitions {
                 dst.put_i32(p.partition);
+                if version >= 4 {
+                    dst.put_i32(p.current_leader_epoch);
+                }
                 dst.put_i64(p.timestamp);
             }
         }
@@ -950,6 +965,7 @@ pub struct ListOffsetsPartitionResponse {
     pub error_code: KafkaErrorCode,
     pub timestamp: i64,
     pub offset: i64,
+    pub leader_epoch: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -978,6 +994,9 @@ impl ListOffsetsResponse {
                 dst.put_i16(p.error_code.code());
                 dst.put_i64(p.timestamp);
                 dst.put_i64(p.offset);
+                if version >= 4 {
+                    dst.put_i32(p.leader_epoch);
+                }
             }
         }
     }
@@ -995,11 +1014,13 @@ impl ListOffsetsResponse {
                 let error_code = KafkaErrorCode::from_i16(src.get_i16());
                 let timestamp = src.get_i64();
                 let offset = src.get_i64();
+                let leader_epoch = if version >= 4 { src.get_i32() } else { -1 };
                 partitions.push(ListOffsetsPartitionResponse {
                     partition,
                     error_code,
                     timestamp,
                     offset,
+                    leader_epoch,
                 });
             }
             topics.push(ListOffsetsTopicResponse { topic, partitions });
@@ -1399,5 +1420,388 @@ impl LeaveGroupResponse {
             throttle_time_ms,
             error_code,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_api_versions_codec() {
+        let req = ApiVersionsRequest {
+            client_software_name: Some("test-client".into()),
+            client_software_version: Some("1.0.0".into()),
+        };
+        for v in [0, 1, 3] {
+            let mut buf = BytesMut::new();
+            req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = ApiVersionsRequest::decode(&mut read_buf, v).unwrap();
+            if v >= 3 {
+                assert_eq!(decoded.client_software_name, req.client_software_name);
+            }
+        }
+
+        let resp = ApiVersionsResponse::default_supported();
+        for v in [0, 1, 3] {
+            let mut buf = BytesMut::new();
+            resp.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = ApiVersionsResponse::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.error_code, KafkaErrorCode::None);
+            assert_eq!(decoded.api_keys.len(), resp.api_keys.len());
+        }
+    }
+
+    #[test]
+    fn test_metadata_codec() {
+        let req = MetadataRequest {
+            topics: Some(vec!["topic-a".into(), "topic-b".into()]),
+            allow_auto_topic_creation: true,
+        };
+        let mut buf = BytesMut::new();
+        req.encode(&mut buf, 1);
+        let mut read_buf = buf.freeze();
+        let decoded = MetadataRequest::decode(&mut read_buf, 1).unwrap();
+        assert_eq!(decoded.topics, req.topics);
+
+        let resp = MetadataResponse {
+            throttle_time_ms: 10,
+            brokers: vec![BrokerMetadata {
+                node_id: 1,
+                host: "localhost".into(),
+                port: 9092,
+                rack: Some("rack-1".into()),
+            }],
+            cluster_id: Some("cluster-xyz".into()),
+            controller_id: 1,
+            topics: vec![TopicMetadata {
+                error_code: KafkaErrorCode::None,
+                name: "topic-a".into(),
+                is_internal: false,
+                partitions: vec![PartitionMetadata {
+                    error_code: KafkaErrorCode::None,
+                    partition_index: 0,
+                    leader_id: 1,
+                    leader_epoch: 1,
+                    replica_nodes: vec![1],
+                    isr_nodes: vec![1],
+                }],
+            }],
+        };
+
+        for v in [1, 3, 5] {
+            let mut b = BytesMut::new();
+            resp.encode(&mut b, v);
+            let mut r = b.freeze();
+            let dec = MetadataResponse::decode(&mut r, v).unwrap();
+            assert_eq!(dec.brokers.len(), 1);
+            assert_eq!(dec.topics.len(), 1);
+            assert_eq!(dec.topics[0].partitions.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_produce_codec() {
+        let req = ProduceRequest {
+            acks: 1,
+            timeout_ms: 5000,
+            topic_data: vec![TopicProduceData {
+                topic: "test-topic".into(),
+                partitions: vec![PartitionProduceData {
+                    partition: 0,
+                    records: Bytes::from_static(b"fake-record-batch"),
+                }],
+            }],
+        };
+
+        for v in [2, 3, 7] {
+            let mut buf = BytesMut::new();
+            req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = ProduceRequest::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.acks, req.acks);
+            assert_eq!(decoded.topic_data.len(), 1);
+            assert_eq!(
+                decoded.topic_data[0].partitions[0].records,
+                Bytes::from_static(b"fake-record-batch")
+            );
+        }
+
+        let resp = ProduceResponse {
+            responses: vec![TopicProduceResponse {
+                topic: "test-topic".into(),
+                partitions: vec![PartitionProduceResponse {
+                    partition: 0,
+                    error_code: KafkaErrorCode::None,
+                    base_offset: 100,
+                    log_append_time_ms: 123456789,
+                    log_start_offset: 0,
+                }],
+            }],
+            throttle_time_ms: 5,
+        };
+
+        for v in [2, 5, 7] {
+            let mut buf = BytesMut::new();
+            resp.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = ProduceResponse::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.responses.len(), 1);
+            assert_eq!(decoded.responses[0].partitions[0].base_offset, 100);
+        }
+    }
+
+    #[test]
+    fn test_fetch_codec() {
+        let req = FetchRequest {
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1048576,
+            topics: vec![FetchTopic {
+                topic: "topic-1".into(),
+                partitions: vec![FetchPartition {
+                    partition: 0,
+                    fetch_offset: 50,
+                    partition_max_bytes: 65536,
+                }],
+            }],
+        };
+
+        for v in [4, 6] {
+            let mut buf = BytesMut::new();
+            req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = FetchRequest::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.topics.len(), 1);
+            assert_eq!(decoded.topics[0].partitions[0].fetch_offset, 50);
+        }
+
+        let resp = FetchResponse {
+            throttle_time_ms: 0,
+            error_code: KafkaErrorCode::None,
+            responses: vec![FetchTopicResponse {
+                topic: "topic-1".into(),
+                partitions: vec![FetchPartitionResponse {
+                    partition_index: 0,
+                    error_code: KafkaErrorCode::None,
+                    high_watermark: 100,
+                    last_stable_offset: 100,
+                    records: Bytes::from_static(b"records-data"),
+                }],
+            }],
+        };
+
+        for v in [4, 6] {
+            let mut buf = BytesMut::new();
+            resp.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = FetchResponse::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.responses.len(), 1);
+            assert_eq!(decoded.responses[0].partitions[0].high_watermark, 100);
+        }
+    }
+
+    #[test]
+    fn test_list_offsets_codec() {
+        let req = ListOffsetsRequest {
+            replica_id: -1,
+            isolation_level: 0,
+            topics: vec![ListOffsetsTopic {
+                topic: "test-topic".into(),
+                partitions: vec![ListOffsetsPartition {
+                    partition: 0,
+                    current_leader_epoch: 1,
+                    timestamp: -1,
+                }],
+            }],
+        };
+
+        for v in [1, 2, 4, 5] {
+            let mut buf = BytesMut::new();
+            req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = ListOffsetsRequest::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.topics.len(), 1);
+            assert_eq!(decoded.topics[0].partitions[0].timestamp, -1);
+        }
+
+        let resp = ListOffsetsResponse {
+            throttle_time_ms: 0,
+            topics: vec![ListOffsetsTopicResponse {
+                topic: "test-topic".into(),
+                partitions: vec![ListOffsetsPartitionResponse {
+                    partition: 0,
+                    error_code: KafkaErrorCode::None,
+                    timestamp: 1000,
+                    offset: 42,
+                    leader_epoch: 1,
+                }],
+            }],
+        };
+
+        for v in [1, 2, 4, 5] {
+            let mut buf = BytesMut::new();
+            resp.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = ListOffsetsResponse::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.topics.len(), 1);
+            assert_eq!(decoded.topics[0].partitions[0].offset, 42);
+        }
+    }
+
+    #[test]
+    fn test_coordinator_and_offsets_codec() {
+        // FindCoordinator
+        let fc_req = FindCoordinatorRequest {
+            key: "my-group".into(),
+            key_type: 0,
+        };
+        for v in [1, 2] {
+            let mut buf = BytesMut::new();
+            fc_req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = FindCoordinatorRequest::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.key, "my-group");
+        }
+
+        let fc_resp = FindCoordinatorResponse {
+            throttle_time_ms: 0,
+            error_code: KafkaErrorCode::None,
+            error_message: None,
+            node_id: 1,
+            host: "127.0.0.1".into(),
+            port: 9092,
+        };
+        for v in [1, 2] {
+            let mut buf = BytesMut::new();
+            fc_resp.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = FindCoordinatorResponse::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.node_id, 1);
+        }
+
+        // OffsetCommit
+        let oc_req = OffsetCommitRequest {
+            group_id: "group-1".into(),
+            generation_id: 1,
+            member_id: "member-1".into(),
+            topics: vec![OffsetCommitTopic {
+                topic: "test-topic".into(),
+                partitions: vec![OffsetCommitPartition {
+                    partition: 0,
+                    committed_offset: 123,
+                    metadata: Some("meta".into()),
+                }],
+            }],
+        };
+        for v in [1, 2] {
+            let mut buf = BytesMut::new();
+            oc_req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = OffsetCommitRequest::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.group_id, "group-1");
+            assert_eq!(decoded.topics[0].partitions[0].committed_offset, 123);
+        }
+
+        let oc_resp = OffsetCommitResponse {
+            throttle_time_ms: 0,
+            topics: vec![OffsetCommitTopicResponse {
+                topic: "test-topic".into(),
+                partitions: vec![OffsetCommitPartitionResponse {
+                    partition: 0,
+                    error_code: KafkaErrorCode::None,
+                }],
+            }],
+        };
+        for v in [1, 2] {
+            let mut buf = BytesMut::new();
+            oc_resp.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = OffsetCommitResponse::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.topics.len(), 1);
+        }
+
+        // OffsetFetch
+        let of_req = OffsetFetchRequest {
+            group_id: "group-1".into(),
+            topics: Some(vec![OffsetFetchTopic {
+                topic: "test-topic".into(),
+                partitions: vec![0],
+            }]),
+        };
+        for v in [1, 5] {
+            let mut buf = BytesMut::new();
+            of_req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = OffsetFetchRequest::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.group_id, "group-1");
+        }
+
+        let of_resp = OffsetFetchResponse {
+            throttle_time_ms: 0,
+            topics: vec![OffsetFetchTopicResponse {
+                topic: "test-topic".into(),
+                partitions: vec![OffsetFetchPartitionResponse {
+                    partition: 0,
+                    offset: 123,
+                    metadata: Some("meta".into()),
+                    error_code: KafkaErrorCode::None,
+                }],
+            }],
+            error_code: KafkaErrorCode::None,
+        };
+        for v in [1, 5] {
+            let mut buf = BytesMut::new();
+            of_resp.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = OffsetFetchResponse::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.topics.len(), 1);
+        }
+    }
+
+    #[test]
+    fn test_heartbeat_and_leave_group() {
+        let hb_req = HeartbeatRequest {
+            group_id: "group-hb".into(),
+            generation_id: 2,
+            member_id: "member-hb".into(),
+        };
+        let mut buf = BytesMut::new();
+        hb_req.encode(&mut buf, 1);
+        let mut read_buf = buf.freeze();
+        let decoded = HeartbeatRequest::decode(&mut read_buf, 1).unwrap();
+        assert_eq!(decoded.group_id, "group-hb");
+
+        let hb_resp = HeartbeatResponse {
+            throttle_time_ms: 0,
+            error_code: KafkaErrorCode::None,
+        };
+        let mut buf = BytesMut::new();
+        hb_resp.encode(&mut buf, 1);
+        let mut read_buf = buf.freeze();
+        let decoded = HeartbeatResponse::decode(&mut read_buf, 1).unwrap();
+        assert_eq!(decoded.error_code, KafkaErrorCode::None);
+
+        let lg_req = LeaveGroupRequest {
+            group_id: "group-lg".into(),
+            member_id: "member-lg".into(),
+        };
+        let mut buf = BytesMut::new();
+        lg_req.encode(&mut buf, 1);
+        let mut read_buf = buf.freeze();
+        let decoded = LeaveGroupRequest::decode(&mut read_buf, 1).unwrap();
+        assert_eq!(decoded.group_id, "group-lg");
+
+        let lg_resp = LeaveGroupResponse {
+            throttle_time_ms: 0,
+            error_code: KafkaErrorCode::None,
+        };
+        let mut buf = BytesMut::new();
+        lg_resp.encode(&mut buf, 1);
+        let mut read_buf = buf.freeze();
+        let decoded = LeaveGroupResponse::decode(&mut read_buf, 1).unwrap();
+        assert_eq!(decoded.error_code, KafkaErrorCode::None);
     }
 }

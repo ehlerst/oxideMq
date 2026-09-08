@@ -88,4 +88,29 @@ mod tests {
         assert_eq!(decoded, payload);
         assert_eq!(buf.len(), 0);
     }
+
+    #[test]
+    fn test_codec_error_conditions() {
+        let mut codec = KafkaFrameCodec::new();
+
+        // < 4 bytes returns Ok(None)
+        let mut short_buf = BytesMut::from(&b"12"[..]);
+        assert_eq!(codec.decode(&mut short_buf).unwrap(), None);
+
+        // Negative frame length
+        let mut neg_buf = BytesMut::new();
+        neg_buf.put_i32(-5);
+        assert!(codec.decode(&mut neg_buf).is_err());
+
+        // Oversized frame
+        let mut huge_buf = BytesMut::new();
+        huge_buf.put_i32(MAX_KAFKA_FRAME_SIZE as i32 + 100);
+        assert!(codec.decode(&mut huge_buf).is_err());
+
+        // Incomplete payload
+        let mut partial_buf = BytesMut::new();
+        partial_buf.put_i32(10);
+        partial_buf.put_slice(b"1234");
+        assert_eq!(codec.decode(&mut partial_buf).unwrap(), None);
+    }
 }

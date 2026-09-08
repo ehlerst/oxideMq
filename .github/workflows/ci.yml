@@ -66,6 +66,17 @@ jobs:
           distribution: 'temurin'
           cache: 'maven'
 
+      - name: Build and Package Java Client Image
+        run: |
+          mvn -B clean package -DskipTests
+          docker build -t oxidemq-kafka-client:latest -f Dockerfile.client .
+        working-directory: compat/java-testcontainers
+
+      - name: Start oxideMq Background Daemon
+        run: |
+          ./target/release/oxidemq start --kafka-port 9092 --admin-port 9093 &
+          sleep 2
+
       - name: Run Java Testcontainers Suite
         run: mvn -B test
         working-directory: compat/java-testcontainers

@@ -209,6 +209,7 @@ impl BrokerEngine {
                             error_code: KafkaErrorCode::None,
                             timestamp: -1,
                             offset,
+                            leader_epoch: 0,
                         });
                     }
                     topic_responses.push(ListOffsetsTopicResponse {
@@ -365,7 +366,13 @@ impl BrokerEngine {
             let mut frame_buf = vec![0u8; frame_len];
             stream.read_exact(&mut frame_buf).await?;
 
-            let response_frame = self.handle_frame(Bytes::from(frame_buf))?;
+            let response_frame = match self.handle_frame(Bytes::from(frame_buf)) {
+                Ok(f) => f,
+                Err(e) => {
+                    error!("Error handling Kafka frame: {:?}", e);
+                    return Err(e);
+                }
+            };
             stream.write_all(&response_frame).await?;
             stream.flush().await?;
         }
@@ -482,5 +489,146 @@ mod tests {
             fetch_resp.responses[0].partitions[0].records.as_ref(),
             b"payload-12345"
         );
+    }
+
+    #[tokio::test]
+    async fn test_engine_all_requests_and_duplex_connection() {
+        let engine = create_test_engine();
+        assert_eq!(engine.cluster_state().node_id(), 1);
+        assert_eq!(engine.coordinator().group_count(), 0);
+        assert!(engine.chaos().is_enabled());
+
+        // Metadata request
+        let meta_header = RequestHeader::new(ApiKey::Metadata, 1, 301, Some("test"));
+        let meta_req = MetadataRequest {
+            topics: Some(vec!["orders".into()]),
+            allow_auto_topic_creation: true,
+        };
+        let mut b = BytesMut::new();
+        meta_req.encode(&mut b, 1);
+        let resp = engine
+            .handle_request(&meta_header, &mut b.freeze())
+            .unwrap();
+        assert!(!resp.is_empty());
+
+        // ListOffsets request
+        let lo_header = RequestHeader::new(ApiKey::ListOffsets, 1, 302, Some("test"));
+        let lo_req = ListOffsetsRequest {
+            replica_id: -1,
+            isolation_level: 0,
+            topics: vec![oxidemq_protocol::ListOffsetsTopic {
+                topic: "orders".into(),
+                partitions: vec![oxidemq_protocol::ListOffsetsPartition {
+                    partition: 0,
+                    current_leader_epoch: 0,
+                    timestamp: -1,
+                }],
+            }],
+        };
+        let mut b = BytesMut::new();
+        lo_req.encode(&mut b, 1);
+        let resp = engine.handle_request(&lo_header, &mut b.freeze()).unwrap();
+        assert!(!resp.is_empty());
+
+        // FindCoordinator request
+        let fc_header = RequestHeader::new(ApiKey::FindCoordinator, 1, 303, Some("test"));
+        let fc_req = FindCoordinatorRequest {
+            key: "test-group".into(),
+            key_type: 0,
+        };
+        let mut b = BytesMut::new();
+        fc_req.encode(&mut b, 1);
+        let resp = engine.handle_request(&fc_header, &mut b.freeze()).unwrap();
+        assert!(!resp.is_empty());
+
+        // OffsetCommit request
+        let oc_header = RequestHeader::new(ApiKey::OffsetCommit, 1, 304, Some("test"));
+        let oc_req = OffsetCommitRequest {
+            group_id: "test-group".into(),
+            generation_id: 1,
+            member_id: "m-1".into(),
+            topics: vec![oxidemq_protocol::OffsetCommitTopic {
+                topic: "orders".into(),
+                partitions: vec![oxidemq_protocol::OffsetCommitPartition {
+                    partition: 0,
+                    committed_offset: 5,
+                    metadata: None,
+                }],
+            }],
+        };
+        let mut b = BytesMut::new();
+        oc_req.encode(&mut b, 1);
+        let resp = engine.handle_request(&oc_header, &mut b.freeze()).unwrap();
+        assert!(!resp.is_empty());
+
+        // OffsetFetch request
+        let of_header = RequestHeader::new(ApiKey::OffsetFetch, 1, 305, Some("test"));
+        let of_req = OffsetFetchRequest {
+            group_id: "test-group".into(),
+            topics: Some(vec![oxidemq_protocol::OffsetFetchTopic {
+                topic: "orders".into(),
+                partitions: vec![0],
+            }]),
+        };
+        let mut b = BytesMut::new();
+        of_req.encode(&mut b, 1);
+        let resp = engine.handle_request(&of_header, &mut b.freeze()).unwrap();
+        assert!(!resp.is_empty());
+
+        // Heartbeat request
+        let hb_header = RequestHeader::new(ApiKey::Heartbeat, 1, 306, Some("test"));
+        let hb_req = HeartbeatRequest {
+            group_id: "test-group".into(),
+            generation_id: 1,
+            member_id: "m-1".into(),
+        };
+        let mut b = BytesMut::new();
+        hb_req.encode(&mut b, 1);
+        let resp = engine.handle_request(&hb_header, &mut b.freeze()).unwrap();
+        assert!(!resp.is_empty());
+
+        // LeaveGroup request
+        let lg_header = RequestHeader::new(ApiKey::LeaveGroup, 1, 307, Some("test"));
+        let lg_req = LeaveGroupRequest {
+            group_id: "test-group".into(),
+            member_id: "m-1".into(),
+        };
+        let mut b = BytesMut::new();
+        lg_req.encode(&mut b, 1);
+        let resp = engine.handle_request(&lg_header, &mut b.freeze()).unwrap();
+        assert!(!resp.is_empty());
+
+        // Unsupported key
+        let bad_header = RequestHeader::new(ApiKey::CreateTopics, 1, 999, Some("test"));
+        let mut empty = Bytes::new();
+        assert!(engine.handle_request(&bad_header, &mut empty).is_err());
+
+        // Full duplex connection test
+        let (mut client, server) = tokio::io::duplex(4096);
+        let engine_clone = engine.clone();
+        tokio::spawn(async move {
+            let _ = engine_clone.process_connection(server).await;
+        });
+
+        // Build framed ApiVersions request
+        let av_hdr = RequestHeader::new(ApiKey::ApiVersions, 0, 777, Some("duplex-client"));
+        let mut req_body = BytesMut::new();
+        av_hdr.encode(&mut req_body);
+        let mut frame = BytesMut::new();
+        frame.put_i32(req_body.len() as i32);
+        frame.put_slice(&req_body);
+
+        client.write_all(&frame).await.unwrap();
+        client.flush().await.unwrap();
+
+        let resp_len = client.read_i32().await.unwrap() as usize;
+        assert!(resp_len > 0);
+        let mut resp_buf = vec![0u8; resp_len];
+        client.read_exact(&mut resp_buf).await.unwrap();
+        let mut resp_bytes = Bytes::from(resp_buf);
+        let hdr = ResponseHeader::decode(&mut resp_bytes).unwrap();
+        assert_eq!(hdr.correlation_id, 777);
+
+        drop(client);
     }
 }

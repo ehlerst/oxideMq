@@ -95,3 +95,63 @@ impl KafkaErrorCode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kafka_error_codes() {
+        let codes = [
+            (KafkaErrorCode::None, 0),
+            (KafkaErrorCode::OffsetOutOfRange, 1),
+            (KafkaErrorCode::CorruptMessage, 2),
+            (KafkaErrorCode::UnknownTopicOrPartition, 3),
+            (KafkaErrorCode::InvalidFetchSize, 4),
+            (KafkaErrorCode::LeaderNotAvailable, 5),
+            (KafkaErrorCode::NotLeaderOrFollower, 6),
+            (KafkaErrorCode::RequestTimedOut, 7),
+            (KafkaErrorCode::BrokerNotAvailable, 8),
+            (KafkaErrorCode::ReplicaNotAvailable, 9),
+            (KafkaErrorCode::MessageTooLarge, 10),
+            (KafkaErrorCode::StaleControllerEpoch, 11),
+            (KafkaErrorCode::OffsetMetadataTooLarge, 12),
+            (KafkaErrorCode::NetworkException, 13),
+            (KafkaErrorCode::CoordinatorLoadInProgress, 14),
+            (KafkaErrorCode::CoordinatorNotAvailable, 15),
+            (KafkaErrorCode::NotCoordinator, 16),
+            (KafkaErrorCode::InvalidTopicException, 17),
+            (KafkaErrorCode::RecordListTooLarge, 18),
+            (KafkaErrorCode::NotEnoughReplicas, 19),
+            (KafkaErrorCode::NotEnoughReplicasAfterAppend, 20),
+            (KafkaErrorCode::InvalidRequiredAcks, 21),
+            (KafkaErrorCode::IllegalGeneration, 22),
+            (KafkaErrorCode::InconsistentGroupProtocol, 23),
+            (KafkaErrorCode::InvalidGroupId, 24),
+            (KafkaErrorCode::UnknownMemberId, 25),
+            (KafkaErrorCode::InvalidSessionTimeout, 26),
+            (KafkaErrorCode::RebalanceInProgress, 27),
+            (KafkaErrorCode::InvalidCommitOffsetSize, 28),
+            (KafkaErrorCode::TopicAuthorizationFailed, 29),
+            (KafkaErrorCode::GroupAuthorizationFailed, 30),
+            (KafkaErrorCode::ClusterAuthorizationFailed, 31),
+            (KafkaErrorCode::InvalidTimestamp, 32),
+            (KafkaErrorCode::UnsupportedSaslMechanism, 33),
+            (KafkaErrorCode::IllegalSaslState, 34),
+            (KafkaErrorCode::UnsupportedVersion, 35),
+            (KafkaErrorCode::TopicAlreadyExists, 36),
+            (KafkaErrorCode::InvalidPartitions, 37),
+            (KafkaErrorCode::InvalidReplicationFactor, 38),
+            (KafkaErrorCode::UnknownServer, -1),
+        ];
+
+        for (err, val) in codes {
+            assert_eq!(err.code(), val);
+            assert_eq!(KafkaErrorCode::from_i16(val), err);
+        }
+
+        // Test unknown code fallback
+        assert_eq!(KafkaErrorCode::from_i16(999), KafkaErrorCode::UnknownServer);
+        assert_eq!(KafkaErrorCode::default(), KafkaErrorCode::None);
+    }
+}

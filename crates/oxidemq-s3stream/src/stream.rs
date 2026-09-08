@@ -64,10 +64,10 @@ impl S3Stream {
         }
     }
 
-    /// Appends a payload to the stream.
-    /// Acknowledged as soon as it is committed to the WAL, and placed in the LogCache for instant tail reads.
-    pub fn append(&self, payload: Bytes) -> Result<i64> {
-        let offset = self.next_offset.fetch_add(1, Ordering::SeqCst);
+    /// Appends a payload to the stream, advancing the watermark by `record_count`.
+    pub fn append_with_count(&self, payload: Bytes, record_count: i64) -> Result<i64> {
+        let count = record_count.max(1);
+        let offset = self.next_offset.fetch_add(count, Ordering::SeqCst);
 
         // Durability: write to WAL
         self.wal.append(self.stream_id, offset, &payload)?;
@@ -76,6 +76,12 @@ impl S3Stream {
         self.log_cache.put(self.stream_id, offset, payload);
 
         Ok(offset)
+    }
+
+    /// Appends a payload to the stream.
+    /// Acknowledged as soon as it is committed to the WAL, and placed in the LogCache for instant tail reads.
+    pub fn append(&self, payload: Bytes) -> Result<i64> {
+        self.append_with_count(payload, 1)
     }
 
     /// Fetches records from the stream starting at `start_offset` up to `max_bytes`.
@@ -234,6 +240,7 @@ impl S3StreamStorage for S3Stream {
 mod tests {
     use super::*;
     use crate::client::MemoryObjectStorage;
+    use crate::S3StreamStorage;
     use oxidemq_wal::memory::MemoryWal;
 
     #[test]
@@ -288,5 +295,36 @@ mod tests {
         let fetched2 = stream.fetch(0, 1024).unwrap();
         assert_eq!(fetched2.len(), 1);
         assert_eq!(storage.get_count(), 1); // No new S3 get!
+
+        // Test stream accessors
+        assert_eq!(stream.stream_id(), 200);
+        assert_eq!(stream.start_offset(), 0);
+
+        // Fetch out of range (greater than next_offset)
+        let empty_fetch = stream.fetch(999, 1024).unwrap();
+        assert!(empty_fetch.is_empty());
+
+        // Test empty upload_batch
+        let empty_key = stream.upload_batch(10, 10, vec![]).unwrap();
+        assert!(empty_key.is_empty());
+
+        // Test trim
+        stream.trim(1).unwrap();
+        assert_eq!(stream.start_offset(), 1);
+    }
+
+    #[test]
+    fn test_s3_stream_append_with_count() {
+        let wal = Arc::new(MemoryWal::new());
+        let storage = Arc::new(MemoryObjectStorage::new());
+        let log_cache = Arc::new(LogCache::new(1024 * 1024));
+        let block_cache = Arc::new(BlockCache::new(1024 * 1024));
+
+        let stream = S3Stream::new(300, 0, wal, storage, log_cache, block_cache);
+        let off = stream
+            .append_with_count(Bytes::from_static(b"batch-of-5"), 5)
+            .unwrap();
+        assert_eq!(off, 0);
+        assert_eq!(stream.next_offset(), 5);
     }
 }

@@ -66,3 +66,27 @@ impl ApiKey {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_api_key_from_i16() {
+        assert_eq!(ApiKey::from_i16(0), Some(ApiKey::Produce));
+        assert_eq!(ApiKey::from_i16(1), Some(ApiKey::Fetch));
+        assert_eq!(ApiKey::from_i16(2), Some(ApiKey::ListOffsets));
+        assert_eq!(ApiKey::from_i16(3), Some(ApiKey::Metadata));
+        assert_eq!(ApiKey::from_i16(8), Some(ApiKey::OffsetCommit));
+        assert_eq!(ApiKey::from_i16(9), Some(ApiKey::OffsetFetch));
+        assert_eq!(ApiKey::from_i16(10), Some(ApiKey::FindCoordinator));
+        assert_eq!(ApiKey::from_i16(11), Some(ApiKey::JoinGroup));
+        assert_eq!(ApiKey::from_i16(12), Some(ApiKey::Heartbeat));
+        assert_eq!(ApiKey::from_i16(13), Some(ApiKey::LeaveGroup));
+        assert_eq!(ApiKey::from_i16(14), Some(ApiKey::SyncGroup));
+        assert_eq!(ApiKey::from_i16(18), Some(ApiKey::ApiVersions));
+        assert_eq!(ApiKey::from_i16(19), Some(ApiKey::CreateTopics));
+        assert_eq!(ApiKey::from_i16(20), Some(ApiKey::DeleteTopics));
+        assert_eq!(ApiKey::from_i16(99), None);
+    }
+}

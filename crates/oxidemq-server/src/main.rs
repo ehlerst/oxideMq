@@ -74,9 +74,11 @@ enum Commands {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt::init();
-
     let cli = Cli::parse();
+    run_cli_command(cli).await
+}
 
+async fn run_cli_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Some(Commands::Status { addr }) => {
             let res = http_get(&addr, "/_oxidemq/status").await?;
@@ -281,5 +283,168 @@ async fn http_post(
         Ok(resp[pos + 4..].to_string())
     } else {
         Ok(resp)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_cli_parsing() {
+        let cli_default = Cli::try_parse_from(["oxidemq"]).unwrap();
+        assert_eq!(cli_default.kafka_port, 9092);
+        assert_eq!(cli_default.admin_port, 9093);
+        assert!(cli_default.command.is_none());
+
+        let cli_start = Cli::try_parse_from([
+            "oxidemq",
+            "start",
+            "--kafka-port",
+            "9095",
+            "--admin-port",
+            "9096",
+            "--host",
+            "127.0.0.1",
+        ])
+        .unwrap();
+        match cli_start.command {
+            Some(Commands::Start {
+                kafka_port,
+                admin_port,
+                host,
+            }) => {
+                assert_eq!(kafka_port, 9095);
+                assert_eq!(admin_port, 9096);
+                assert_eq!(host, "127.0.0.1");
+            }
+            _ => panic!("Expected Start command"),
+        }
+
+        let cli_status =
+            Cli::try_parse_from(["oxidemq", "status", "--addr", "10.0.0.1:9093"]).unwrap();
+        match cli_status.command {
+            Some(Commands::Status { addr }) => {
+                assert_eq!(addr, "10.0.0.1:9093");
+            }
+            _ => panic!("Expected Status command"),
+        }
+
+        let cli_dump = Cli::try_parse_from(["oxidemq", "dump-state"]).unwrap();
+        match cli_dump.command {
+            Some(Commands::DumpState { addr }) => {
+                assert_eq!(addr, "127.0.0.1:9093");
+            }
+            _ => panic!("Expected DumpState command"),
+        }
+
+        let cli_chaos = Cli::try_parse_from([
+            "oxidemq",
+            "chaos",
+            "--target",
+            "produce",
+            "--latency-ms",
+            "25",
+            "--error-prob",
+            "0.5",
+        ])
+        .unwrap();
+        match cli_chaos.command {
+            Some(Commands::Chaos {
+                target,
+                latency_ms,
+                error_prob,
+                ..
+            }) => {
+                assert_eq!(target, "produce");
+                assert_eq!(latency_ms, 25);
+                assert!((error_prob - 0.5).abs() < f64::EPSILON);
+            }
+            _ => panic!("Expected Chaos command"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_http_get_and_post() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            for _ in 0..2 {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buf = [0u8; 1024];
+                    let n = socket.read(&mut buf).await.unwrap();
+                    let req_str = String::from_utf8_lossy(&buf[..n]);
+                    let resp = if req_str.starts_with("GET") {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n{\"status\":\"ok\"}"
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 15\r\n\r\n{\"status\":\"done\"}"
+                    };
+                    socket.write_all(resp.as_bytes()).await.unwrap();
+                }
+            }
+        });
+
+        let get_resp = http_get(&addr.to_string(), "/_oxidemq/status")
+            .await
+            .unwrap();
+        assert_eq!(get_resp, "{\"status\":\"ok\"}");
+
+        let post_resp = http_post(&addr.to_string(), "/_oxidemq/chaos/rules", "{}")
+            .await
+            .unwrap();
+        assert_eq!(post_resp, "{\"status\":\"done\"}");
+    }
+
+    #[tokio::test]
+    async fn test_run_cli_commands() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut socket, _)) = listener.accept().await {
+                    let mut buf = [0u8; 1024];
+                    let _ = socket.read(&mut buf).await;
+                    let resp = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\n{\"status\":\"ok\"}";
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                }
+            }
+        });
+
+        let cli_status = Cli {
+            command: Some(Commands::Status {
+                addr: addr.to_string(),
+            }),
+            kafka_port: 9092,
+            admin_port: 9093,
+            host: "127.0.0.1".into(),
+        };
+        assert!(run_cli_command(cli_status).await.is_ok());
+
+        let cli_dump = Cli {
+            command: Some(Commands::DumpState {
+                addr: addr.to_string(),
+            }),
+            kafka_port: 9092,
+            admin_port: 9093,
+            host: "127.0.0.1".into(),
+        };
+        assert!(run_cli_command(cli_dump).await.is_ok());
+
+        for target in ["produce", "fetch", "wal", "s3", "invalid"] {
+            let cli_chaos = Cli {
+                command: Some(Commands::Chaos {
+                    addr: addr.to_string(),
+                    target: target.into(),
+                    latency_ms: 10,
+                    error_prob: 0.1,
+                }),
+                kafka_port: 9092,
+                admin_port: 9093,
+                host: "127.0.0.1".into(),
+            };
+            assert!(run_cli_command(cli_chaos).await.is_ok());
+        }
     }
 }

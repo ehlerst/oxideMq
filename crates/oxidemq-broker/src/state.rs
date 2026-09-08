@@ -75,3 +75,45 @@ impl ClusterStateSnapshot {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oxidemq_s3stream::block_cache::BlockCache;
+    use oxidemq_s3stream::client::MemoryObjectStorage;
+    use oxidemq_s3stream::log_cache::LogCache;
+    use oxidemq_wal::memory::MemoryWal;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_cluster_state_snapshot_roundtrip() {
+        let wal = Arc::new(MemoryWal::new());
+        let storage = Arc::new(MemoryObjectStorage::new());
+        let log_cache = Arc::new(LogCache::new(1024 * 1024));
+        let block_cache = Arc::new(BlockCache::new(1024 * 1024));
+        let cluster = ClusterState::new(
+            1,
+            "127.0.0.1",
+            9092,
+            "test-cluster",
+            wal,
+            storage,
+            log_cache,
+            block_cache,
+        );
+        let coordinator = GroupCoordinator::new();
+
+        let tp = TopicPartition::new("my-topic", 0);
+        cluster.get_or_create_partition(&tp);
+        coordinator.commit_offset("group-1", tp.clone(), 42);
+
+        let snap = ClusterStateSnapshot::capture(&cluster, &coordinator);
+        assert_eq!(snap.partitions.len(), 1);
+        assert_eq!(snap.consumer_groups.len(), 1);
+
+        // Apply to a clean cluster
+        snap.apply(&cluster, &coordinator).unwrap();
+        assert_eq!(cluster.partition_count(), 1);
+        assert_eq!(coordinator.fetch_offset("group-1", &tp), Some(42));
+    }
+}

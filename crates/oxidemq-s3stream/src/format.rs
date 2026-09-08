@@ -246,4 +246,26 @@ mod tests {
         assert_eq!(index[0].end_offset, 9);
         assert_eq!(index[1].stream_id, 2);
     }
+
+    #[test]
+    fn test_s3_object_format_errors() {
+        // Too small
+        assert!(S3ObjectCodec::decode_all(&[0u8; 4]).is_err());
+        assert!(S3ObjectCodec::read_footer_index(&[0u8; 8]).is_err());
+
+        // Bad magic
+        let bad_magic = vec![0xFF; 20];
+        assert!(S3ObjectCodec::decode_all(&bad_magic).is_err());
+        assert!(S3ObjectCodec::read_footer_index(&bad_magic).is_err());
+
+        // Corrupted CRC
+        let b = S3DataBlock::new(1, 0, 1, 2, Bytes::from_static(b"valid-data"));
+        let mut encoded = S3ObjectCodec::encode(&[b]).to_vec();
+        // Mutate block payload to trigger CRC failure
+        encoded[8 + BLOCK_HEADER_SIZE] ^= 0xFF;
+        assert!(matches!(
+            S3ObjectCodec::decode_all(&encoded),
+            Err(OxideMqError::CorruptedRecord { .. })
+        ));
+    }
 }

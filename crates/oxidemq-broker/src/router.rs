@@ -236,5 +236,31 @@ mod tests {
         assert_eq!(meta.topics.len(), 1);
         assert_eq!(meta.topics[0].name, "telemetry");
         assert_eq!(meta.topics[0].partitions.len(), 1);
+
+        assert!(state.get_partition(&tp).is_some());
+        assert!(state
+            .get_partition(&TopicPartition::new("non-existent", 0))
+            .is_none());
+
+        assert_eq!(state.node_id(), 1);
+        assert_eq!(state.host(), "127.0.0.1");
+        assert_eq!(state.port(), 9092);
+        assert_eq!(state.cluster_id(), "test-cluster");
+        assert_eq!(state.partition_count(), 1);
+
+        state.set_advertised_host("broker-new.com");
+        state.set_advertised_port(9095);
+        assert_eq!(state.host(), "broker-new.com");
+        assert_eq!(state.port(), 9095);
+
+        let snapshots = state.dump_partition_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].topic, "telemetry");
+
+        let all_meta = state.build_metadata(None);
+        assert_eq!(all_meta.topics.len(), 1);
+
+        state.reset();
+        assert_eq!(state.partition_count(), 0);
     }
 }

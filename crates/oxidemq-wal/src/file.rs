@@ -429,6 +429,37 @@ mod tests {
 
             let s4 = wal.append(1, 2, b"message-2").unwrap();
             assert_eq!(s4, 4);
+            assert_eq!(wal.next_seq(), 5);
+
+            wal.trim(1, 1).unwrap();
         }
+    }
+
+    #[test]
+    fn test_file_wal_segment_rollover_and_purge() {
+        let dir = tempdir().unwrap();
+        // Tiny segment size to force segment rotation
+        let config = WalConfig {
+            dir: dir.path().to_path_buf(),
+            max_segment_size_bytes: 128,
+            group_commit_window_micros: 100,
+            max_batch_records: 5,
+            sync_to_disk: true,
+            direct_io: false,
+        };
+
+        let wal = FileWal::open(config).unwrap();
+        for i in 0..10 {
+            wal.append(1, i, format!("payload-data-line-{}", i).as_bytes())
+                .unwrap();
+        }
+        wal.flush().unwrap();
+
+        let recs = wal.read_stream(1, 0, 50).unwrap();
+        assert!(!recs.is_empty());
+
+        // Purge old segments
+        let purged = wal.purge_segments_before(5).unwrap();
+        assert!(purged > 0);
     }
 }

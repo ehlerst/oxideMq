@@ -184,10 +184,106 @@ mod tests {
         KafkaEncoder::write_varint(&mut buf, 0);
         KafkaEncoder::write_varint(&mut buf, -1);
         KafkaEncoder::write_varint(&mut buf, 1234567);
+        KafkaEncoder::write_varint(&mut buf, i64::MAX);
+        KafkaEncoder::write_varint(&mut buf, i64::MIN);
 
         let mut read_buf = buf.freeze();
         assert_eq!(KafkaDecoder::read_varint(&mut read_buf).unwrap(), 0);
         assert_eq!(KafkaDecoder::read_varint(&mut read_buf).unwrap(), -1);
         assert_eq!(KafkaDecoder::read_varint(&mut read_buf).unwrap(), 1234567);
+        assert_eq!(KafkaDecoder::read_varint(&mut read_buf).unwrap(), i64::MAX);
+        assert_eq!(KafkaDecoder::read_varint(&mut read_buf).unwrap(), i64::MIN);
+    }
+
+    #[test]
+    fn test_compact_string_codec() {
+        let mut buf = BytesMut::new();
+        KafkaEncoder::write_compact_string(&mut buf, Some("compact-topic"));
+        KafkaEncoder::write_compact_string(&mut buf, None);
+
+        let mut read_buf = buf.freeze();
+        assert_eq!(
+            KafkaDecoder::read_compact_string(&mut read_buf).unwrap(),
+            Some("compact-topic".to_string())
+        );
+        assert_eq!(
+            KafkaDecoder::read_compact_string(&mut read_buf).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_bytes_codec() {
+        let mut buf = BytesMut::new();
+        KafkaEncoder::write_bytes(&mut buf, Some(b"hello world bytes"));
+        KafkaEncoder::write_bytes(&mut buf, None);
+
+        let mut read_buf = buf.freeze();
+        assert_eq!(
+            KafkaDecoder::read_bytes(&mut read_buf).unwrap(),
+            Some(Bytes::from_static(b"hello world bytes"))
+        );
+        assert_eq!(KafkaDecoder::read_bytes(&mut read_buf).unwrap(), None);
+    }
+
+    #[test]
+    fn test_compact_bytes_codec() {
+        let mut buf = BytesMut::new();
+        KafkaEncoder::write_compact_bytes(&mut buf, Some(b"compact-raw-bytes"));
+        KafkaEncoder::write_compact_bytes(&mut buf, None);
+
+        let mut read_buf = buf.freeze();
+        assert_eq!(
+            KafkaDecoder::read_compact_bytes(&mut read_buf).unwrap(),
+            Some(Bytes::from_static(b"compact-raw-bytes"))
+        );
+        assert_eq!(
+            KafkaDecoder::read_compact_bytes(&mut read_buf).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parser_errors() {
+        // Truncated string length
+        let mut short_str = Bytes::from_static(&[0x00]);
+        assert!(KafkaDecoder::read_string(&mut short_str).is_err());
+
+        // Truncated string body
+        let mut short_str_body = Bytes::from_static(&[0x00, 0x05, b'a', b'b']);
+        assert!(KafkaDecoder::read_string(&mut short_str_body).is_err());
+
+        // Invalid UTF-8 in string
+        let mut bad_utf8_str = Bytes::from_static(&[0x00, 0x02, 0xFF, 0xFF]);
+        assert!(KafkaDecoder::read_string(&mut bad_utf8_str).is_err());
+
+        // Truncated compact string body
+        let mut short_compact_str = Bytes::from_static(&[0x05, b'a']);
+        assert!(KafkaDecoder::read_compact_string(&mut short_compact_str).is_err());
+
+        // Invalid UTF-8 in compact string
+        let mut bad_utf8_compact_str = Bytes::from_static(&[0x03, 0xFF, 0xFF]);
+        assert!(KafkaDecoder::read_compact_string(&mut bad_utf8_compact_str).is_err());
+
+        // Truncated bytes length
+        let mut short_bytes_len = Bytes::from_static(&[0x00, 0x00]);
+        assert!(KafkaDecoder::read_bytes(&mut short_bytes_len).is_err());
+
+        // Truncated bytes body
+        let mut short_bytes_body = Bytes::from_static(&[0x00, 0x00, 0x00, 0x05, 0x01, 0x02]);
+        assert!(KafkaDecoder::read_bytes(&mut short_bytes_body).is_err());
+
+        // Truncated compact bytes body
+        let mut short_compact_bytes = Bytes::from_static(&[0x05, 0x01]);
+        assert!(KafkaDecoder::read_compact_bytes(&mut short_compact_bytes).is_err());
+
+        // Truncated varint
+        let mut truncated_varint = Bytes::from_static(&[0x80]);
+        assert!(KafkaDecoder::read_unsigned_varint(&mut truncated_varint).is_err());
+
+        // Varint overflow (>63 shift)
+        let overflow_bytes = vec![0x80; 11];
+        let mut overflow_buf = Bytes::from(overflow_bytes);
+        assert!(KafkaDecoder::read_unsigned_varint(&mut overflow_buf).is_err());
     }
 }

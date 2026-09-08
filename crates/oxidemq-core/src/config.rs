@@ -101,3 +101,51 @@ impl Default for CacheConfig {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config_lifecycle() {
+        let config = OxideConfig::default();
+        assert_eq!(config.broker.node_id, 1);
+        assert_eq!(config.broker.cluster_id, "oxidemq-cluster-local");
+        assert_eq!(config.broker.kafka_port, 9092);
+        assert_eq!(config.broker.admin_port, 9093);
+        assert_eq!(config.broker.host, "0.0.0.0");
+
+        assert_eq!(config.wal.max_batch_records, 4096);
+        assert_eq!(config.wal.max_segment_size_bytes, 64 * 1024 * 1024);
+        assert_eq!(config.wal.group_commit_window_micros, 500);
+        assert!(config.wal.sync_to_disk);
+        assert!(!config.wal.direct_io);
+
+        assert_eq!(config.s3.bucket, "oxidemq-streams");
+        assert_eq!(config.s3.region, "us-east-1");
+        assert_eq!(config.s3.max_object_size_bytes, 32 * 1024 * 1024);
+        assert_eq!(config.s3.compactor_interval_secs, 30);
+        assert!(config.s3.force_path_style);
+
+        assert_eq!(config.cache.log_cache_size_bytes, 256 * 1024 * 1024);
+        assert_eq!(config.cache.block_cache_size_bytes, 512 * 1024 * 1024);
+        assert_eq!(config.cache.prefetch_batch_count, 4);
+    }
+
+    #[test]
+    fn test_config_json_roundtrip() {
+        let mut config = OxideConfig::default();
+        config.broker.node_id = 42;
+        config.broker.kafka_port = 19092;
+        config.wal.sync_to_disk = false;
+        config.s3.bucket = "custom-bucket".to_string();
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: OxideConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(deserialized.broker.node_id, 42);
+        assert_eq!(deserialized.broker.kafka_port, 19092);
+        assert!(!deserialized.wal.sync_to_disk);
+        assert_eq!(deserialized.s3.bucket, "custom-bucket");
+    }
+}
