@@ -1,0 +1,12 @@
+oxideMq
+Copyright 2026 oxideMq Contributors
+
+This product includes software developed by the oxideMq project.
+
+Attribution and Architectural Heritage:
+- oxideMq is an independent, clean-room, pure-Rust re-implementation inspired
+  by the decoupled streaming storage architecture originally introduced by AutoMQ
+  (https://github.com/AutoMQ/automq), licensed under the Apache License, Version 2.0.
+- oxideMq implements the Apache Kafka wire protocol based on the open specifications
+  provided by the Apache Software Foundation (https://kafka.apache.org/), licensed
+  under the Apache License, Version 2.0.

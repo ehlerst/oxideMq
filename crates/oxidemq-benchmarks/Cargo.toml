@@ -1,0 +1,20 @@
+[package]
+name = "oxidemq-benchmarks"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+oxidemq-core = { workspace = true }
+oxidemq-wal = { workspace = true }
+oxidemq-s3stream = { workspace = true }
+oxidemq-protocol = { workspace = true }
+oxidemq-broker = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "phase0_baseline"
+harness = false

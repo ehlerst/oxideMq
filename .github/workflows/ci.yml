@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  check-and-lint:
+    name: Formatting & Clippy Discipline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Check Rust Formatting
+        run: cargo fmt --all -- --check
+
+      - name: Strict Clippy Linter (-D warnings)
+        run: cargo clippy --workspace --all-targets --all-features
+
+  test:
+    name: Pure Rust Workspace Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run Workspace Tests
+        run: cargo test --workspace --all-targets

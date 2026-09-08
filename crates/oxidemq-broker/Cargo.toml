@@ -1,0 +1,21 @@
+[package]
+name = "oxidemq-broker"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+oxidemq-core = { workspace = true }
+oxidemq-wal = { workspace = true }
+oxidemq-s3stream = { workspace = true }
+oxidemq-protocol = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+parking_lot = { workspace = true }
+dashmap = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

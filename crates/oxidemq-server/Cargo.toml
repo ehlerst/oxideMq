@@ -1,0 +1,23 @@
+[package]
+name = "oxidemq-server"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+oxidemq-core = { workspace = true }
+oxidemq-wal = { workspace = true }
+oxidemq-s3stream = { workspace = true }
+oxidemq-protocol = { workspace = true }
+oxidemq-broker = { workspace = true }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

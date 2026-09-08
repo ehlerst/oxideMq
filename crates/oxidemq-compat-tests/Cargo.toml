@@ -1,0 +1,18 @@
+[package]
+name = "oxidemq-compat-tests"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+oxidemq-core = { workspace = true }
+oxidemq-wal = { workspace = true }
+oxidemq-s3stream = { workspace = true }
+oxidemq-protocol = { workspace = true }
+oxidemq-broker = { workspace = true }
+tokio = { workspace = true }
+bytes = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
