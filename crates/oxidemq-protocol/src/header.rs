@@ -40,6 +40,10 @@ impl RequestHeader {
         let correlation_id = src.get_i32();
         let client_id = KafkaDecoder::read_string(src)?;
 
+        if api_key == ApiKey::ApiVersions && api_version >= 3 && src.has_remaining() {
+            let _tag_count = KafkaDecoder::read_unsigned_varint(src)?;
+        }
+
         Ok(Self {
             api_key,
             api_version,

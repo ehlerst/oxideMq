@@ -13,6 +13,7 @@ pub struct MemoryWal {
     next_seq: AtomicU64,
     records: Arc<RwLock<BTreeMap<u64, WalRecord>>>,
     stream_indexes: Arc<RwLock<HashMap<u64, Vec<u64>>>>, // stream_id -> [seq]
+    active_epochs: Arc<RwLock<HashMap<u64, u64>>>,       // stream_id -> active_epoch
 }
 
 impl MemoryWal {
@@ -21,6 +22,7 @@ impl MemoryWal {
             next_seq: AtomicU64::new(1),
             records: Arc::new(RwLock::new(BTreeMap::new())),
             stream_indexes: Arc::new(RwLock::new(HashMap::new())),
+            active_epochs: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -61,6 +63,43 @@ impl MemoryWal {
 
     pub fn is_empty(&self) -> bool {
         self.records.read().is_empty()
+    }
+
+    /// Acquires write permission lease for a stream under a specific leadership epoch.
+    /// Rejects if the requested epoch is strictly less than the currently active epoch (epoch fencing).
+    pub fn acquire_lease(&self, stream_id: u64, epoch: u64) -> Result<()> {
+        let mut epochs = self.active_epochs.write();
+        if let Some(&active) = epochs.get(&stream_id) {
+            if epoch < active {
+                return Err(oxidemq_core::error::OxideMqError::Wal(format!(
+                    "WAL lease fenced for stream {}: requested epoch {} < active epoch {}",
+                    stream_id, epoch, active
+                )));
+            }
+        }
+        epochs.insert(stream_id, epoch);
+        Ok(())
+    }
+
+    /// Appends a record verifying that the writer's leadership epoch is current.
+    pub fn append_with_epoch(
+        &self,
+        stream_id: u64,
+        epoch: u64,
+        offset: i64,
+        data: &[u8],
+    ) -> Result<u64> {
+        let epochs = self.active_epochs.read();
+        if let Some(&active) = epochs.get(&stream_id) {
+            if epoch < active {
+                return Err(oxidemq_core::error::OxideMqError::Wal(format!(
+                    "WAL append fenced for stream {}: epoch {} < active epoch {}",
+                    stream_id, epoch, active
+                )));
+            }
+        }
+        drop(epochs);
+        self.append(stream_id, offset, data)
     }
 }
 
@@ -135,5 +174,32 @@ mod tests {
         let remaining = wal.read_stream(1, 0, 1024);
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].offset, 1);
+    }
+
+    #[test]
+    fn test_wal_epoch_fencing() {
+        let wal = MemoryWal::new();
+        // Broker 1 acquires epoch 10
+        wal.acquire_lease(42, 10).unwrap();
+        let s1 = wal.append_with_epoch(42, 10, 0, b"valid-1").unwrap();
+        assert_eq!(s1, 1);
+
+        // Broker 2 acquires higher epoch 11 (e.g. failover / leader election)
+        wal.acquire_lease(42, 11).unwrap();
+        let s2 = wal.append_with_epoch(42, 11, 1, b"valid-2").unwrap();
+        assert_eq!(s2, 2);
+
+        // Stale Broker 1 attempts to append with old epoch 10 -> MUST BE FENCED
+        let fenced_err = wal.append_with_epoch(42, 10, 2, b"stale-write");
+        assert!(fenced_err.is_err(), "Stale epoch write should be fenced");
+        let err_msg = fenced_err.unwrap_err().to_string();
+        assert!(err_msg.contains("fenced"));
+
+        // Stale Broker attempts to acquire older epoch 9 -> MUST BE REJECTED
+        let lease_err = wal.acquire_lease(42, 9);
+        assert!(
+            lease_err.is_err(),
+            "Stale lease acquisition should be rejected"
+        );
     }
 }

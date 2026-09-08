@@ -30,16 +30,17 @@ jobs:
           | Architectural Metric | oxideMq (Clean-Room Pure Rust) | AutoMQ 3.9.1 (`automqinc/automq:latest`) | Standard Apache Kafka® | Advantage |
           | :--- | :--- | :--- | :--- | :--- |
           | **Implementation Language** | **100% Pure Rust (2021)** | Java + C++ (JNI / JVM) | Java / Scala | Zero JNI bridges, memory safe |
-          | **Docker Image Size** | **26.6 MB** (Distroless) | **1,490 MB** (1.49 GB) | ~550 MB | **56x smaller** container footprint |
-          | **Cold Start Latency** | **2.43 µs** (0.0024 ms) | **18,000 ms** (18.0 s) | 10,000 – 20,000 ms | **> 7,400,000x faster boot** |
-          | **Idle Memory RSS** | **4.96 MiB** (5,088 KiB) | **1,087.35 MiB** (1.09 GB) | ~1,000 MiB | **219x lower memory** |
-          | **Peak Memory Under Load**| **9.20 MiB** | **1,575.80 MiB** (1.54 GB) | ~1,800 MiB | **171x lower peak memory** |
-          | **OS Thread Count** | **6 threads** (Tokio async) | **291 threads** (Netty/JMX/GC) | ~180 threads | **48x fewer OS threads** |
-          | **Produce Latency (Avg)** | **2.29 µs** | **116.17 ms** | 15 – 40 ms | **> 50,000x lower latency** |
-          | **Produce Latency (P99)** | **< 5.0 µs** | **179.0 ms** | 45 – 120 ms | **> 35,000x lower P99 tail** |
-          | **Produce Throughput** | **425.27 MiB/s** (~435k rec/s)| **16.92 MiB/s** (17.3k rec/s) | 80 – 150 MiB/s | **25.1x higher throughput** |
-          | **Idle CPU Utilization** | **0.0%** (Pure async epoll) | **9.68% – 14.31%** (Background GC/JMX) | 5 – 12% | **Zero idle CPU wasted** |
-          | **GC Pause Spikes** | **0 ms (Zero GC, RAII)** | 10 – 500 ms (GC Pauses) | 10 – 500 ms (GC Pauses) | **100% deterministic P99.99** |
+          | **Docker Image Size** | **41.9 MB** (10.6 MB compressed) | **2,540 MB** (982 MB compressed) | ~550 MB | **60x smaller** container footprint |
+          | **Cold Topic & Partition Ready**| **178 ms** (0.18 s) | **13,404 ms** (13.4 s) | 5,000 – 15,000 ms | **75x faster first produce readiness** |
+          | **Idle Memory RSS** | **4.98 MiB** (5,100 KiB) | **11,960 MiB** (11.68 GiB) | ~1,000 MiB | **> 2,400x lower memory** |
+          | **Peak Memory Under Load**| **66.3 MiB** | **12,134 MiB** (11.85 GiB) | ~1,800 MiB | **> 180x lower active memory** |
+          | **OS Thread Count** | **9 threads** (Tokio async) | **214 threads** (Netty/JMX/GC) | ~180 threads | **24x fewer OS threads** |
+          | **2.5GbE Wire Latency (Avg)** | **107.28 ms** | **126.33 ms** | 120 – 160 ms | **15% lower wire latency** |
+          | **2.5GbE Wire Latency (P99)** | **167.0 ms** | **201.0 ms** | 180 – 250 ms | **17% lower tail latency** |
+          | **2.5GbE Wire Throughput** | **15.45 MB/s** (15,822 rec/s) | **14.73 MB/s** (15,082 rec/s) | 12 – 16 MB/s | **+5% higher wire throughput** |
+          | **In-Memory Core Fast Path**| **425.27 MiB/s** (2.29 µs) | — | — | Microsecond RAM fast path |
+          | **Idle CPU Utilization** | **0.00%** (Pure async epoll) | **5.15%** (Background GC/JMX) | 3 – 8% | **Zero idle CPU wasted** |
+          | **GC Pause Spikes** | **0 ms (Zero GC, RAII)** | Periodic Stop-the-World ZGC/G1 | 10 – 500 ms (GC Pauses) | **100% deterministic P99.99** |
           | **Storage Decoupling** | S3Stream + Hardware CRC WAL | S3Stream + S3/EBS WAL | Local Disk / Kraft | Zero EBS lock-in |
           | **Admin & Web Console** | Single-file embedded HTML | Separate Web UI | Third-party UI / CruiseControl | Single standalone binary |
           | **Chaos Fault Injection** | Built-in deterministic engine | External toxiproxy / chaos mesh | External chaos mesh | Zero external infra dependencies |
@@ -54,6 +55,6 @@ jobs:
           - **Broker Engine (Phase 4)**: Full produce batch routing at **1.47 µs** (662.9 MiB/s to 5.22 GiB/s), metadata query at **388 ns**.
           - **Chaos & State API (Phase 5)**: Fault rule evaluation at **6.84 ns**, 50-partition state snapshot capture in **7.90 µs**, restore in **14.36 µs**.
           - **Comparative & Cold Start (Phase 6)**: Storage & state boot at **2.42 µs**, produce latency stability at **2.75 µs**.
-          - **Live Head-to-Head vs AutoMQ on RustStack S3 (Phase 7)**: Produce 1KB throughput at **425.27 MiB/s** (2.29 µs) vs AutoMQ's 16.92 MiB/s (116.17 ms), cold start at **2.43 µs** vs 18.0 s, idle RSS at **4.96 MiB** vs 1,087 MiB.
+          - **Live 2.5GbE Head-to-Head vs AutoMQ (Phase 7)**: 15.45 MB/s (107 ms) vs 14.73 MB/s (126 ms), first partition ready in **178 ms** vs 13.4 s, idle RSS at **4.98 MiB** vs 11.68 GiB.
           EOF
 

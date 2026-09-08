@@ -158,9 +158,15 @@ async fn run_server(
     let log_cache = Arc::new(LogCache::new(config.cache.log_cache_size_bytes));
     let block_cache = Arc::new(BlockCache::new(config.cache.block_cache_size_bytes));
 
+    let advertised_host = if host == "0.0.0.0" {
+        std::env::var("OXIDEMQ_ADVERTISED_HOST").unwrap_or_else(|_| "127.0.0.1".to_string())
+    } else {
+        host.to_string()
+    };
+
     let cluster_state = Arc::new(ClusterState::new(
         config.broker.node_id,
-        host,
+        &advertised_host,
         kafka_port as i32,
         config.broker.cluster_id.clone(),
         wal,

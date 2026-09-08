@@ -26,6 +26,9 @@ pub enum OxideMqError {
     #[error("Storage engine error: {0}")]
     Storage(String),
 
+    #[error("WAL error: {0}")]
+    Wal(String),
+
     #[error("Protocol error: {0}")]
     Protocol(String),
 

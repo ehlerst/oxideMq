@@ -122,6 +122,57 @@ impl WalRecovery {
 
         Ok(report)
     }
+
+    /// Reconciles and recovers streams given their already committed end offsets in S3.
+    /// Follows AutoMQ's WAL recovery protocol:
+    /// - Discards records that have already been confirmed in object storage (offset < stream_end_offset).
+    /// - Sorts out-of-order records chronologically by stream offset.
+    /// - Detects discontinuous offset gaps: if a gap appears, drops discontinuous trailing records.
+    pub fn reconcile_stream_records(
+        records: Vec<WalRecord>,
+        stream_end_offsets: &HashMap<u64, i64>,
+    ) -> HashMap<u64, Vec<WalRecord>> {
+        let mut grouped: HashMap<u64, Vec<WalRecord>> = HashMap::new();
+        for r in records {
+            grouped.entry(r.stream_id).or_default().push(r);
+        }
+
+        let mut reconciled: HashMap<u64, Vec<WalRecord>> = HashMap::new();
+
+        for (stream_id, mut recs) in grouped {
+            let end_offset = match stream_end_offsets.get(&stream_id) {
+                Some(&off) => off,
+                None => continue, // ignore streams not registered in stream_end_offsets
+            };
+
+            // Sort out-of-order records by logical offset
+            recs.sort_by_key(|r| r.offset);
+
+            let mut valid_stream_records = Vec::new();
+            let mut expected_offset = end_offset;
+
+            for r in recs {
+                // If record offset is less than already committed S3 end offset, skip
+                if r.offset < end_offset {
+                    continue;
+                }
+
+                if r.offset == expected_offset {
+                    expected_offset = r.offset + 1;
+                    valid_stream_records.push(r);
+                } else if r.offset > expected_offset {
+                    // Discontinuous gap detected: drop discontinuous records per AutoMQ protocol
+                    break;
+                }
+            }
+
+            if !valid_stream_records.is_empty() {
+                reconciled.insert(stream_id, valid_stream_records);
+            }
+        }
+
+        reconciled
+    }
 }
 
 #[cfg(test)]
@@ -185,5 +236,74 @@ mod tests {
         assert_eq!(report.total_records_recovered, 1);
         assert_eq!(report.highest_seq, 1);
         assert_eq!(report.truncated_bytes, 15);
+    }
+
+    /// Ported from AutoMQ WALRecoveryTest: testRecoverContinuousRecords
+    /// Verifies continuous records are recovered, already-committed records are ignored,
+    /// and discontinuous trailing records are dropped.
+    #[test]
+    fn test_recover_continuous_records() {
+        let records = vec![
+            WalRecord::new(1, 233, 10, Bytes::from_static(b"data-10")),
+            WalRecord::new(2, 233, 11, Bytes::from_static(b"data-11")),
+            WalRecord::new(3, 233, 12, Bytes::from_static(b"data-12")),
+            WalRecord::new(4, 233, 15, Bytes::from_static(b"discontinuous-15")),
+            WalRecord::new(5, 234, 20, Bytes::from_static(b"unregistered-stream")),
+        ];
+
+        let mut end_offsets = HashMap::new();
+        end_offsets.insert(233, 11);
+
+        let recovered = WalRecovery::reconcile_stream_records(records, &end_offsets);
+        assert_eq!(recovered.len(), 1);
+        let s233 = recovered.get(&233).unwrap();
+        assert_eq!(s233.len(), 2);
+        assert_eq!(s233[0].offset, 11);
+        assert_eq!(s233[1].offset, 12);
+    }
+
+    /// Ported from AutoMQ WALRecoveryTest: testRecoverDataLoss
+    /// When a stream's S3 end offset is 5, but WAL starts at 10 (data loss gap),
+    /// all records are dropped as discontinuous.
+    #[test]
+    fn test_recover_data_loss() {
+        let records = vec![
+            WalRecord::new(1, 233, 10, Bytes::from_static(b"data-10")),
+            WalRecord::new(2, 233, 11, Bytes::from_static(b"data-11")),
+            WalRecord::new(3, 233, 12, Bytes::from_static(b"data-12")),
+        ];
+
+        let mut end_offsets = HashMap::new();
+        end_offsets.insert(233, 5);
+
+        let recovered = WalRecovery::reconcile_stream_records(records, &end_offsets);
+        assert!(
+            recovered.is_empty(),
+            "Gap between S3 and WAL must result in discontinuous drop"
+        );
+    }
+
+    /// Ported from AutoMQ WALRecoveryTest: testRecoverOutOfOrderRecords
+    /// Out-of-order WAL records (e.g. 9, 10, 13, 11, 12, 14) are sorted and recovered continuously.
+    #[test]
+    fn test_recover_out_of_order_records() {
+        let records = vec![
+            WalRecord::new(1, 42, 9, Bytes::from_static(b"9")),
+            WalRecord::new(2, 42, 10, Bytes::from_static(b"10")),
+            WalRecord::new(3, 42, 13, Bytes::from_static(b"13")),
+            WalRecord::new(4, 42, 11, Bytes::from_static(b"11")),
+            WalRecord::new(5, 42, 12, Bytes::from_static(b"12")),
+            WalRecord::new(6, 42, 14, Bytes::from_static(b"14")),
+        ];
+
+        let mut end_offsets = HashMap::new();
+        end_offsets.insert(42, 9);
+
+        let recovered = WalRecovery::reconcile_stream_records(records, &end_offsets);
+        let s42 = recovered.get(&42).unwrap();
+        assert_eq!(s42.len(), 6);
+        for (i, rec) in s42.iter().enumerate() {
+            assert_eq!(rec.offset, 9 + i as i64);
+        }
     }
 }

@@ -61,57 +61,57 @@ impl ApiVersionsResponse {
             ApiVersionKey {
                 api_key: 0,
                 min_version: 0,
-                max_version: 9,
+                max_version: 7,
             }, // Produce
             ApiVersionKey {
                 api_key: 1,
                 min_version: 0,
-                max_version: 12,
+                max_version: 11,
             }, // Fetch
             ApiVersionKey {
                 api_key: 2,
                 min_version: 0,
-                max_version: 7,
+                max_version: 6,
             }, // ListOffsets
             ApiVersionKey {
                 api_key: 3,
                 min_version: 0,
-                max_version: 12,
+                max_version: 7,
             }, // Metadata
             ApiVersionKey {
                 api_key: 8,
                 min_version: 0,
-                max_version: 8,
+                max_version: 7,
             }, // OffsetCommit
             ApiVersionKey {
                 api_key: 9,
                 min_version: 0,
-                max_version: 8,
+                max_version: 7,
             }, // OffsetFetch
             ApiVersionKey {
                 api_key: 10,
                 min_version: 0,
-                max_version: 4,
+                max_version: 3,
             }, // FindCoordinator
             ApiVersionKey {
                 api_key: 11,
                 min_version: 0,
-                max_version: 9,
+                max_version: 8,
             }, // JoinGroup
             ApiVersionKey {
                 api_key: 12,
                 min_version: 0,
-                max_version: 4,
+                max_version: 3,
             }, // Heartbeat
             ApiVersionKey {
                 api_key: 13,
                 min_version: 0,
-                max_version: 5,
+                max_version: 4,
             }, // LeaveGroup
             ApiVersionKey {
                 api_key: 14,
                 min_version: 0,
-                max_version: 5,
+                max_version: 4,
             }, // SyncGroup
             ApiVersionKey {
                 api_key: 18,
@@ -121,12 +121,12 @@ impl ApiVersionsResponse {
             ApiVersionKey {
                 api_key: 19,
                 min_version: 0,
-                max_version: 7,
+                max_version: 4,
             }, // CreateTopics
             ApiVersionKey {
                 api_key: 20,
                 min_version: 0,
-                max_version: 6,
+                max_version: 3,
             }, // DeleteTopics
         ];
         Self::new(KafkaErrorCode::None, keys)
@@ -340,6 +340,9 @@ impl MetadataResponse {
                 for isr in &p.isr_nodes {
                     dst.put_i32(*isr);
                 }
+                if version >= 5 {
+                    dst.put_i32(0); // offline_replicas count = 0
+                }
             }
         }
     }
@@ -402,6 +405,13 @@ impl MetadataResponse {
                 let mut isr_nodes = Vec::with_capacity(isr_count);
                 for _ in 0..isr_count {
                     isr_nodes.push(src.get_i32());
+                }
+
+                if version >= 5 {
+                    let offline_count = src.get_i32() as usize;
+                    for _ in 0..offline_count {
+                        src.get_i32();
+                    }
                 }
 
                 partitions.push(PartitionMetadata {

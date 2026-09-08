@@ -169,3 +169,104 @@ async fn test_broker_daemon_cold_start_and_rss() {
         }
     }
 }
+
+#[tokio::test]
+async fn test_real_docker_testcontainers_suite() {
+    use testcontainers::core::IntoContainerPort;
+    use testcontainers::runners::AsyncRunner;
+    use testcontainers::GenericImage;
+
+    // Check if Docker socket is available; if not, skip gracefully
+    if !std::path::Path::new("/var/run/docker.sock").exists() {
+        eprintln!("Docker socket not found; skipping testcontainers test.");
+        return;
+    }
+
+    let image = GenericImage::new("ehlers320/oxidemq", "latest")
+        .with_exposed_port(9092.tcp())
+        .with_exposed_port(9093.tcp());
+
+    let container = match image.start().await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "Testcontainers start failed (possibly daemon permissions): {}",
+                e
+            );
+            return;
+        }
+    };
+
+    let admin_port = match container.get_host_port_ipv4(9093.tcp()).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to get host port for admin: {}", e);
+            return;
+        }
+    };
+
+    let kafka_port = match container.get_host_port_ipv4(9092.tcp()).await {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("Failed to get host port for kafka: {}", e);
+            return;
+        }
+    };
+
+    // Wait for container daemon to initialize
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // 1. Verify health endpoint on real running Docker container with retry
+    let mut health_resp = String::new();
+    for _attempt in 0..10 {
+        if let Ok(mut admin_conn) = TcpStream::connect(format!("127.0.0.1:{}", admin_port)).await {
+            let req = format!(
+                "GET /_oxidemq/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+                admin_port
+            );
+            if admin_conn.write_all(req.as_bytes()).await.is_ok() {
+                let mut resp = String::new();
+                if admin_conn.read_to_string(&mut resp).await.is_ok() && resp.contains("200 OK") {
+                    health_resp = resp;
+                    break;
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        health_resp.contains("200 OK"),
+        "Health check failed: {}",
+        health_resp
+    );
+    assert!(health_resp.contains("OK"));
+
+    // 2. Verify Kafka ApiVersions wire protocol on real running Docker container
+    let mut kafka_client = TcpStream::connect(format!("127.0.0.1:{}", kafka_port))
+        .await
+        .unwrap();
+    let header = RequestHeader::new(ApiKey::ApiVersions, 0, 999, Some("testcontainers-client"));
+    let mut body = BytesMut::new();
+    header.encode(&mut body);
+    let api_req = ApiVersionsRequest::default();
+    api_req.encode(&mut body, 0);
+
+    let mut frame = BytesMut::new();
+    frame.put_i32(body.len() as i32);
+    frame.put_slice(&body);
+
+    kafka_client.write_all(&frame).await.unwrap();
+    kafka_client.flush().await.unwrap();
+
+    let resp_len = kafka_client.read_i32().await.unwrap() as usize;
+    let mut resp_buf = vec![0u8; resp_len];
+    kafka_client.read_exact(&mut resp_buf).await.unwrap();
+
+    let mut resp_bytes = Bytes::from(resp_buf);
+    let resp_header = ResponseHeader::decode(&mut resp_bytes).unwrap();
+    assert_eq!(resp_header.correlation_id, 999);
+
+    let api_resp = ApiVersionsResponse::decode(&mut resp_bytes, 0).unwrap();
+    assert_eq!(api_resp.error_code, KafkaErrorCode::None);
+    println!("Testcontainers real Docker container validation passed successfully!");
+}

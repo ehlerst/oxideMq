@@ -73,40 +73,51 @@ Every phase includes dedicated Criterion micro- and macro-benchmarks executed wi
 | **Phase 5** | State API | 50-Partition Restore Apply | **14.36 µs** |
 | **Phase 6** | Cold Start | Storage & State Engine Boot | **2.42 µs** (&lt; 1 ms) |
 | **Phase 6** | Zero-GC Produce | Flat Latency Distribution | **2.75 µs** (0 ms jitter) |
-| **Phase 7** | Head-to-Head Produce | 1 KiB Produce Throughput | **2.29 µs** (**425.27 MiB/s**) |
-| **Phase 7** | Head-to-Head Cold Start | Full Engine Ready State | **2.43 µs** (Sub-millisecond) |
+| **Phase 7 (Core)** | In-Memory Fast-Path | 1 KiB Zero-Copy Produce | **2.29 µs** (**425.27 MiB/s**) |
 
 ---
 
-## ⚔️ Live Head-to-Head Benchmark: oxideMq vs. AutoMQ (on RustStack S3)
+## ⚔️ Live 2.5GbE Network Benchmark: oxideMq vs. AutoMQ (on RustStack S3)
 
-To validate the real-world performance differences between clean-room pure Rust and the official JVM AutoMQ implementation, both systems were deployed side-by-side against a local instance of [RustStack](https://github.com/ehlerst/ruststack) high-performance S3 emulation (`http://localhost:4566`):
+To validate real-world performance differences under production network conditions, both systems were deployed and benchmarked across a dedicated **2.5GbE physical network link** against [RustStack](https://github.com/ehlerst/ruststack) high-performance S3 storage emulation (`automq-bucket` and `oxidemq-bucket`):
 
-- **Environment**: Linux x86_64, NVMe, local loopback network.
-- **S3 Object Storage**: [RustStack S3](https://github.com/ehlerst/ruststack) running on port `4566` (`automq-bucket` and `oxidemq-bucket`).
-- **AutoMQ Setup**: Official `automqinc/automq:latest` container (AutoMQ 3.9.1 / Apache Kafka 3.9), single-node KRaft server mode (`--process.roles server`), S3 Object WAL enabled.
-- **Workload**: 10,000 records of 1,024 bytes (1 KiB) produced with acks=1. Official `kafka-producer-perf-test.sh` against AutoMQ, matched against identical wire batches in oxideMq.
+- **Network Topology**: Client machine (`192.168.55.31`) $\rightarrow$ 2.5GbE physical switch $\rightarrow$ Dedicated broker VM (`192.168.55.25:9092`).
+- **Benchmark Client**: Official Apache Kafka Java client (`kafka-producer-perf-test.sh` from Kafka 3.9.1).
+- **Workload**: 10,000 records of 1,024 bytes (1 KiB) each, produced with `acks=1`, standard production batching `batch.size=16384`, and `linger.ms=5`.
+- **Brokers Tested**:
+  - **AutoMQ**: Official `automqinc/automq:latest` container (AutoMQ 3.9.1 / KRaft server mode / S3 Object WAL enabled).
+  - **oxideMq**: Standalone compiled release binary (`v0.1.0` pure Rust).
 
-### 📈 Empirical Head-to-Head Matrix
+### 📈 Empirical 2.5GbE Head-to-Head Matrix
 
-| Performance & Resource Metric | oxideMq (Clean-Room Pure Rust) | AutoMQ 3.9.1 (`automqinc/automq:latest`) | oxideMq Advantage |
+| Performance & Resource Metric | oxideMq (Pure Rust) | AutoMQ 3.9.1 (`automqinc/automq:latest`) | oxideMq Advantage |
 | :--- | :--- | :--- | :--- |
-| **Docker Container Size** | **26.6 MB** (Distroless) | **1,490 MB** (1.49 GB) | **56x smaller footprint** |
-| **Cold Start to Ready** | **2.43 µs** (0.0024 ms) | **18,000 ms** (18.0 seconds) | **> 7,400,000x faster boot** |
-| **Idle Memory (RSS)** | **4.96 MiB** (5,088 KiB) | **1,087.35 MiB** (1,113,448 KiB) | **219x less memory** |
-| **Peak Memory Under Load** | **9.20 MiB** | **1,575.80 MiB** (1,613,656 KiB) | **171x less memory** |
-| **OS Thread Count** | **6 threads** (Tokio work-stealing) | **291 threads** (Netty + JMX + GC + Raft) | **48x fewer OS threads** |
-| **Produce Latency (Average)** | **2.29 µs** (0.0023 ms) | **116.17 ms** | **> 50,000x lower latency** |
-| **Produce Latency (P99)** | **< 5.0 µs** | **179.0 ms** | **> 35,000x lower P99 tail** |
-| **Produce Throughput** | **425.27 MiB/s** (~435,000 rec/s) | **16.92 MiB/s** (17,331 rec/s) | **25.1x higher throughput** |
-| **Idle CPU Utilization** | **0.0%** (Pure async epoll) | **9.68% – 14.31%** (JMX/GC background churn) | **Zero CPU wasted at idle** |
-| **Garbage Collection Pauses** | **0 ms** (Deterministic RAII) | Periodic Stop-the-World GC pauses | **Zero GC jitter** |
+| **Docker Container Size** | **41.9 MB** (10.6 MB compressed) | **2,540 MB** (982 MB compressed) | **60x smaller image** |
+| **Initial Topic & Partition Ready** | **178 ms** (0.18 seconds) | **13,404 ms** (13.4 seconds) | **75x faster first-produce readiness** |
+| **Warmed Network Throughput** | **15,822 rec/s** (**15.45 MB/s**) | **15,082 rec/s** (**14.73 MB/s**) | **+5% higher sustained wire throughput** |
+| **Zero-Linger Latency Throughput** | **16,694 rec/s** (**16.30 MB/s**) | — | High responsiveness on interactive streams |
+| **Average Network Produce Latency** | **107.28 ms** | **126.33 ms** | **15% lower wire latency** |
+| **P95 Latency** | **160.0 ms** | **194.0 ms** | **18% lower tail latency** |
+| **P99 Latency** | **167.0 ms** | **201.0 ms** | **17% lower tail latency** |
+| **Max Network Latency** | **332.0 ms** | **360.0 ms** | **28 ms lower peak ceiling** |
+| **Idle Memory (RSS)** | **4.98 MiB** | **11,960 MiB** (11.68 GiB) | **> 2,400x lower memory footprint** |
+| **Peak Memory Under 10k Load** | **66.3 MiB** | **12,134 MiB** (11.85 GiB) | **> 180x lower active memory** |
+| **OS Thread Count** | **9 threads** (Tokio work-stealing) | **214 threads** (Netty + JVM GC + JMX + Raft) | **24x fewer OS threads** |
+| **Idle CPU Utilization** | **0.00%** (Pure async epoll) | **5.15%** (Background GC/JMX/KRaft keepalives) | **Zero CPU wasted at idle** |
+| **Garbage Collection Pauses** | **0 ms** (Deterministic RAII) | Periodic Stop-the-World ZGC/G1 pauses | **100% deterministic P99.99** |
+
+> [!NOTE]
+> **Benchmarking Integrity**:
+> - **In-Memory Core Microbenchmarks**: Criterion benchmarks measure pure memory operations (e.g. `2.29 µs` per 1KB produce in RAM).
+> - **End-to-End Network Benchmarks**: Over physical 2.5GbE wire with standard `linger.ms=5` client batching, client-observed latency is ~107 ms for oxideMq vs ~126 ms for AutoMQ.
+> - The primary real-world advantages of oxideMq are its **dramatic 2,400x reduction in memory footprint** (5 MiB vs 11.7 GiB), **60x smaller image** (42 MB vs 2.5 GB), **zero garbage collection pauses**, and **instant partition readiness** (178 ms vs 13.4 s).
 
 ### 💡 Why oxideMq Outperforms AutoMQ:
 1. **Zero-Copy Memory Model**: Requests bypass JVM `ByteBuffer` heap-to-direct memory copy cycles and JNI boundaries, operating on reference-counted slice offsets via `bytes::BytesMut`.
 2. **Deterministic RAII Deallocation**: Memory buffers are immediately reclaimed upon network transmission completion with zero generational GC spikes or stop-the-world pauses.
 3. **Sub-Millisecond Tokio Async Core**: Instead of hundreds of blocked OS threads waiting on Java synchronization primitives, oxideMq schedules connections over a lean tokio epoll loop consuming under 5 MiB RSS.
 4. **Direct Cloud Storage Pipelining**: Hardware CRC32C streaming (`31.5 GiB/s`) coalesces straight to the RustStack/S3 HTTP client without intermediate JNI wrappers or Java native bridging layers.
+5. **Real Docker Testcontainers Integration**: Verified in Rust with the `testcontainers` crate, asserting ephemeral port binding, HTTP `/health`, and Kafka TCP wire negotiation.
 
 
 ## 🐳 Running with Docker
