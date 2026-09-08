@@ -204,6 +204,33 @@ impl GroupCoordinator {
             .get(group_id)
             .and_then(|g| g.offsets.get(tp).copied())
     }
+
+    pub fn reset(&self) {
+        self.groups.write().clear();
+    }
+
+    pub fn group_count(&self) -> usize {
+        self.groups.read().len()
+    }
+
+    pub fn dump_group_snapshots(&self) -> Vec<crate::state::ConsumerGroupSnapshot> {
+        let groups = self.groups.read();
+        let mut snapshots = Vec::with_capacity(groups.len());
+        for (gid, g) in groups.iter() {
+            let mut offsets = HashMap::new();
+            for (tp, off) in &g.offsets {
+                offsets.insert(format!("{}:{}", tp.topic, tp.partition), *off);
+            }
+            snapshots.push(crate::state::ConsumerGroupSnapshot {
+                group_id: gid.clone(),
+                state: format!("{:?}", g.state),
+                generation_id: g.generation_id,
+                leader_id: g.leader_id.clone(),
+                offsets,
+            });
+        }
+        snapshots
+    }
 }
 
 #[cfg(test)]

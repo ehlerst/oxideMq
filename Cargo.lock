@@ -844,6 +844,8 @@ dependencies = [
  "oxidemq-s3stream",
  "oxidemq-wal",
  "parking_lot",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror",
  "tokio",

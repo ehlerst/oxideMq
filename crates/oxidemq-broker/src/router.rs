@@ -106,6 +106,26 @@ impl ClusterState {
         self.partitions.read().len()
     }
 
+    pub fn reset(&self) {
+        self.partitions.write().clear();
+        self.next_stream_id.store(100, Ordering::SeqCst);
+    }
+
+    pub fn dump_partition_snapshots(&self) -> Vec<crate::state::PartitionSnapshot> {
+        let partitions = self.partitions.read();
+        let mut snapshots = Vec::with_capacity(partitions.len());
+        for (tp, part) in partitions.iter() {
+            snapshots.push(crate::state::PartitionSnapshot {
+                topic: tp.topic.clone(),
+                partition: tp.partition,
+                stream_id: part.stream.stream_id(),
+                high_watermark: part.high_watermark(),
+                log_start_offset: part.log_start_offset(),
+            });
+        }
+        snapshots
+    }
+
     /// Constructs standard Kafka `MetadataResponse`.
     pub fn build_metadata(&self, requested_topics: Option<&[String]>) -> MetadataResponse {
         let brokers = vec![BrokerMetadata {

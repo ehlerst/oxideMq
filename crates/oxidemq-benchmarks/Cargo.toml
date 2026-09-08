@@ -37,4 +37,9 @@ harness = false
 name = "phase4_broker"
 harness = false
 
+[[bench]]
+name = "phase5_chaos"
+harness = false
+
+
 

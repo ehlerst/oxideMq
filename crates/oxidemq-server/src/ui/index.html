@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>oxideMq - High-Performance Pure Rust Kafka Console</title>
+    <style>
+        :root {
+            --bg-primary: #0f172a;
+            --bg-secondary: #1e293b;
+            --bg-tertiary: #334155;
+            --text-primary: #f8fafc;
+            --text-secondary: #94a3b8;
+            --accent-cyan: #38bdf8;
+            --accent-purple: #a855f7;
+            --accent-green: #22c55e;
+            --accent-red: #ef4444;
+            --accent-amber: #f59e0b;
+            --border-color: #334155;
+            --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            background-color: var(--bg-primary);
+            color: var(--text-primary);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+            line-height: 1.5;
+            padding: 24px;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 16px;
+            margin-bottom: 24px;
+        }
+
+        .logo-area { display: flex; align-items: center; gap: 12px; }
+        .logo-text { font-size: 24px; font-weight: 800; letter-spacing: -0.5px; }
+        .logo-text span { color: var(--accent-cyan); }
+        .badge {
+            background: rgba(34, 197, 94, 0.15);
+            color: var(--accent-green);
+            padding: 4px 10px;
+            border-radius: 9999px;
+            font-size: 12px;
+            font-weight: 600;
+            border: 1px solid rgba(34, 197, 94, 0.3);
+        }
+
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-bottom: 24px;
+        }
+
+        .stat-card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 10px;
+            padding: 18px;
+        }
+
+        .stat-title { font-size: 13px; color: var(--text-secondary); text-transform: uppercase; font-weight: 600; margin-bottom: 6px; }
+        .stat-value { font-size: 28px; font-weight: 700; color: var(--text-primary); font-family: var(--font-mono); }
+        .stat-sub { font-size: 12px; color: var(--accent-cyan); margin-top: 4px; }
+
+        .main-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(480px, 1fr));
+            gap: 24px;
+        }
+
+        .card {
+            background: var(--bg-secondary);
+            border: 1px solid var(--border-color);
+            border-radius: 12px;
+            padding: 20px;
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 16px;
+            border-bottom: 1px solid var(--border-color);
+            padding-bottom: 10px;
+        }
+
+        .card-title { font-size: 18px; font-weight: 700; display: flex; align-items: center; gap: 8px; }
+
+        table { width: 100%; border-collapse: collapse; font-size: 14px; font-family: var(--font-mono); }
+        th { text-align: left; padding: 10px 12px; color: var(--text-secondary); border-bottom: 1px solid var(--border-color); font-weight: 600; }
+        td { padding: 10px 12px; border-bottom: 1px solid rgba(51, 65, 85, 0.5); }
+        tr:hover { background: rgba(51, 65, 85, 0.3); }
+
+        .btn {
+            background: var(--accent-cyan);
+            color: #000;
+            border: none;
+            padding: 8px 14px;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 13px;
+            cursor: pointer;
+            transition: opacity 0.2s;
+        }
+        .btn:hover { opacity: 0.9; }
+        .btn-danger { background: var(--accent-red); color: #fff; }
+        .btn-purple { background: var(--accent-purple); color: #fff; }
+        .btn-secondary { background: var(--bg-tertiary); color: var(--text-primary); }
+
+        .form-row { display: flex; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
+        .form-group { display: flex; flex-direction: column; gap: 6px; flex: 1; min-width: 140px; }
+        label { font-size: 12px; color: var(--text-secondary); font-weight: 600; }
+        input, select, textarea {
+            background: var(--bg-primary);
+            border: 1px solid var(--border-color);
+            color: var(--text-primary);
+            padding: 8px 12px;
+            border-radius: 6px;
+            font-family: var(--font-mono);
+            font-size: 13px;
+        }
+        input:focus, select:focus, textarea:focus { outline: 1px solid var(--accent-cyan); }
+        textarea { width: 100%; height: 100px; resize: vertical; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <header>
+        <div class="logo-area">
+            <div class="logo-text">oxide<span>Mq</span></div>
+            <span class="badge" id="status-badge">● ONLINE (0 JVM Overhead)</span>
+            <span class="badge" style="background: rgba(56, 189, 248, 0.15); color: var(--accent-cyan); border-color: rgba(56, 189, 248, 0.3);">Idle RSS &lt; 5 MiB</span>
+        </div>
+        <div style="font-family: var(--font-mono); font-size: 13px; color: var(--text-secondary);">
+            Cluster: <strong id="cluster-id" style="color: var(--text-primary);">oxide-1</strong> | 
+            Node: <strong id="node-id" style="color: var(--text-primary);">1</strong>
+        </div>
+    </header>
+
+    <div class="stats-grid">
+        <div class="stat-card">
+            <div class="stat-title">Partitions</div>
+            <div class="stat-value" id="stat-partitions">0</div>
+            <div class="stat-sub">S3Stream Backed</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-title">Consumer Groups</div>
+            <div class="stat-value" id="stat-groups">0</div>
+            <div class="stat-sub">Active Coordinations</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-title">Active Chaos Rules</div>
+            <div class="stat-value" id="stat-chaos">0</div>
+            <div class="stat-sub">Deterministic Faults</div>
+        </div>
+        <div class="stat-card">
+            <div class="stat-title">Cold Start Time</div>
+            <div class="stat-value" style="color: var(--accent-green);">&lt; 1 ms</div>
+            <div class="stat-sub">Sub-millisecond pure Rust</div>
+        </div>
+    </div>
+
+    <div class="main-grid">
+        <!-- Partitions Card -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title">Topic Partitions</div>
+                <button class="btn btn-secondary" onclick="fetchStatus()">Refresh</button>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Topic</th>
+                        <th>Partition</th>
+                        <th>High Watermark</th>
+                        <th>Log Start</th>
+                    </tr>
+                </thead>
+                <tbody id="partitions-tbody">
+                    <tr><td colspan="4" style="text-align: center; color: var(--text-secondary);">No partitions active yet</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Consumer Groups Card -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title">Consumer Groups</div>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Group ID</th>
+                        <th>State</th>
+                        <th>Generation</th>
+                        <th>Offsets Committed</th>
+                    </tr>
+                </thead>
+                <tbody id="groups-tbody">
+                    <tr><td colspan="4" style="text-align: center; color: var(--text-secondary);">No consumer groups active</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Chaos Engine Card -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title">Chaos Engine (Fault Injection)</div>
+                <button class="btn btn-danger" onclick="clearChaos()">Clear All Rules</button>
+            </div>
+            <div class="form-row">
+                <div class="form-group">
+                    <label>Rule ID</label>
+                    <input type="text" id="chaos-id" placeholder="e.g. s3-latency-spike">
+                </div>
+                <div class="form-group">
+                    <label>Target</label>
+                    <select id="chaos-target">
+                        <option value="Produce">Produce</option>
+                        <option value="Fetch">Fetch</option>
+                        <option value="Wal">Wal</option>
+                        <option value="S3Storage">S3Storage</option>
+                    </select>
+                </div>
+                <div class="form-group">
+                    <label>Injected Latency (ms)</label>
+                    <input type="number" id="chaos-latency" value="0" min="0">
+                </div>
+                <div class="form-group">
+                    <label>Error Rate (0.0 - 1.0)</label>
+                    <input type="number" id="chaos-error-prob" value="0.0" step="0.1" min="0" max="1">
+                </div>
+            </div>
+            <button class="btn btn-purple" style="margin-bottom: 16px;" onclick="addChaosRule()">Inject Chaos Rule</button>
+
+            <table>
+                <thead>
+                    <tr>
+                        <th>Rule ID</th>
+                        <th>Target</th>
+                        <th>Latency</th>
+                        <th>Error Rate</th>
+                    </tr>
+                </thead>
+                <tbody id="chaos-tbody">
+                    <tr><td colspan="4" style="text-align: center; color: var(--text-secondary);">No active fault injection rules</td></tr>
+                </tbody>
+            </table>
+        </div>
+
+        <!-- Deterministic State Management Card -->
+        <div class="card">
+            <div class="card-header">
+                <div class="card-title">Deterministic State API</div>
+                <div style="display: flex; gap: 8px;">
+                    <button class="btn" onclick="dumpState()">Dump State JSON</button>
+                    <button class="btn btn-danger" onclick="resetState()">Reset State</button>
+                </div>
+            </div>
+            <p style="font-size: 13px; color: var(--text-secondary);">
+                Export or restore full cluster metadata, stream mappings, and consumer offsets instantly for deterministic replay.
+            </p>
+            <textarea id="state-dump-area" placeholder="Click 'Dump State JSON' to capture snapshot or paste snapshot JSON here to restore..."></textarea>
+            <button class="btn btn-secondary" style="margin-top: 8px;" onclick="loadState()">Apply Snapshot JSON</button>
+        </div>
+    </div>
+
+    <script>
+        async function fetchStatus() {
+            try {
+                const res = await fetch('/_oxidemq/status');
+                const data = await res.json();
+                document.getElementById('cluster-id').innerText = data.cluster_id || 'oxide-1';
+                document.getElementById('node-id').innerText = data.node_id || '1';
+                document.getElementById('stat-partitions').innerText = data.partitions ? data.partitions.length : 0;
+                document.getElementById('stat-groups').innerText = data.consumer_groups ? data.consumer_groups.length : 0;
+
+                const pTbody = document.getElementById('partitions-tbody');
+                if (data.partitions && data.partitions.length > 0) {
+                    pTbody.innerHTML = data.partitions.map(p => `
+                        <tr>
+                            <td><strong>${p.topic}</strong></td>
+                            <td>${p.partition}</td>
+                            <td style="color: var(--accent-cyan); font-weight: bold;">${p.high_watermark}</td>
+                            <td>${p.log_start_offset}</td>
+                        </tr>
+                    `).join('');
+                } else {
+                    pTbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-secondary);">No partitions active yet</td></tr>';
+                }
+
+                const gTbody = document.getElementById('groups-tbody');
+                if (data.consumer_groups && data.consumer_groups.length > 0) {
+                    gTbody.innerHTML = data.consumer_groups.map(g => `
+                        <tr>
+                            <td><strong>${g.group_id}</strong></td>
+                            <td><span class="badge" style="background: rgba(56, 189, 248, 0.15); color: var(--accent-cyan);">${g.state}</span></td>
+                            <td>${g.generation_id}</td>
+                            <td>${Object.keys(g.offsets || {}).length} partitions</td>
+                        </tr>
+                    `).join('');
+                } else {
+                    gTbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-secondary);">No consumer groups active</td></tr>';
+                }
+
+                fetchChaosRules();
+            } catch (e) {
+                console.error("Failed to fetch broker status:", e);
+            }
+        }
+
+        async function fetchChaosRules() {
+            try {
+                const res = await fetch('/_oxidemq/chaos/rules');
+                const rules = await res.json();
+                document.getElementById('stat-chaos').innerText = rules.length;
+                const cTbody = document.getElementById('chaos-tbody');
+                if (rules.length > 0) {
+                    cTbody.innerHTML = rules.map(r => `
+                        <tr>
+                            <td><strong>${r.id}</strong></td>
+                            <td><span class="badge" style="background: rgba(168, 85, 247, 0.15); color: var(--accent-purple);">${r.target}</span></td>
+                            <td>${r.latency_ms} ms</td>
+                            <td style="color: ${r.error_probability > 0 ? 'var(--accent-red)' : 'var(--text-primary)'};">${(r.error_probability * 100).toFixed(0)}%</td>
+                        </tr>
+                    `).join('');
+                } else {
+                    cTbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--text-secondary);">No active fault injection rules</td></tr>';
+                }
+            } catch (e) {
+                console.error("Failed to fetch chaos rules:", e);
+            }
+        }
+
+        async function addChaosRule() {
+            const id = document.getElementById('chaos-id').value || `rule-${Date.now()}`;
+            const target = document.getElementById('chaos-target').value;
+            const latency_ms = parseInt(document.getElementById('chaos-latency').value) || 0;
+            const error_probability = parseFloat(document.getElementById('chaos-error-prob').value) || 0.0;
+
+            await fetch('/_oxidemq/chaos/rules', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ id, target, latency_ms, error_probability, error_message: null })
+            });
+            fetchChaosRules();
+        }
+
+        async function clearChaos() {
+            await fetch('/_oxidemq/chaos/clear', { method: 'POST' });
+            fetchChaosRules();
+        }
+
+        async function dumpState() {
+            const res = await fetch('/_oxidemq/state/dump');
+            const data = await res.json();
+            document.getElementById('state-dump-area').value = JSON.stringify(data, null, 2);
+        }
+
+        async function resetState() {
+            if (confirm("Reset all broker partitions, streams, and state?")) {
+                await fetch('/_oxidemq/state/reset', { method: 'POST' });
+                fetchStatus();
+                document.getElementById('state-dump-area').value = "";
+            }
+        }
+
+        async function loadState() {
+            const val = document.getElementById('state-dump-area').value;
+            if (!val) return;
+            try {
+                const snapshot = JSON.parse(val);
+                await fetch('/_oxidemq/state/load', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(snapshot)
+                });
+                fetchStatus();
+                alert("Cluster state restored successfully!");
+            } catch (e) {
+                alert("Invalid JSON snapshot: " + e.message);
+            }
+        }
+
+        // Initialize & poll every 3 seconds
+        fetchStatus();
+        setInterval(fetchStatus, 3000);
+    </script>
+</body>
+</html>

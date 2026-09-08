@@ -1,3 +1,4 @@
+use crate::chaos::{ChaosEngine, FaultTarget};
 use crate::coordinator::GroupCoordinator;
 use crate::router::ClusterState;
 use bytes::{BufMut, Bytes, BytesMut};
@@ -24,6 +25,7 @@ use tracing::{debug, error, trace};
 pub struct BrokerEngine {
     cluster_state: Arc<ClusterState>,
     coordinator: Arc<GroupCoordinator>,
+    chaos: Arc<ChaosEngine>,
 }
 
 impl BrokerEngine {
@@ -31,7 +33,13 @@ impl BrokerEngine {
         Self {
             cluster_state,
             coordinator,
+            chaos: Arc::new(ChaosEngine::new()),
         }
+    }
+
+    pub fn with_chaos(mut self, chaos: Arc<ChaosEngine>) -> Self {
+        self.chaos = chaos;
+        self
     }
 
     pub fn cluster_state(&self) -> &Arc<ClusterState> {
@@ -40,6 +48,10 @@ impl BrokerEngine {
 
     pub fn coordinator(&self) -> &Arc<GroupCoordinator> {
         &self.coordinator
+    }
+
+    pub fn chaos(&self) -> &Arc<ChaosEngine> {
+        &self.chaos
     }
 
     /// Dispatches and processes an individual Kafka request given its header and body payload.
@@ -63,6 +75,7 @@ impl BrokerEngine {
             ApiKey::Produce => {
                 let req = ProduceRequest::decode(body, header.api_version)?;
                 let mut topic_responses = Vec::with_capacity(req.topic_data.len());
+                let fault = self.chaos.check_fault(FaultTarget::Produce);
 
                 for t in req.topic_data {
                     let mut part_responses = Vec::with_capacity(t.partitions.len());
@@ -70,7 +83,10 @@ impl BrokerEngine {
                         let tp = TopicPartition::new(&t.topic, p.partition);
                         let partition = self.cluster_state.get_or_create_partition(&tp);
 
-                        let (err, base_off, append_time, start_off) =
+                        let (err, base_off, append_time, start_off) = if let Err(e) = &fault {
+                            error!("Chaos fault injected on Produce for {}: {}", tp, e);
+                            (KafkaErrorCode::UnknownServer, -1, -1, 0)
+                        } else {
                             match partition.append_records(p.records) {
                                 Ok((b_off, a_time)) => (
                                     KafkaErrorCode::None,
@@ -82,7 +98,8 @@ impl BrokerEngine {
                                     error!("Failed to append records to {}: {}", tp, e);
                                     (KafkaErrorCode::UnknownServer, -1, -1, 0)
                                 }
-                            };
+                            }
+                        };
 
                         part_responses.push(PartitionProduceResponse {
                             partition: p.partition,
@@ -108,6 +125,7 @@ impl BrokerEngine {
             ApiKey::Fetch => {
                 let req = FetchRequest::decode(body, header.api_version)?;
                 let mut topic_responses = Vec::with_capacity(req.topics.len());
+                let fault = self.chaos.check_fault(FaultTarget::Fetch);
 
                 for t in req.topics {
                     let mut part_responses = Vec::with_capacity(t.partitions.len());
@@ -115,19 +133,24 @@ impl BrokerEngine {
                         let tp = TopicPartition::new(&t.topic, p.partition);
                         let partition = self.cluster_state.get_or_create_partition(&tp);
 
-                        let (err, records_bytes) = match partition
-                            .read_records(p.fetch_offset, p.partition_max_bytes as usize)
-                        {
-                            Ok(batches) => {
-                                let mut b = BytesMut::new();
-                                for (_off, batch_bytes) in batches {
-                                    b.extend_from_slice(&batch_bytes);
+                        let (err, records_bytes) = if let Err(e) = &fault {
+                            error!("Chaos fault injected on Fetch for {}: {}", tp, e);
+                            (KafkaErrorCode::UnknownServer, Bytes::new())
+                        } else {
+                            match partition
+                                .read_records(p.fetch_offset, p.partition_max_bytes as usize)
+                            {
+                                Ok(batches) => {
+                                    let mut b = BytesMut::new();
+                                    for (_off, batch_bytes) in batches {
+                                        b.extend_from_slice(&batch_bytes);
+                                    }
+                                    (KafkaErrorCode::None, b.freeze())
                                 }
-                                (KafkaErrorCode::None, b.freeze())
-                            }
-                            Err(e) => {
-                                error!("Failed to fetch records from {}: {}", tp, e);
-                                (KafkaErrorCode::UnknownServer, Bytes::new())
+                                Err(e) => {
+                                    error!("Failed to fetch records from {}: {}", tp, e);
+                                    (KafkaErrorCode::UnknownServer, Bytes::new())
+                                }
                             }
                         };
 
