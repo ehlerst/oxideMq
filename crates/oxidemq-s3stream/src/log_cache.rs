@@ -93,16 +93,14 @@ impl LogCache {
 
         let mut result = Vec::new();
         let mut total_bytes = 0;
-        let mut expected_offset = start_offset;
 
-        for (&off, payload) in stream_map.range(start_offset..) {
+        for (expected_offset, (&off, payload)) in (start_offset..).zip(stream_map.range(start_offset..)) {
             if off != expected_offset {
                 // Gap in cache
                 break;
             }
             result.push((off, payload.clone()));
             total_bytes += payload.len();
-            expected_offset += 1;
 
             if total_bytes >= max_bytes {
                 break;
