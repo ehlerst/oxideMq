@@ -11,14 +11,14 @@ use oxidemq_s3stream::stream::S3Stream;
 use oxidemq_wal::WalEngine;
 use parking_lot::RwLock;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Central broker cluster state tracking all active topics, partitions, and S3 streams.
 pub struct ClusterState {
     node_id: i32,
-    host: String,
-    port: i32,
+    host: RwLock<String>,
+    port: AtomicI32,
     cluster_id: String,
     partitions: Arc<RwLock<HashMap<TopicPartition, Arc<Partition>>>>,
     wal: Arc<dyn WalEngine>,
@@ -42,8 +42,8 @@ impl ClusterState {
     ) -> Self {
         Self {
             node_id,
-            host: host.into(),
-            port,
+            host: RwLock::new(host.into()),
+            port: AtomicI32::new(port),
             cluster_id: cluster_id.into(),
             partitions: Arc::new(RwLock::new(HashMap::new())),
             wal,
@@ -90,12 +90,20 @@ impl ClusterState {
         self.node_id
     }
 
-    pub fn host(&self) -> &str {
-        &self.host
+    pub fn host(&self) -> String {
+        self.host.read().clone()
     }
 
     pub fn port(&self) -> i32 {
-        self.port
+        self.port.load(Ordering::Relaxed)
+    }
+
+    pub fn set_advertised_host(&self, host: impl Into<String>) {
+        *self.host.write() = host.into();
+    }
+
+    pub fn set_advertised_port(&self, port: i32) {
+        self.port.store(port, Ordering::SeqCst);
     }
 
     pub fn cluster_id(&self) -> &str {
@@ -130,8 +138,8 @@ impl ClusterState {
     pub fn build_metadata(&self, requested_topics: Option<&[String]>) -> MetadataResponse {
         let brokers = vec![BrokerMetadata {
             node_id: self.node_id,
-            host: self.host.clone(),
-            port: self.port,
+            host: self.host(),
+            port: self.port(),
             rack: None,
         }];
 

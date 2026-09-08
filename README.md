@@ -137,6 +137,50 @@ docker run -d \
 
 ---
 
+## 🧪 Testcontainers Support (Java & Rust)
+
+oxideMq provides first-class support for Docker Testcontainers in both Java and Rust, enabling sub-second spin-up in automated integration test suites.
+
+### Java (`compat/java-testcontainers`)
+
+Add `OxideMqContainer` to your JUnit 5 test suite:
+
+```java
+@Testcontainers
+class MyServiceIntegrationTest {
+
+    @Container
+    static final OxideMqContainer oxidemq = new OxideMqContainer();
+
+    @Test
+    void testKafkaProduce() {
+        Properties props = new Properties();
+        props.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, oxidemq.getBootstrapServers());
+        props.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+        props.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, StringSerializer.class.getName());
+
+        try (KafkaProducer<String, String> producer = new KafkaProducer<>(props)) {
+            producer.send(new ProducerRecord<>("my-topic", "key", "val")).get();
+        }
+    }
+}
+```
+
+### Rust (`testcontainers` crate)
+
+```rust
+use testcontainers::runners::AsyncRunner;
+use testcontainers::GenericImage;
+
+let image = GenericImage::new("ehlers320/oxidemq", "latest")
+    .with_exposed_port(9092.tcp())
+    .with_exposed_port(9093.tcp());
+let container = image.start().await.unwrap();
+let kafka_port = container.get_host_port_ipv4(9092.tcp()).await.unwrap();
+```
+
+---
+
 ## 🖥️ Production CLI Usage
 
 The standalone `oxidemq` binary provides built-in operations commands:

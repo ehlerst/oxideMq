@@ -39,3 +39,33 @@ jobs:
 
       - name: Run Workspace Tests
         run: cargo test --workspace --all-targets
+
+  testcontainers-java:
+    name: Java Testcontainers Compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust Stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build oxidemq Release Binary
+        run: cargo build --release -p oxidemq-server
+
+      - name: Prepare Docker Build Context
+        run: |
+          mkdir -p docker-bin/amd64
+          cp target/release/oxidemq docker-bin/amd64/oxidemq
+          chmod +x docker-bin/amd64/oxidemq
+          docker build --build-arg TARGETARCH=amd64 -t ehlers320/oxidemq:latest .
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run Java Testcontainers Suite
+        run: mvn -B test
+        working-directory: compat/java-testcontainers

@@ -163,11 +163,15 @@ async fn run_server(
     } else {
         host.to_string()
     };
+    let advertised_port = std::env::var("OXIDEMQ_ADVERTISED_PORT")
+        .ok()
+        .and_then(|p| p.parse::<i32>().ok())
+        .unwrap_or(kafka_port as i32);
 
     let cluster_state = Arc::new(ClusterState::new(
         config.broker.node_id,
         &advertised_host,
-        kafka_port as i32,
+        advertised_port,
         config.broker.cluster_id.clone(),
         wal,
         storage,

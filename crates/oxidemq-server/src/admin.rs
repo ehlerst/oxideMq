@@ -35,6 +35,7 @@ pub fn create_admin_router(state: AppState) -> Router {
             get(list_chaos_handler).post(add_chaos_handler),
         )
         .route("/_oxidemq/chaos/clear", post(clear_chaos_handler))
+        .route("/_oxidemq/advertised", post(update_advertised_handler))
         .with_state(state)
 }
 
@@ -102,6 +103,29 @@ async fn add_chaos_handler(
 async fn clear_chaos_handler(State(state): State<AppState>) -> impl IntoResponse {
     state.chaos.clear_rules();
     Json(json!({ "status": "ok", "message": "All chaos rules cleared" }))
+}
+
+#[derive(serde::Deserialize)]
+pub struct AdvertisedConfigRequest {
+    pub host: Option<String>,
+    pub port: Option<i32>,
+}
+
+async fn update_advertised_handler(
+    State(state): State<AppState>,
+    Json(payload): Json<AdvertisedConfigRequest>,
+) -> impl IntoResponse {
+    if let Some(h) = payload.host {
+        state.cluster_state.set_advertised_host(h);
+    }
+    if let Some(p) = payload.port {
+        state.cluster_state.set_advertised_port(p);
+    }
+    Json(json!({
+        "status": "updated",
+        "advertised_host": state.cluster_state.host(),
+        "advertised_port": state.cluster_state.port(),
+    }))
 }
 
 #[cfg(test)]

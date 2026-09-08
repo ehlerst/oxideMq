@@ -1,4 +1,6 @@
-/target
+target/
+**/target/
+.m2_cache/
 **/*.rs.bk
 *.bk
 *.log
