@@ -45,6 +45,6 @@ harness = false
 name = "phase6_comparative"
 harness = false
 
-
-
-
+[[bench]]
+name = "phase7_head_to_head"
+harness = false
