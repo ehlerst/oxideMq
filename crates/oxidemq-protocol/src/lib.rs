@@ -12,17 +12,20 @@ pub use codec::KafkaFrameCodec;
 pub use error_code::KafkaErrorCode;
 pub use header::{RequestHeader, ResponseHeader};
 pub use messages::{
-    ApiVersionKey, ApiVersionsRequest, ApiVersionsResponse, BrokerMetadata, FetchPartition,
-    FetchPartitionResponse, FetchRequest, FetchResponse, FetchTopic, FetchTopicResponse,
-    FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
-    LeaveGroupRequest, LeaveGroupResponse, ListOffsetsPartition, ListOffsetsPartitionResponse,
-    ListOffsetsRequest, ListOffsetsResponse, ListOffsetsTopic, ListOffsetsTopicResponse,
-    MetadataRequest, MetadataResponse, OffsetCommitPartition, OffsetCommitPartitionResponse,
-    OffsetCommitRequest, OffsetCommitResponse, OffsetCommitTopic, OffsetCommitTopicResponse,
+    compress_record_batch, decompress_record_batch, encode_record_batch_v2,
+    parse_record_batch_records, ApiVersionKey, ApiVersionsRequest, ApiVersionsResponse,
+    BrokerMetadata, FetchPartition, FetchPartitionResponse, FetchRequest, FetchResponse,
+    FetchTopic, FetchTopicResponse, FindCoordinatorRequest, FindCoordinatorResponse,
+    HeartbeatRequest, HeartbeatResponse, LeaveGroupRequest, LeaveGroupResponse,
+    ListOffsetsPartition, ListOffsetsPartitionResponse, ListOffsetsRequest, ListOffsetsResponse,
+    ListOffsetsTopic, ListOffsetsTopicResponse, MetadataRequest, MetadataResponse,
+    OffsetCommitPartition, OffsetCommitPartitionResponse, OffsetCommitRequest,
+    OffsetCommitResponse, OffsetCommitTopic, OffsetCommitTopicResponse,
     OffsetFetchPartitionResponse, OffsetFetchRequest, OffsetFetchResponse, OffsetFetchTopic,
     OffsetFetchTopicResponse, PartitionMetadata, PartitionProduceData, PartitionProduceResponse,
     ProduceRequest, ProduceResponse, TopicMetadata, TopicProduceData, TopicProduceResponse,
 };
+
 pub use parser::{KafkaDecoder, KafkaEncoder};
 
 /// Kafka API Keys according to the Apache Kafka wire protocol specification.

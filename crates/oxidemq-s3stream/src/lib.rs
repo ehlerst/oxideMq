@@ -12,7 +12,7 @@ pub mod stream;
 pub mod uploader;
 
 pub use block_cache::{BlockCache, BlockKey};
-pub use client::{MemoryObjectStorage, ObjectStorage};
+pub use client::{MemoryObjectStorage, ObjectStorage, RetryableObjectStorage, S3ClientStorage};
 pub use compactor::StreamCompactor;
 pub use format::{S3BlockIndex, S3DataBlock, S3ObjectCodec};
 pub use log_cache::LogCache;

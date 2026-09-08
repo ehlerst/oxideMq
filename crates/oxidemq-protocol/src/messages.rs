@@ -1,7 +1,8 @@
 use crate::error_code::KafkaErrorCode;
 use crate::parser::{KafkaDecoder, KafkaEncoder};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
-use oxidemq_core::error::Result;
+use oxidemq_core::error::{OxideMqError, Result};
+use oxidemq_core::types::{CompressionCodec, Record, RecordHeader};
 
 // ==========================================
 // ApiVersions (Key 18)
@@ -452,6 +453,327 @@ pub struct PartitionProduceData {
     pub records: Bytes,
 }
 
+impl PartitionProduceData {
+    /// Returns the decompressed records payload if the batch is compressed.
+    pub fn decompressed_records(&self) -> Result<Bytes> {
+        decompress_record_batch(&self.records)
+    }
+
+    /// Compresses or recompresses the records in this partition data with the specified codec.
+    pub fn compress_with(&mut self, codec: CompressionCodec) -> Result<()> {
+        self.records = compress_record_batch(&self.records, codec)?;
+        Ok(())
+    }
+}
+
+/// Decompresses any compressed Kafka RecordBatch v2 within `batch_bytes`.
+/// If the batch is already uncompressed, returns the bytes unchanged.
+pub fn decompress_record_batch(batch_bytes: &Bytes) -> Result<Bytes> {
+    if batch_bytes.len() < 61 {
+        return Ok(batch_bytes.clone());
+    }
+
+    let mut cursor = 0;
+    let mut out = BytesMut::new();
+    let src = batch_bytes.as_ref();
+    let mut any_decompressed = false;
+
+    while cursor + 61 <= src.len() {
+        if src[cursor + 16] == 2 {
+            let batch_len =
+                i32::from_be_bytes(src[cursor + 8..cursor + 12].try_into().unwrap()) as usize;
+            let total_batch_size = 12 + batch_len;
+            if cursor + total_batch_size > src.len() {
+                break;
+            }
+
+            let attributes = i16::from_be_bytes(src[cursor + 21..cursor + 23].try_into().unwrap());
+            let codec = CompressionCodec::from_attributes(attributes);
+
+            if codec != CompressionCodec::None {
+                any_decompressed = true;
+                let compressed_payload = &src[cursor + 61..cursor + total_batch_size];
+                let decompressed = codec.decompress(compressed_payload)?;
+
+                let new_batch_len = (49 + decompressed.len()) as i32;
+                let start_idx = out.len();
+
+                out.extend_from_slice(&src[cursor..cursor + 8]);
+                out.put_i32(new_batch_len);
+                out.extend_from_slice(&src[cursor + 12..cursor + 16]);
+                out.put_u8(2);
+                out.put_u32(0);
+                let uncompressed_attributes = attributes & !0x07;
+                out.put_i16(uncompressed_attributes);
+                out.extend_from_slice(&src[cursor + 23..cursor + 61]);
+                out.extend_from_slice(&decompressed);
+
+                let crc_data = &out[start_idx + 21..];
+                let crc = oxidemq_core::compute_crc32c(crc_data);
+                out[start_idx + 17..start_idx + 21].copy_from_slice(&crc.to_be_bytes());
+            } else {
+                out.extend_from_slice(&src[cursor..cursor + total_batch_size]);
+            }
+
+            cursor += total_batch_size;
+        } else {
+            break;
+        }
+    }
+
+    if !any_decompressed {
+        return Ok(batch_bytes.clone());
+    }
+
+    if cursor < src.len() {
+        out.extend_from_slice(&src[cursor..]);
+    }
+
+    Ok(out.freeze())
+}
+
+/// Compresses any Kafka RecordBatch v2 within `batch_bytes` using `target_codec`.
+pub fn compress_record_batch(batch_bytes: &Bytes, target_codec: CompressionCodec) -> Result<Bytes> {
+    if target_codec == CompressionCodec::None {
+        return decompress_record_batch(batch_bytes);
+    }
+
+    let uncompressed_bytes = decompress_record_batch(batch_bytes)?;
+    let src = uncompressed_bytes.as_ref();
+    if src.len() < 61 {
+        return Ok(batch_bytes.clone());
+    }
+
+    let mut cursor = 0;
+    let mut out = BytesMut::new();
+
+    while cursor + 61 <= src.len() {
+        if src[cursor + 16] == 2 {
+            let batch_len =
+                i32::from_be_bytes(src[cursor + 8..cursor + 12].try_into().unwrap()) as usize;
+            let total_batch_size = 12 + batch_len;
+            if cursor + total_batch_size > src.len() {
+                break;
+            }
+
+            let attributes = i16::from_be_bytes(src[cursor + 21..cursor + 23].try_into().unwrap());
+            let payload = &src[cursor + 61..cursor + total_batch_size];
+            let compressed = target_codec.compress(payload)?;
+
+            let new_batch_len = (49 + compressed.len()) as i32;
+            let start_idx = out.len();
+
+            out.extend_from_slice(&src[cursor..cursor + 8]);
+            out.put_i32(new_batch_len);
+            out.extend_from_slice(&src[cursor + 12..cursor + 16]);
+            out.put_u8(2);
+            out.put_u32(0);
+            let new_attributes = (attributes & !0x07) | target_codec.to_attributes();
+            out.put_i16(new_attributes);
+            out.extend_from_slice(&src[cursor + 23..cursor + 61]);
+            out.extend_from_slice(&compressed);
+
+            let crc_data = &out[start_idx + 21..];
+            let crc = oxidemq_core::compute_crc32c(crc_data);
+            out[start_idx + 17..start_idx + 21].copy_from_slice(&crc.to_be_bytes());
+
+            cursor += total_batch_size;
+        } else {
+            break;
+        }
+    }
+
+    if cursor < src.len() {
+        out.extend_from_slice(&src[cursor..]);
+    }
+
+    Ok(out.freeze())
+}
+
+/// Encodes a slice of records into a Kafka RecordBatch v2 byte buffer, optionally compressing with `codec`.
+pub fn encode_record_batch_v2(
+    base_offset: i64,
+    records: &[Record],
+    codec: CompressionCodec,
+) -> Result<Bytes> {
+    let mut payload = BytesMut::new();
+    let base_timestamp = records.first().map(|r| r.timestamp).unwrap_or(0);
+    let mut max_timestamp = base_timestamp;
+
+    for record in records {
+        max_timestamp = max_timestamp.max(record.timestamp);
+
+        let mut rec_body = BytesMut::new();
+        rec_body.put_i8(0);
+        KafkaEncoder::write_varint(&mut rec_body, record.timestamp - base_timestamp);
+        KafkaEncoder::write_varint(&mut rec_body, record.offset - base_offset);
+
+        match &record.key {
+            Some(k) => {
+                KafkaEncoder::write_varint(&mut rec_body, k.len() as i64);
+                rec_body.extend_from_slice(k);
+            }
+            None => {
+                KafkaEncoder::write_varint(&mut rec_body, -1);
+            }
+        }
+
+        match &record.value {
+            Some(v) => {
+                KafkaEncoder::write_varint(&mut rec_body, v.len() as i64);
+                rec_body.extend_from_slice(v);
+            }
+            None => {
+                KafkaEncoder::write_varint(&mut rec_body, -1);
+            }
+        }
+
+        KafkaEncoder::write_varint(&mut rec_body, record.headers.len() as i64);
+        for h in &record.headers {
+            KafkaEncoder::write_varint(&mut rec_body, h.key.len() as i64);
+            rec_body.extend_from_slice(h.key.as_bytes());
+            KafkaEncoder::write_varint(&mut rec_body, h.value.len() as i64);
+            rec_body.extend_from_slice(&h.value);
+        }
+
+        KafkaEncoder::write_varint(&mut payload, rec_body.len() as i64);
+        payload.extend_from_slice(&rec_body);
+    }
+
+    let records_payload = if codec != CompressionCodec::None {
+        codec.compress(&payload)?
+    } else {
+        payload.freeze()
+    };
+
+    let count = records.len() as i32;
+    let last_offset_delta = (count - 1).max(0);
+    let batch_len = (49 + records_payload.len()) as i32;
+
+    let mut out = BytesMut::with_capacity(12 + batch_len as usize);
+    out.put_i64(base_offset);
+    out.put_i32(batch_len);
+    out.put_i32(0);
+    out.put_i8(2);
+    out.put_u32(0);
+
+    let attributes = codec.to_attributes();
+    out.put_i16(attributes);
+    out.put_i32(last_offset_delta);
+    out.put_i64(base_timestamp);
+    out.put_i64(max_timestamp);
+    out.put_i64(-1);
+    out.put_i16(-1);
+    out.put_i32(-1);
+    out.put_i32(count);
+    out.extend_from_slice(&records_payload);
+
+    let crc = oxidemq_core::compute_crc32c(&out[21..]);
+    out[17..21].copy_from_slice(&crc.to_be_bytes());
+
+    Ok(out.freeze())
+}
+
+/// Parses individual `Record` items from a Kafka RecordBatch v2 buffer, decompressing if necessary.
+pub fn parse_record_batch_records(batch_bytes: &Bytes) -> Result<Vec<Record>> {
+    let uncompressed = decompress_record_batch(batch_bytes)?;
+    let mut records = Vec::new();
+    let src = uncompressed.as_ref();
+    let mut cursor = 0;
+
+    while cursor + 61 <= src.len() {
+        if src[cursor + 16] == 2 {
+            let base_offset = i64::from_be_bytes(src[cursor..cursor + 8].try_into().unwrap());
+            let batch_len =
+                i32::from_be_bytes(src[cursor + 8..cursor + 12].try_into().unwrap()) as usize;
+            let total_batch_size = 12 + batch_len;
+            if cursor + total_batch_size > src.len() {
+                break;
+            }
+
+            let base_timestamp =
+                i64::from_be_bytes(src[cursor + 27..cursor + 35].try_into().unwrap());
+            let num_records = i32::from_be_bytes(src[cursor + 57..cursor + 61].try_into().unwrap());
+
+            let mut payload = Bytes::copy_from_slice(&src[cursor + 61..cursor + total_batch_size]);
+
+            for _ in 0..num_records {
+                if !payload.has_remaining() {
+                    break;
+                }
+                let _record_len = KafkaDecoder::read_varint(&mut payload)?;
+                if !payload.has_remaining() {
+                    break;
+                }
+                let _attributes = payload.get_i8();
+                let ts_delta = KafkaDecoder::read_varint(&mut payload)?;
+                let off_delta = KafkaDecoder::read_varint(&mut payload)?;
+
+                let key_len = KafkaDecoder::read_varint(&mut payload)?;
+                let key = if key_len >= 0 {
+                    let len = key_len as usize;
+                    if payload.len() < len {
+                        return Err(OxideMqError::Protocol("Truncated record key".into()));
+                    }
+                    Some(payload.copy_to_bytes(len))
+                } else {
+                    None
+                };
+
+                let val_len = KafkaDecoder::read_varint(&mut payload)?;
+                let value = if val_len >= 0 {
+                    let len = val_len as usize;
+                    if payload.len() < len {
+                        return Err(OxideMqError::Protocol("Truncated record value".into()));
+                    }
+                    Some(payload.copy_to_bytes(len))
+                } else {
+                    None
+                };
+
+                let headers_count = KafkaDecoder::read_varint(&mut payload)?;
+                let mut headers = Vec::new();
+                for _ in 0..headers_count.max(0) {
+                    let k_len = KafkaDecoder::read_varint(&mut payload)?;
+                    if k_len < 0 || payload.len() < k_len as usize {
+                        return Err(OxideMqError::Protocol("Truncated header key".into()));
+                    }
+                    let k_bytes = payload.copy_to_bytes(k_len as usize);
+                    let k_str = String::from_utf8(k_bytes.to_vec()).map_err(|e| {
+                        OxideMqError::Protocol(format!("Invalid header key UTF-8: {e}"))
+                    })?;
+
+                    let v_len = KafkaDecoder::read_varint(&mut payload)?;
+                    let v_bytes = if v_len >= 0 {
+                        if payload.len() < v_len as usize {
+                            return Err(OxideMqError::Protocol("Truncated header value".into()));
+                        }
+                        payload.copy_to_bytes(v_len as usize)
+                    } else {
+                        Bytes::new()
+                    };
+
+                    headers.push(RecordHeader::new(k_str, v_bytes));
+                }
+
+                records.push(Record {
+                    offset: base_offset + off_delta,
+                    timestamp: base_timestamp + ts_delta,
+                    key,
+                    value,
+                    headers,
+                });
+            }
+
+            cursor += total_batch_size;
+        } else {
+            break;
+        }
+    }
+
+    Ok(records)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicProduceData {
     pub topic: String,
@@ -714,6 +1036,19 @@ pub struct FetchPartitionResponse {
     pub high_watermark: i64,
     pub last_stable_offset: i64,
     pub records: Bytes,
+}
+
+impl FetchPartitionResponse {
+    /// Returns the decompressed records payload if the batch is compressed.
+    pub fn decompressed_records(&self) -> Result<Bytes> {
+        decompress_record_batch(&self.records)
+    }
+
+    /// Compresses or recompresses the records in this fetch partition response with the specified codec.
+    pub fn compress_with(&mut self, codec: CompressionCodec) -> Result<()> {
+        self.records = compress_record_batch(&self.records, codec)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1803,5 +2138,205 @@ mod tests {
         let mut read_buf = buf.freeze();
         let decoded = LeaveGroupResponse::decode(&mut read_buf, 1).unwrap();
         assert_eq!(decoded.error_code, KafkaErrorCode::None);
+    }
+
+    #[test]
+    fn test_record_batch_compression_codecs() {
+        let mut rec1 = Record::new(
+            100,
+            1000,
+            Some(Bytes::from_static(b"order-key-1")),
+            Some(Bytes::from_static(
+                b"order-payload-with-repetitive-data-12345-12345-12345",
+            )),
+        );
+        rec1.headers
+            .push(RecordHeader::new("source", Bytes::from_static(b"api")));
+
+        let mut rec2 = Record::new(
+            101,
+            1001,
+            Some(Bytes::from_static(b"order-key-2")),
+            Some(Bytes::from_static(
+                b"order-payload-with-repetitive-data-67890-67890-67890",
+            )),
+        );
+        rec2.headers
+            .push(RecordHeader::new("trace-id", Bytes::from_static(b"tx-999")));
+
+        let original_records = vec![rec1, rec2];
+
+        let codecs = [
+            CompressionCodec::None,
+            CompressionCodec::Gzip,
+            CompressionCodec::Snappy,
+            CompressionCodec::Lz4,
+            CompressionCodec::Zstd,
+        ];
+
+        for codec in codecs {
+            let batch = encode_record_batch_v2(100, &original_records, codec).unwrap();
+            assert!(batch.len() >= 61);
+
+            // Parse records directly
+            let parsed = parse_record_batch_records(&batch).unwrap();
+            assert_eq!(parsed.len(), 2);
+            assert_eq!(parsed[0].offset, 100);
+            assert_eq!(parsed[0].key.as_deref(), Some(&b"order-key-1"[..]));
+            assert_eq!(
+                parsed[0].value.as_deref(),
+                Some(&b"order-payload-with-repetitive-data-12345-12345-12345"[..])
+            );
+            assert_eq!(parsed[0].headers.len(), 1);
+            assert_eq!(parsed[0].headers[0].key, "source");
+
+            assert_eq!(parsed[1].offset, 101);
+            assert_eq!(parsed[1].key.as_deref(), Some(&b"order-key-2"[..]));
+            assert_eq!(
+                parsed[1].value.as_deref(),
+                Some(&b"order-payload-with-repetitive-data-67890-67890-67890"[..])
+            );
+            assert_eq!(parsed[1].headers.len(), 1);
+            assert_eq!(parsed[1].headers[0].key, "trace-id");
+
+            // Decompress explicitly
+            let decompressed_batch = decompress_record_batch(&batch).unwrap();
+            assert_eq!(decompressed_batch[16], 2); // magic v2
+            let attr = i16::from_be_bytes(decompressed_batch[21..23].try_into().unwrap());
+            assert_eq!(
+                CompressionCodec::from_attributes(attr),
+                CompressionCodec::None
+            );
+
+            let decompressed_parsed = parse_record_batch_records(&decompressed_batch).unwrap();
+            assert_eq!(decompressed_parsed.len(), 2);
+        }
+
+        // Test transcoding across codecs: Uncompressed -> Gzip -> Snappy -> LZ4 -> Zstd -> Uncompressed
+        let base_batch =
+            encode_record_batch_v2(0, &original_records, CompressionCodec::None).unwrap();
+
+        let gz_batch = compress_record_batch(&base_batch, CompressionCodec::Gzip).unwrap();
+        assert_eq!(
+            CompressionCodec::from_attributes(i16::from_be_bytes(
+                gz_batch[21..23].try_into().unwrap()
+            )),
+            CompressionCodec::Gzip
+        );
+
+        let snappy_batch = compress_record_batch(&gz_batch, CompressionCodec::Snappy).unwrap();
+        assert_eq!(
+            CompressionCodec::from_attributes(i16::from_be_bytes(
+                snappy_batch[21..23].try_into().unwrap()
+            )),
+            CompressionCodec::Snappy
+        );
+
+        let lz4_batch = compress_record_batch(&snappy_batch, CompressionCodec::Lz4).unwrap();
+        assert_eq!(
+            CompressionCodec::from_attributes(i16::from_be_bytes(
+                lz4_batch[21..23].try_into().unwrap()
+            )),
+            CompressionCodec::Lz4
+        );
+
+        let zstd_batch = compress_record_batch(&lz4_batch, CompressionCodec::Zstd).unwrap();
+        assert_eq!(
+            CompressionCodec::from_attributes(i16::from_be_bytes(
+                zstd_batch[21..23].try_into().unwrap()
+            )),
+            CompressionCodec::Zstd
+        );
+
+        let final_uncompressed = decompress_record_batch(&zstd_batch).unwrap();
+        assert_eq!(
+            CompressionCodec::from_attributes(i16::from_be_bytes(
+                final_uncompressed[21..23].try_into().unwrap()
+            )),
+            CompressionCodec::None
+        );
+
+        let final_parsed = parse_record_batch_records(&final_uncompressed).unwrap();
+        assert_eq!(final_parsed.len(), 2);
+        assert_eq!(final_parsed[0].key.as_deref(), Some(&b"order-key-1"[..]));
+    }
+
+    #[test]
+    fn test_partition_produce_and_fetch_compression() {
+        let rec = Record::new(
+            0,
+            500,
+            None,
+            Some(Bytes::from_static(
+                b"repeat-payload-repeat-payload-repeat-payload",
+            )),
+        );
+        let raw = encode_record_batch_v2(0, &[rec], CompressionCodec::Snappy).unwrap();
+
+        let mut p_data = PartitionProduceData {
+            partition: 0,
+            records: raw.clone(),
+        };
+
+        let decompressed = p_data.decompressed_records().unwrap();
+        assert_ne!(decompressed, raw);
+
+        p_data.compress_with(CompressionCodec::Zstd).unwrap();
+        assert_eq!(
+            CompressionCodec::from_attributes(i16::from_be_bytes(
+                p_data.records[21..23].try_into().unwrap()
+            )),
+            CompressionCodec::Zstd
+        );
+
+        let mut f_resp = FetchPartitionResponse {
+            partition_index: 0,
+            error_code: KafkaErrorCode::None,
+            high_watermark: 1,
+            last_stable_offset: 1,
+            records: raw,
+        };
+
+        let f_decompressed = f_resp.decompressed_records().unwrap();
+        assert_eq!(f_decompressed, decompressed);
+
+        f_resp.compress_with(CompressionCodec::Lz4).unwrap();
+        assert_eq!(
+            CompressionCodec::from_attributes(i16::from_be_bytes(
+                f_resp.records[21..23].try_into().unwrap()
+            )),
+            CompressionCodec::Lz4
+        );
+    }
+
+    #[test]
+    fn test_corrupted_compression_handling() {
+        // Small buffer returns as-is
+        let small = Bytes::from_static(b"too-small");
+        assert_eq!(decompress_record_batch(&small).unwrap(), small);
+        assert_eq!(
+            compress_record_batch(&small, CompressionCodec::Gzip).unwrap(),
+            small
+        );
+
+        // RecordBatch header with invalid compression payload
+        let mut corrupted = BytesMut::new();
+        corrupted.put_i64(0); // base_offset
+        corrupted.put_i32(49 + 10); // batch_len
+        corrupted.put_i32(0); // leader_epoch
+        corrupted.put_u8(2); // magic
+        corrupted.put_u32(0); // crc
+        corrupted.put_i16(1); // attributes: GZIP
+        corrupted.put_i32(0); // last_offset_delta
+        corrupted.put_i64(0); // first_timestamp
+        corrupted.put_i64(0); // max_timestamp
+        corrupted.put_i64(-1); // producer_id
+        corrupted.put_i16(-1); // producer_epoch
+        corrupted.put_i32(-1); // first_sequence
+        corrupted.put_i32(1); // num_records
+        corrupted.extend_from_slice(b"bad-gzip-corrupted-bytes!");
+
+        let res = decompress_record_batch(&corrupted.freeze());
+        assert!(res.is_err(), "Expected error for corrupted gzip stream");
     }
 }

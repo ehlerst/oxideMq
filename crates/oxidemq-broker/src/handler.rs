@@ -3,7 +3,7 @@ use crate::coordinator::GroupCoordinator;
 use crate::router::ClusterState;
 use bytes::{BufMut, Bytes, BytesMut};
 use oxidemq_core::error::{OxideMqError, Result};
-use oxidemq_core::types::TopicPartition;
+use oxidemq_core::types::{CompressionCodec, TopicPartition};
 use oxidemq_protocol::header::{RequestHeader, ResponseHeader};
 use oxidemq_protocol::messages::{
     ApiVersionsRequest, ApiVersionsResponse, FetchPartitionResponse, FetchRequest, FetchResponse,
@@ -87,16 +87,25 @@ impl BrokerEngine {
                             error!("Chaos fault injected on Produce for {}: {}", tp, e);
                             (KafkaErrorCode::UnknownServer, -1, -1, 0)
                         } else {
-                            match partition.append_records(p.records) {
-                                Ok((b_off, a_time)) => (
-                                    KafkaErrorCode::None,
-                                    b_off,
-                                    a_time,
-                                    partition.log_start_offset(),
-                                ),
-                                Err(e) => {
-                                    error!("Failed to append records to {}: {}", tp, e);
-                                    (KafkaErrorCode::UnknownServer, -1, -1, 0)
+                            // Validate and decompress if compressed, ensuring payload integrity
+                            if let Err(e) = p.decompressed_records() {
+                                error!(
+                                    "Corrupted compressed record batch produced to {}: {}",
+                                    tp, e
+                                );
+                                (KafkaErrorCode::CorruptMessage, -1, -1, 0)
+                            } else {
+                                match partition.append_records(p.records) {
+                                    Ok((b_off, a_time)) => (
+                                        KafkaErrorCode::None,
+                                        b_off,
+                                        a_time,
+                                        partition.log_start_offset(),
+                                    ),
+                                    Err(e) => {
+                                        error!("Failed to append records to {}: {}", tp, e);
+                                        (KafkaErrorCode::UnknownServer, -1, -1, 0)
+                                    }
                                 }
                             }
                         };
@@ -155,13 +164,24 @@ impl BrokerEngine {
                         };
 
                         let hw = partition.high_watermark();
-                        part_responses.push(FetchPartitionResponse {
+                        let mut resp_part = FetchPartitionResponse {
                             partition_index: p.partition,
                             error_code: err,
                             high_watermark: hw,
                             last_stable_offset: hw,
                             records: records_bytes,
-                        });
+                        };
+                        if let Ok(comp_str) = std::env::var("OXIDEMQ_FETCH_COMPRESSION") {
+                            let codec = match comp_str.to_lowercase().as_str() {
+                                "gzip" => CompressionCodec::Gzip,
+                                "snappy" => CompressionCodec::Snappy,
+                                "lz4" => CompressionCodec::Lz4,
+                                "zstd" => CompressionCodec::Zstd,
+                                _ => CompressionCodec::None,
+                            };
+                            let _ = resp_part.compress_with(codec);
+                        }
+                        part_responses.push(resp_part);
                     }
 
                     topic_responses.push(FetchTopicResponse {

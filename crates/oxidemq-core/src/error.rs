@@ -32,6 +32,9 @@ pub enum OxideMqError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    #[error("Compression error: {0}")]
+    Compression(String),
+
     #[error("Configuration error: {0}")]
     Configuration(String),
 

@@ -1,6 +1,8 @@
+use crate::error::{OxideMqError, Result};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::io::{Read, Write};
 
 /// Unique identifier for a streaming storage stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -59,6 +61,100 @@ impl CompressionCodec {
 
     pub fn to_attributes(self) -> i16 {
         self as i16
+    }
+
+    /// Compresses raw record batch payload using this codec.
+    pub fn compress(self, data: &[u8]) -> Result<Bytes> {
+        match self {
+            Self::None => Ok(Bytes::copy_from_slice(data)),
+            Self::Gzip => {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder
+                    .write_all(data)
+                    .map_err(|e| OxideMqError::Compression(format!("Gzip compress error: {e}")))?;
+                let compressed = encoder
+                    .finish()
+                    .map_err(|e| OxideMqError::Compression(format!("Gzip finish error: {e}")))?;
+                Ok(Bytes::from(compressed))
+            }
+            Self::Snappy => {
+                let mut encoder = snap::raw::Encoder::new();
+                let compressed = encoder.compress_vec(data).map_err(|e| {
+                    OxideMqError::Compression(format!("Snappy compress error: {e}"))
+                })?;
+                Ok(Bytes::from(compressed))
+            }
+            Self::Lz4 => {
+                let mut out = Vec::new();
+                let mut encoder = lz4_flex::frame::FrameEncoder::new(&mut out);
+                encoder
+                    .write_all(data)
+                    .map_err(|e| OxideMqError::Compression(format!("LZ4 compress error: {e}")))?;
+                encoder
+                    .finish()
+                    .map_err(|e| OxideMqError::Compression(format!("LZ4 finish error: {e}")))?;
+                Ok(Bytes::from(out))
+            }
+            Self::Zstd => {
+                let compressed = zstd::stream::encode_all(data, 0)
+                    .map_err(|e| OxideMqError::Compression(format!("Zstd compress error: {e}")))?;
+                Ok(Bytes::from(compressed))
+            }
+        }
+    }
+
+    /// Decompresses raw compressed record batch payload using this codec.
+    pub fn decompress(self, data: &[u8]) -> Result<Bytes> {
+        match self {
+            Self::None => Ok(Bytes::copy_from_slice(data)),
+            Self::Gzip => {
+                let mut decoder = flate2::read::GzDecoder::new(data);
+                let mut decompressed = Vec::new();
+                decoder.read_to_end(&mut decompressed).map_err(|e| {
+                    OxideMqError::Compression(format!("Gzip decompress error: {e}"))
+                })?;
+                Ok(Bytes::from(decompressed))
+            }
+            Self::Snappy => {
+                if data.starts_with(b"\xff\x06\x00\x00sNaPpY") {
+                    let mut decoder = snap::read::FrameDecoder::new(data);
+                    let mut decompressed = Vec::new();
+                    decoder.read_to_end(&mut decompressed).map_err(|e| {
+                        OxideMqError::Compression(format!("Snappy framed decompress error: {e}"))
+                    })?;
+                    Ok(Bytes::from(decompressed))
+                } else {
+                    let mut decoder = snap::raw::Decoder::new();
+                    let decompressed = decoder.decompress_vec(data).map_err(|e| {
+                        OxideMqError::Compression(format!("Snappy raw decompress error: {e}"))
+                    })?;
+                    Ok(Bytes::from(decompressed))
+                }
+            }
+            Self::Lz4 => {
+                if data.starts_with(&[0x04, 0x22, 0x4D, 0x18]) {
+                    let mut decoder = lz4_flex::frame::FrameDecoder::new(data);
+                    let mut decompressed = Vec::new();
+                    decoder.read_to_end(&mut decompressed).map_err(|e| {
+                        OxideMqError::Compression(format!("LZ4 frame decompress error: {e}"))
+                    })?;
+                    Ok(Bytes::from(decompressed))
+                } else {
+                    let decompressed =
+                        lz4_flex::block::decompress_size_prepended(data).map_err(|e| {
+                            OxideMqError::Compression(format!("LZ4 block decompress error: {e}"))
+                        })?;
+                    Ok(Bytes::from(decompressed))
+                }
+            }
+            Self::Zstd => {
+                let decompressed = zstd::stream::decode_all(data).map_err(|e| {
+                    OxideMqError::Compression(format!("Zstd decompress error: {e}"))
+                })?;
+                Ok(Bytes::from(decompressed))
+            }
+        }
     }
 }
 
@@ -253,5 +349,74 @@ mod tests {
         assert!(empty_batch.is_empty());
         assert_eq!(empty_batch.last_offset(), 200);
         assert_eq!(empty_batch.size_in_bytes(), 0);
+    }
+
+    #[test]
+    fn test_compression_roundtrips() {
+        let sample_data = b"The quick brown fox jumps over the lazy dog. Repeat this string to ensure good compression ratio! The quick brown fox jumps over the lazy dog.";
+
+        let codecs = [
+            CompressionCodec::None,
+            CompressionCodec::Gzip,
+            CompressionCodec::Snappy,
+            CompressionCodec::Lz4,
+            CompressionCodec::Zstd,
+        ];
+
+        for codec in codecs {
+            let compressed = codec
+                .compress(sample_data)
+                .expect("Compression should succeed");
+            if codec != CompressionCodec::None {
+                assert!(
+                    compressed.len() < sample_data.len(),
+                    "Codec {:?} did not compress",
+                    codec
+                );
+            } else {
+                assert_eq!(compressed.as_ref(), sample_data);
+            }
+
+            let decompressed = codec
+                .decompress(&compressed)
+                .expect("Decompression should succeed");
+            assert_eq!(
+                decompressed.as_ref(),
+                sample_data,
+                "Decompressed mismatch for codec {:?}",
+                codec
+            );
+        }
+    }
+
+    #[test]
+    fn test_compression_snappy_framed() {
+        use std::io::Write;
+        let sample = b"Snappy framed test data with enough repeated elements 1234567890 1234567890";
+        let mut framed_out = Vec::new();
+        let mut encoder = snap::write::FrameEncoder::new(&mut framed_out);
+        encoder.write_all(sample).unwrap();
+        drop(encoder);
+
+        assert!(framed_out.starts_with(b"\xff\x06\x00\x00sNaPpY"));
+        let decompressed = CompressionCodec::Snappy.decompress(&framed_out).unwrap();
+        assert_eq!(decompressed.as_ref(), sample);
+    }
+
+    #[test]
+    fn test_compression_lz4_block() {
+        let sample = b"LZ4 prepend size test payload with repeated data xyz123 xyz123 xyz123";
+        let compressed = lz4_flex::block::compress_prepend_size(sample);
+        let decompressed = CompressionCodec::Lz4.decompress(&compressed).unwrap();
+        assert_eq!(decompressed.as_ref(), sample);
+    }
+
+    #[test]
+    fn test_compression_invalid_data() {
+        let invalid = b"completely-corrupted-and-invalid-compressed-bytes";
+        assert!(CompressionCodec::Gzip.decompress(invalid).is_err());
+        assert!(CompressionCodec::Snappy.decompress(invalid).is_err());
+        assert!(CompressionCodec::Lz4.decompress(invalid).is_err());
+        assert!(CompressionCodec::Zstd.decompress(invalid).is_err());
     }
 }

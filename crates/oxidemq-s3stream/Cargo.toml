@@ -15,6 +15,10 @@ dashmap = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 crc32fast = { workspace = true }
+aws-sdk-s3 = { workspace = true }
+aws-config = { workspace = true }
+aws-credential-types = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+axum = { workspace = true }

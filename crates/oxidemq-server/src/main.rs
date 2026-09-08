@@ -5,7 +5,7 @@ use oxidemq_broker::handler::BrokerEngine;
 use oxidemq_broker::router::ClusterState;
 use oxidemq_core::config::OxideConfig;
 use oxidemq_s3stream::block_cache::BlockCache;
-use oxidemq_s3stream::client::MemoryObjectStorage;
+use oxidemq_s3stream::client::{MemoryObjectStorage, ObjectStorage, S3ClientStorage};
 use oxidemq_s3stream::log_cache::LogCache;
 use oxidemq_server::admin::{create_admin_router, AppState};
 use oxidemq_wal::memory::MemoryWal;
@@ -156,7 +156,30 @@ async fn run_server(
 
     // 1. Initialize Storage, Cache, and State Layers
     let wal = Arc::new(MemoryWal::new());
-    let storage = Arc::new(MemoryObjectStorage::new());
+    let storage: Arc<dyn ObjectStorage> = if let Ok(bucket) = std::env::var("OXIDEMQ_S3_BUCKET") {
+        let endpoint = std::env::var("OXIDEMQ_S3_ENDPOINT").ok();
+        let region = std::env::var("OXIDEMQ_S3_REGION").ok();
+        info!(
+            "Initializing S3ClientStorage backend with bucket '{}' (endpoint: {:?})",
+            bucket, endpoint
+        );
+        Arc::new(
+            S3ClientStorage::new(bucket, endpoint.as_deref(), region.as_deref())
+                .expect("Failed to initialize S3ClientStorage"),
+        )
+    } else if let Ok(endpoint) = std::env::var("OXIDEMQ_S3_ENDPOINT") {
+        info!(
+            "Initializing S3ClientStorage backend with endpoint '{}'",
+            endpoint
+        );
+        Arc::new(
+            S3ClientStorage::new("oxidemq-data", Some(&endpoint), None)
+                .expect("Failed to initialize S3ClientStorage"),
+        )
+    } else {
+        info!("Using in-memory Tier 1 storage backend (MemoryObjectStorage)");
+        Arc::new(MemoryObjectStorage::new())
+    };
     let log_cache = Arc::new(LogCache::new(config.cache.log_cache_size_bytes));
     let block_cache = Arc::new(BlockCache::new(config.cache.block_cache_size_bytes));
 
