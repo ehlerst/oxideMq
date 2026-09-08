@@ -12,8 +12,8 @@
 | **S3** | `GetObject` with `Range` header | S3Stream historical / cold reads | ✅ Supported (`ByteRange` parser) | `Range: bytes=start-end` tested |
 | **S3** | `DeleteObjects` (Multi-Object) | Compactor garbage collection | ✅ Supported (`DeleteObjects` XML) | Verified in `ruststack-s3` |
 | **S3** | `ListObjectsV2` | Stream discovery & recovery | ✅ Supported | Continuation token supported |
-| **S3** | `CompleteMultipartUpload` Checksums | Large compacted segment uploads | ⚠️ Under Observation | Validate checksum verification |
-| **S3** | S3 Express One Zone latency tier | Ultra-low latency WAL tier | 💡 Feature Request | Issue #RS-001 |
+| **S3** | `CompleteMultipartUpload` Checksums | Large compacted segment uploads | ✅ Supported (`ruststack-s3`) | Verified CRC32, CRC32C, SHA1, SHA256 & composite checksum calculations |
+| **S3** | S3 Express One Zone latency tier | Ultra-low latency WAL tier | ✅ Supported (`ruststack-s3`) | Resolved in Issue #RS-001 |
 
 ---
 
@@ -23,8 +23,11 @@
 - **Component**: `ruststack-s3`
 - **Type**: Feature Request
 - **Description**: S3 Express One Zone delivers single-digit millisecond latency for append logs. Adding an optional low-latency in-memory directory bucket configuration to `ruststack-s3` will allow local stress-testing of S3-based WAL offloading under extreme IOPS without simulated round-trip overhead.
-- **Impact on oxideMq**: Non-blocking; oxideMq functions with standard S3 bucket semantics and uses local NVMe/Memory WAL for sub-millisecond writes.
-- **Status**: Open / Proposed
+- **Impact on oxideMq**: Enables local high-throughput WAL replication testing directly against emulated S3 Express One Zone directory buckets (`--x-s3` suffix, `Bucket.Type = Directory`, `CreateSession` API authentication, and `EXPRESS_ONEZONE` storage class).
+- **Status**: ✅ Resolved / Supported (`ruststack-s3`)
+- **Verification & Benchmarks**:
+  - Integration test suite: `crates/ruststack-compat-tests/tests/test_s3_express_and_checksums_compat.rs`
+  - Criterion benchmark: 4 KB WAL record Put ~36.7 µs (~27,000 ops/sec), Get ~193 ns (>5M ops/sec)
 
 ---
 
