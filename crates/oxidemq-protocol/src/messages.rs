@@ -804,3 +804,590 @@ impl FetchResponse {
         })
     }
 }
+
+// ==========================================
+// FindCoordinator (Key 10)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindCoordinatorRequest {
+    pub key: String,
+    pub key_type: i8, // 0 = group, 1 = transaction
+}
+
+impl FindCoordinatorRequest {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let key = KafkaDecoder::read_string(src)?.unwrap_or_default();
+        let key_type = if version >= 1 { src.get_i8() } else { 0 };
+        Ok(Self { key, key_type })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        KafkaEncoder::write_string(dst, Some(&self.key));
+        if version >= 1 {
+            dst.put_i8(self.key_type);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FindCoordinatorResponse {
+    pub throttle_time_ms: i32,
+    pub error_code: KafkaErrorCode,
+    pub error_message: Option<String>,
+    pub node_id: i32,
+    pub host: String,
+    pub port: i32,
+}
+
+impl FindCoordinatorResponse {
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        if version >= 1 {
+            dst.put_i32(self.throttle_time_ms);
+        }
+        dst.put_i16(self.error_code.code());
+        if version >= 1 {
+            KafkaEncoder::write_string(dst, self.error_message.as_deref());
+        }
+        dst.put_i32(self.node_id);
+        KafkaEncoder::write_string(dst, Some(&self.host));
+        dst.put_i32(self.port);
+    }
+
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let throttle_time_ms = if version >= 1 { src.get_i32() } else { 0 };
+        let error_code = KafkaErrorCode::from_i16(src.get_i16());
+        let error_message = if version >= 1 {
+            KafkaDecoder::read_string(src)?
+        } else {
+            None
+        };
+        let node_id = src.get_i32();
+        let host = KafkaDecoder::read_string(src)?.unwrap_or_default();
+        let port = src.get_i32();
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            error_message,
+            node_id,
+            host,
+            port,
+        })
+    }
+}
+
+// ==========================================
+// ListOffsets (Key 2)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListOffsetsPartition {
+    pub partition: i32,
+    pub timestamp: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListOffsetsTopic {
+    pub topic: String,
+    pub partitions: Vec<ListOffsetsPartition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListOffsetsRequest {
+    pub replica_id: i32,
+    pub topics: Vec<ListOffsetsTopic>,
+}
+
+impl ListOffsetsRequest {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        let replica_id = src.get_i32();
+        let topic_count = src.get_i32() as usize;
+        let mut topics = Vec::with_capacity(topic_count);
+        for _ in 0..topic_count {
+            let topic = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            let p_count = src.get_i32() as usize;
+            let mut partitions = Vec::with_capacity(p_count);
+            for _ in 0..p_count {
+                let partition = src.get_i32();
+                let timestamp = src.get_i64();
+                partitions.push(ListOffsetsPartition {
+                    partition,
+                    timestamp,
+                });
+            }
+            topics.push(ListOffsetsTopic { topic, partitions });
+        }
+        Ok(Self { replica_id, topics })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.replica_id);
+        dst.put_i32(self.topics.len() as i32);
+        for t in &self.topics {
+            KafkaEncoder::write_string(dst, Some(&t.topic));
+            dst.put_i32(t.partitions.len() as i32);
+            for p in &t.partitions {
+                dst.put_i32(p.partition);
+                dst.put_i64(p.timestamp);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListOffsetsPartitionResponse {
+    pub partition: i32,
+    pub error_code: KafkaErrorCode,
+    pub timestamp: i64,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListOffsetsTopicResponse {
+    pub topic: String,
+    pub partitions: Vec<ListOffsetsPartitionResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListOffsetsResponse {
+    pub throttle_time_ms: i32,
+    pub topics: Vec<ListOffsetsTopicResponse>,
+}
+
+impl ListOffsetsResponse {
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        if version >= 2 {
+            dst.put_i32(self.throttle_time_ms);
+        }
+        dst.put_i32(self.topics.len() as i32);
+        for t in &self.topics {
+            KafkaEncoder::write_string(dst, Some(&t.topic));
+            dst.put_i32(t.partitions.len() as i32);
+            for p in &t.partitions {
+                dst.put_i32(p.partition);
+                dst.put_i16(p.error_code.code());
+                dst.put_i64(p.timestamp);
+                dst.put_i64(p.offset);
+            }
+        }
+    }
+
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let throttle_time_ms = if version >= 2 { src.get_i32() } else { 0 };
+        let topic_count = src.get_i32() as usize;
+        let mut topics = Vec::with_capacity(topic_count);
+        for _ in 0..topic_count {
+            let topic = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            let p_count = src.get_i32() as usize;
+            let mut partitions = Vec::with_capacity(p_count);
+            for _ in 0..p_count {
+                let partition = src.get_i32();
+                let error_code = KafkaErrorCode::from_i16(src.get_i16());
+                let timestamp = src.get_i64();
+                let offset = src.get_i64();
+                partitions.push(ListOffsetsPartitionResponse {
+                    partition,
+                    error_code,
+                    timestamp,
+                    offset,
+                });
+            }
+            topics.push(ListOffsetsTopicResponse { topic, partitions });
+        }
+        Ok(Self {
+            throttle_time_ms,
+            topics,
+        })
+    }
+}
+
+// ==========================================
+// OffsetCommit (Key 8)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffsetCommitPartition {
+    pub partition: i32,
+    pub committed_offset: i64,
+    pub metadata: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffsetCommitTopic {
+    pub topic: String,
+    pub partitions: Vec<OffsetCommitPartition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffsetCommitRequest {
+    pub group_id: String,
+    pub generation_id: i32,
+    pub member_id: String,
+    pub topics: Vec<OffsetCommitTopic>,
+}
+
+impl OffsetCommitRequest {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let group_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+        let (generation_id, member_id) = if version >= 1 {
+            (
+                src.get_i32(),
+                KafkaDecoder::read_string(src)?.unwrap_or_default(),
+            )
+        } else {
+            (0, String::new())
+        };
+        if (2..=4).contains(&version) {
+            let _retention_time_ms = src.get_i64();
+        }
+        let topic_count = src.get_i32() as usize;
+        let mut topics = Vec::with_capacity(topic_count);
+        for _ in 0..topic_count {
+            let topic = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            let p_count = src.get_i32() as usize;
+            let mut partitions = Vec::with_capacity(p_count);
+            for _ in 0..p_count {
+                let partition = src.get_i32();
+                let committed_offset = src.get_i64();
+                let metadata = KafkaDecoder::read_string(src)?;
+                partitions.push(OffsetCommitPartition {
+                    partition,
+                    committed_offset,
+                    metadata,
+                });
+            }
+            topics.push(OffsetCommitTopic { topic, partitions });
+        }
+        Ok(Self {
+            group_id,
+            generation_id,
+            member_id,
+            topics,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        KafkaEncoder::write_string(dst, Some(&self.group_id));
+        if version >= 1 {
+            dst.put_i32(self.generation_id);
+            KafkaEncoder::write_string(dst, Some(&self.member_id));
+        }
+        if (2..=4).contains(&version) {
+            dst.put_i64(-1);
+        }
+        dst.put_i32(self.topics.len() as i32);
+        for t in &self.topics {
+            KafkaEncoder::write_string(dst, Some(&t.topic));
+            dst.put_i32(t.partitions.len() as i32);
+            for p in &t.partitions {
+                dst.put_i32(p.partition);
+                dst.put_i64(p.committed_offset);
+                KafkaEncoder::write_string(dst, p.metadata.as_deref());
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffsetCommitPartitionResponse {
+    pub partition: i32,
+    pub error_code: KafkaErrorCode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffsetCommitTopicResponse {
+    pub topic: String,
+    pub partitions: Vec<OffsetCommitPartitionResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffsetCommitResponse {
+    pub throttle_time_ms: i32,
+    pub topics: Vec<OffsetCommitTopicResponse>,
+}
+
+impl OffsetCommitResponse {
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        if version >= 3 {
+            dst.put_i32(self.throttle_time_ms);
+        }
+        dst.put_i32(self.topics.len() as i32);
+        for t in &self.topics {
+            KafkaEncoder::write_string(dst, Some(&t.topic));
+            dst.put_i32(t.partitions.len() as i32);
+            for p in &t.partitions {
+                dst.put_i32(p.partition);
+                dst.put_i16(p.error_code.code());
+            }
+        }
+    }
+
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let throttle_time_ms = if version >= 3 { src.get_i32() } else { 0 };
+        let topic_count = src.get_i32() as usize;
+        let mut topics = Vec::with_capacity(topic_count);
+        for _ in 0..topic_count {
+            let topic = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            let p_count = src.get_i32() as usize;
+            let mut partitions = Vec::with_capacity(p_count);
+            for _ in 0..p_count {
+                let partition = src.get_i32();
+                let error_code = KafkaErrorCode::from_i16(src.get_i16());
+                partitions.push(OffsetCommitPartitionResponse {
+                    partition,
+                    error_code,
+                });
+            }
+            topics.push(OffsetCommitTopicResponse { topic, partitions });
+        }
+        Ok(Self {
+            throttle_time_ms,
+            topics,
+        })
+    }
+}
+
+// ==========================================
+// OffsetFetch (Key 9)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffsetFetchTopic {
+    pub topic: String,
+    pub partitions: Vec<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffsetFetchRequest {
+    pub group_id: String,
+    pub topics: Option<Vec<OffsetFetchTopic>>,
+}
+
+impl OffsetFetchRequest {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        let group_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+        let topic_count = src.get_i32();
+        let topics = if topic_count < 0 {
+            None
+        } else {
+            let mut t_vec = Vec::with_capacity(topic_count as usize);
+            for _ in 0..topic_count {
+                let topic = KafkaDecoder::read_string(src)?.unwrap_or_default();
+                let p_count = src.get_i32() as usize;
+                let mut partitions = Vec::with_capacity(p_count);
+                for _ in 0..p_count {
+                    partitions.push(src.get_i32());
+                }
+                t_vec.push(OffsetFetchTopic { topic, partitions });
+            }
+            Some(t_vec)
+        };
+        Ok(Self { group_id, topics })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        KafkaEncoder::write_string(dst, Some(&self.group_id));
+        match &self.topics {
+            Some(t_vec) => {
+                dst.put_i32(t_vec.len() as i32);
+                for t in t_vec {
+                    KafkaEncoder::write_string(dst, Some(&t.topic));
+                    dst.put_i32(t.partitions.len() as i32);
+                    for p in &t.partitions {
+                        dst.put_i32(*p);
+                    }
+                }
+            }
+            None => {
+                dst.put_i32(-1);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffsetFetchPartitionResponse {
+    pub partition: i32,
+    pub offset: i64,
+    pub metadata: Option<String>,
+    pub error_code: KafkaErrorCode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffsetFetchTopicResponse {
+    pub topic: String,
+    pub partitions: Vec<OffsetFetchPartitionResponse>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OffsetFetchResponse {
+    pub throttle_time_ms: i32,
+    pub topics: Vec<OffsetFetchTopicResponse>,
+    pub error_code: KafkaErrorCode,
+}
+
+impl OffsetFetchResponse {
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        if version >= 3 {
+            dst.put_i32(self.throttle_time_ms);
+        }
+        dst.put_i32(self.topics.len() as i32);
+        for t in &self.topics {
+            KafkaEncoder::write_string(dst, Some(&t.topic));
+            dst.put_i32(t.partitions.len() as i32);
+            for p in &t.partitions {
+                dst.put_i32(p.partition);
+                dst.put_i64(p.offset);
+                if version >= 5 {
+                    dst.put_i32(-1); // leader_epoch
+                }
+                KafkaEncoder::write_string(dst, p.metadata.as_deref());
+                dst.put_i16(p.error_code.code());
+            }
+        }
+        if version >= 2 {
+            dst.put_i16(self.error_code.code());
+        }
+    }
+
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let throttle_time_ms = if version >= 3 { src.get_i32() } else { 0 };
+        let topic_count = src.get_i32() as usize;
+        let mut topics = Vec::with_capacity(topic_count);
+        for _ in 0..topic_count {
+            let topic = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            let p_count = src.get_i32() as usize;
+            let mut partitions = Vec::with_capacity(p_count);
+            for _ in 0..p_count {
+                let partition = src.get_i32();
+                let offset = src.get_i64();
+                if version >= 5 {
+                    let _epoch = src.get_i32();
+                }
+                let metadata = KafkaDecoder::read_string(src)?;
+                let error_code = KafkaErrorCode::from_i16(src.get_i16());
+                partitions.push(OffsetFetchPartitionResponse {
+                    partition,
+                    offset,
+                    metadata,
+                    error_code,
+                });
+            }
+            topics.push(OffsetFetchTopicResponse { topic, partitions });
+        }
+        let error_code = if version >= 2 {
+            KafkaErrorCode::from_i16(src.get_i16())
+        } else {
+            KafkaErrorCode::None
+        };
+        Ok(Self {
+            throttle_time_ms,
+            topics,
+            error_code,
+        })
+    }
+}
+
+// ==========================================
+// Heartbeat (Key 12)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeartbeatRequest {
+    pub group_id: String,
+    pub generation_id: i32,
+    pub member_id: String,
+}
+
+impl HeartbeatRequest {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        let group_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+        let generation_id = src.get_i32();
+        let member_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+        Ok(Self {
+            group_id,
+            generation_id,
+            member_id,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        KafkaEncoder::write_string(dst, Some(&self.group_id));
+        dst.put_i32(self.generation_id);
+        KafkaEncoder::write_string(dst, Some(&self.member_id));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeartbeatResponse {
+    pub throttle_time_ms: i32,
+    pub error_code: KafkaErrorCode,
+}
+
+impl HeartbeatResponse {
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        if version >= 1 {
+            dst.put_i32(self.throttle_time_ms);
+        }
+        dst.put_i16(self.error_code.code());
+    }
+
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let throttle_time_ms = if version >= 1 { src.get_i32() } else { 0 };
+        let error_code = KafkaErrorCode::from_i16(src.get_i16());
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+        })
+    }
+}
+
+// ==========================================
+// LeaveGroup (Key 13)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaveGroupRequest {
+    pub group_id: String,
+    pub member_id: String,
+}
+
+impl LeaveGroupRequest {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        let group_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+        let member_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+        Ok(Self {
+            group_id,
+            member_id,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        KafkaEncoder::write_string(dst, Some(&self.group_id));
+        KafkaEncoder::write_string(dst, Some(&self.member_id));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaveGroupResponse {
+    pub throttle_time_ms: i32,
+    pub error_code: KafkaErrorCode,
+}
+
+impl LeaveGroupResponse {
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        if version >= 1 {
+            dst.put_i32(self.throttle_time_ms);
+        }
+        dst.put_i16(self.error_code.code());
+    }
+
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let throttle_time_ms = if version >= 1 { src.get_i32() } else { 0 };
+        let error_code = KafkaErrorCode::from_i16(src.get_i16());
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+        })
+    }
+}

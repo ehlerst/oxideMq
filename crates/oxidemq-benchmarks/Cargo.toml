@@ -33,3 +33,8 @@ harness = false
 name = "phase3_protocol"
 harness = false
 
+[[bench]]
+name = "phase4_broker"
+harness = false
+
+

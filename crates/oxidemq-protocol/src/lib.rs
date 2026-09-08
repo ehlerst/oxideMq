@@ -14,9 +14,14 @@ pub use header::{RequestHeader, ResponseHeader};
 pub use messages::{
     ApiVersionKey, ApiVersionsRequest, ApiVersionsResponse, BrokerMetadata, FetchPartition,
     FetchPartitionResponse, FetchRequest, FetchResponse, FetchTopic, FetchTopicResponse,
-    MetadataRequest, MetadataResponse, PartitionMetadata, PartitionProduceData,
-    PartitionProduceResponse, ProduceRequest, ProduceResponse, TopicMetadata, TopicProduceData,
-    TopicProduceResponse,
+    FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
+    LeaveGroupRequest, LeaveGroupResponse, ListOffsetsPartition, ListOffsetsPartitionResponse,
+    ListOffsetsRequest, ListOffsetsResponse, ListOffsetsTopic, ListOffsetsTopicResponse,
+    MetadataRequest, MetadataResponse, OffsetCommitPartition, OffsetCommitPartitionResponse,
+    OffsetCommitRequest, OffsetCommitResponse, OffsetCommitTopic, OffsetCommitTopicResponse,
+    OffsetFetchPartitionResponse, OffsetFetchRequest, OffsetFetchResponse, OffsetFetchTopic,
+    OffsetFetchTopicResponse, PartitionMetadata, PartitionProduceData, PartitionProduceResponse,
+    ProduceRequest, ProduceResponse, TopicMetadata, TopicProduceData, TopicProduceResponse,
 };
 pub use parser::{KafkaDecoder, KafkaEncoder};
 
