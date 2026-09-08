@@ -5,6 +5,11 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[[bin]]
+name = "oxidemq"
+path = "src/main.rs"
+
+
 [dependencies]
 oxidemq-core = { workspace = true }
 oxidemq-wal = { workspace = true }

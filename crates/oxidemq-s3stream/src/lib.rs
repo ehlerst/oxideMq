@@ -1,7 +1,23 @@
 //! # oxideMq S3Stream Engine
 //!
 //! Cloud-native streaming storage engine decoupling compute and storage by offloading
-//! stream records to S3 with multi-tiered in-memory and LRU caches.
+//! stream records to S3 with multi-tiered in-memory (Tier 1 LogCache) and LRU (Tier 2 BlockCache) caches.
+
+pub mod block_cache;
+pub mod client;
+pub mod compactor;
+pub mod format;
+pub mod log_cache;
+pub mod stream;
+pub mod uploader;
+
+pub use block_cache::{BlockCache, BlockKey};
+pub use client::{MemoryObjectStorage, ObjectStorage};
+pub use compactor::StreamCompactor;
+pub use format::{S3BlockIndex, S3DataBlock, S3ObjectCodec};
+pub use log_cache::LogCache;
+pub use stream::{S3ObjectMeta, S3Stream};
+pub use uploader::BatchUploader;
 
 use oxidemq_core::Result;
 

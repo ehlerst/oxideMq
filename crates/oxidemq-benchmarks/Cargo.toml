@@ -23,3 +23,7 @@ harness = false
 [[bench]]
 name = "phase1_wal"
 harness = false
+
+[[bench]]
+name = "phase2_s3stream"
+harness = false

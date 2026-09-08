@@ -896,6 +896,7 @@ name = "oxidemq-s3stream"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "crc32fast",
  "dashmap",
  "oxidemq-core",
  "oxidemq-wal",

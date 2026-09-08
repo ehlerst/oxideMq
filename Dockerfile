@@ -1,0 +1,15 @@
+FROM gcr.io/distroless/cc-debian12:latest
+
+ARG TARGETARCH
+
+WORKDIR /app
+COPY docker-bin/${TARGETARCH}/oxidemq /usr/local/bin/oxidemq
+
+EXPOSE 9092 9093
+
+ENV HOST=0.0.0.0
+ENV KAFKA_PORT=9092
+ENV ADMIN_PORT=9093
+
+ENTRYPOINT ["/usr/local/bin/oxidemq"]
+CMD ["start"]
