@@ -1,7 +1,3 @@
-mod admin;
-mod ui;
-
-use admin::{create_admin_router, AppState};
 use clap::{Parser, Subcommand};
 use oxidemq_broker::chaos::{ChaosEngine, ChaosRule, FaultTarget};
 use oxidemq_broker::coordinator::GroupCoordinator;
@@ -11,6 +7,7 @@ use oxidemq_core::config::OxideConfig;
 use oxidemq_s3stream::block_cache::BlockCache;
 use oxidemq_s3stream::client::MemoryObjectStorage;
 use oxidemq_s3stream::log_cache::LogCache;
+use oxidemq_server::admin::{create_admin_router, AppState};
 use oxidemq_wal::memory::MemoryWal;
 use std::net::SocketAddr;
 use std::sync::Arc;

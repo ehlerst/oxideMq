@@ -11,8 +11,13 @@ oxidemq-wal = { workspace = true }
 oxidemq-s3stream = { workspace = true }
 oxidemq-protocol = { workspace = true }
 oxidemq-broker = { workspace = true }
+oxidemq-server = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
+axum = { workspace = true }
+serde_json = { workspace = true }
+
+
 
 [dev-dependencies]
 tempfile = { workspace = true }

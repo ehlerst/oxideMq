@@ -856,12 +856,15 @@ dependencies = [
 name = "oxidemq-compat-tests"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "bytes",
  "oxidemq-broker",
  "oxidemq-core",
  "oxidemq-protocol",
  "oxidemq-s3stream",
+ "oxidemq-server",
  "oxidemq-wal",
+ "serde_json",
  "tempfile",
  "tokio",
 ]
