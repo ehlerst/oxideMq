@@ -2,6 +2,24 @@
 //!
 //! Pure-Rust, zero-allocation binary Kafka wire protocol parser and serializer.
 
+pub mod codec;
+pub mod error_code;
+pub mod header;
+pub mod messages;
+pub mod parser;
+
+pub use codec::KafkaFrameCodec;
+pub use error_code::KafkaErrorCode;
+pub use header::{RequestHeader, ResponseHeader};
+pub use messages::{
+    ApiVersionKey, ApiVersionsRequest, ApiVersionsResponse, BrokerMetadata, FetchPartition,
+    FetchPartitionResponse, FetchRequest, FetchResponse, FetchTopic, FetchTopicResponse,
+    MetadataRequest, MetadataResponse, PartitionMetadata, PartitionProduceData,
+    PartitionProduceResponse, ProduceRequest, ProduceResponse, TopicMetadata, TopicProduceData,
+    TopicProduceResponse,
+};
+pub use parser::{KafkaDecoder, KafkaEncoder};
+
 /// Kafka API Keys according to the Apache Kafka wire protocol specification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(i16)]

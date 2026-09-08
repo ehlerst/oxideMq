@@ -13,6 +13,7 @@ oxidemq-protocol = { workspace = true }
 oxidemq-broker = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
+tokio-util = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
 
@@ -27,3 +28,8 @@ harness = false
 [[bench]]
 name = "phase2_s3stream"
 harness = false
+
+[[bench]]
+name = "phase3_protocol"
+harness = false
+

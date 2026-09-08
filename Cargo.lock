@@ -830,6 +830,7 @@ dependencies = [
  "oxidemq-wal",
  "tempfile",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
