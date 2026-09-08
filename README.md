@@ -81,7 +81,8 @@ Every phase includes dedicated Criterion micro- and macro-benchmarks executed wi
 
 To validate real-world performance differences under production network conditions, both systems were deployed and benchmarked across a dedicated **2.5GbE physical network link** against [RustStack](https://github.com/ehlerst/ruststack) high-performance S3 storage emulation (`automq-bucket` and `oxidemq-bucket`):
 
-- **Network Topology**: Client machine (`192.168.55.31`) $\rightarrow$ 2.5GbE physical switch $\rightarrow$ Dedicated broker VM (`192.168.55.25:9092`).
+- **Network Topology**: Dedicated benchmark client host $\rightarrow$ 2.5GbE non-blocking switch $\rightarrow$ Dedicated broker VM (4 vCPU, 16 GiB RAM, 2.5GbE NIC, port 9092).
+- **Environment Specs**: 2.5 Gbps Ethernet, Linux kernel 6.x, x86_64 architecture.
 - **Benchmark Client**: Official Apache Kafka Java client (`kafka-producer-perf-test.sh` from Kafka 3.9.1).
 - **Workload**: 10,000 records of 1,024 bytes (1 KiB) each, produced with `acks=1`, standard production batching `batch.size=16384`, and `linger.ms=5`.
 - **Brokers Tested**:
