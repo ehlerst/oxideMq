@@ -42,6 +42,12 @@ pub enum KafkaErrorCode {
     TopicAlreadyExists = 36,
     InvalidPartitions = 37,
     InvalidReplicationFactor = 38,
+    InvalidProducerEpoch = 47,
+    InvalidTxnState = 48,
+    InvalidProducerIdMapping = 49,
+    ConcurrentTransactions = 51,
+    ProducerFenced = 52,
+    TransactionalIdAuthorizationFailed = 53,
     UnknownServer = -1,
 }
 
@@ -91,6 +97,12 @@ impl KafkaErrorCode {
             36 => Self::TopicAlreadyExists,
             37 => Self::InvalidPartitions,
             38 => Self::InvalidReplicationFactor,
+            47 => Self::InvalidProducerEpoch,
+            48 => Self::InvalidTxnState,
+            49 => Self::InvalidProducerIdMapping,
+            51 => Self::ConcurrentTransactions,
+            52 => Self::ProducerFenced,
+            53 => Self::TransactionalIdAuthorizationFailed,
             _ => Self::UnknownServer,
         }
     }
@@ -142,6 +154,12 @@ mod tests {
             (KafkaErrorCode::TopicAlreadyExists, 36),
             (KafkaErrorCode::InvalidPartitions, 37),
             (KafkaErrorCode::InvalidReplicationFactor, 38),
+            (KafkaErrorCode::InvalidProducerEpoch, 47),
+            (KafkaErrorCode::InvalidTxnState, 48),
+            (KafkaErrorCode::InvalidProducerIdMapping, 49),
+            (KafkaErrorCode::ConcurrentTransactions, 51),
+            (KafkaErrorCode::ProducerFenced, 52),
+            (KafkaErrorCode::TransactionalIdAuthorizationFailed, 53),
             (KafkaErrorCode::UnknownServer, -1),
         ];
 

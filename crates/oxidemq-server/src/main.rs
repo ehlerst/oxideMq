@@ -8,8 +8,10 @@ use oxidemq_s3stream::block_cache::BlockCache;
 use oxidemq_s3stream::client::{MemoryObjectStorage, ObjectStorage, S3ClientStorage};
 use oxidemq_s3stream::log_cache::LogCache;
 use oxidemq_server::admin::{create_admin_router, AppState};
+use oxidemq_server::tls::{create_tls_acceptor, TlsConfig};
 use oxidemq_wal::memory::MemoryWal;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -30,6 +32,18 @@ struct Cli {
     #[arg(short, long, default_value_t = 9092)]
     kafka_port: u16,
 
+    #[arg(long, default_value_t = 9093, env = "OXIDEMQ_SSL_PORT")]
+    ssl_port: u16,
+
+    #[arg(long, default_value_t = true, env = "OXIDEMQ_ENABLE_SSL", action = clap::ArgAction::Set)]
+    enable_ssl: bool,
+
+    #[arg(long, env = "OXIDEMQ_TLS_CERT")]
+    tls_cert: Option<std::path::PathBuf>,
+
+    #[arg(long, env = "OXIDEMQ_TLS_KEY")]
+    tls_key: Option<std::path::PathBuf>,
+
     #[arg(short, long, default_value_t = 8082)]
     admin_port: u16,
 
@@ -43,6 +57,14 @@ enum Commands {
     Start {
         #[arg(short, long, default_value_t = 9092)]
         kafka_port: u16,
+        #[arg(long, default_value_t = 9093, env = "OXIDEMQ_SSL_PORT")]
+        ssl_port: u16,
+        #[arg(long, default_value_t = true, env = "OXIDEMQ_ENABLE_SSL", action = clap::ArgAction::Set)]
+        enable_ssl: bool,
+        #[arg(long, env = "OXIDEMQ_TLS_CERT")]
+        tls_cert: Option<std::path::PathBuf>,
+        #[arg(long, env = "OXIDEMQ_TLS_KEY")]
+        tls_key: Option<std::path::PathBuf>,
         #[arg(short, long, default_value_t = 8082)]
         admin_port: u16,
         #[arg(long, default_value = "0.0.0.0")]
@@ -127,13 +149,29 @@ async fn run_cli_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Some(Commands::Start {
             kafka_port,
+            ssl_port,
+            enable_ssl,
+            tls_cert,
+            tls_key,
             admin_port,
             host,
         }) => {
-            run_server(&host, kafka_port, admin_port).await?;
+            run_server(
+                &host, kafka_port, ssl_port, enable_ssl, tls_cert, tls_key, admin_port,
+            )
+            .await?;
         }
         None => {
-            run_server(&cli.host, cli.kafka_port, cli.admin_port).await?;
+            run_server(
+                &cli.host,
+                cli.kafka_port,
+                cli.ssl_port,
+                cli.enable_ssl,
+                cli.tls_cert,
+                cli.tls_key,
+                cli.admin_port,
+            )
+            .await?;
         }
     }
 
@@ -143,6 +181,10 @@ async fn run_cli_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 async fn run_server(
     host: &str,
     kafka_port: u16,
+    ssl_port: u16,
+    enable_ssl: bool,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
     admin_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = OxideConfig::default();
@@ -236,6 +278,66 @@ async fn run_server(
         }
     });
 
+    // 2b. Start Kafka TLS/SSL Listener (Encrypted Wire-Protocol)
+    if enable_ssl {
+        let tls_config = TlsConfig {
+            cert_path: tls_cert,
+            key_path: tls_key,
+            auto_generate: true,
+        };
+        match create_tls_acceptor(&tls_config) {
+            Ok(acceptor) => {
+                let ssl_addr: SocketAddr = format!("{}:{}", host, ssl_port).parse()?;
+                match TcpListener::bind(ssl_addr).await {
+                    Ok(ssl_listener) => {
+                        info!("Kafka Wire Protocol TLS/SSL listener ready on {}", ssl_addr);
+                        let engine_for_ssl = Arc::clone(&broker_engine);
+                        tokio::spawn(async move {
+                            loop {
+                                match ssl_listener.accept().await {
+                                    Ok((stream, peer_addr)) => {
+                                        let engine = Arc::clone(&engine_for_ssl);
+                                        let acceptor = acceptor.clone();
+                                        tokio::spawn(async move {
+                                            match acceptor.accept(stream).await {
+                                                Ok(tls_stream) => {
+                                                    if let Err(e) =
+                                                        engine.process_connection(tls_stream).await
+                                                    {
+                                                        error!(
+                                                            "TLS connection error from {}: {}",
+                                                            peer_addr, e
+                                                        );
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    error!(
+                                                        "TLS handshake error from {}: {}",
+                                                        peer_addr, e
+                                                    );
+                                                }
+                                            }
+                                        });
+                                    }
+                                    Err(e) => {
+                                        error!("Kafka SSL TCP accept error: {}", e);
+                                        break;
+                                    }
+                                }
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!("Failed to bind Kafka SSL listener on {}: {}", ssl_addr, e);
+                    }
+                }
+            }
+            Err(e) => {
+                error!("Failed to initialize TLS acceptor: {}", e);
+            }
+        }
+    }
+
     // 3. Start Axum Admin & Web Console Server
     let admin_state = AppState {
         cluster_state,
@@ -317,6 +419,8 @@ mod tests {
     fn test_cli_parsing() {
         let cli_default = Cli::try_parse_from(["oxidemq"]).unwrap();
         assert_eq!(cli_default.kafka_port, 9092);
+        assert_eq!(cli_default.ssl_port, 9093);
+        assert!(cli_default.enable_ssl);
         assert_eq!(cli_default.admin_port, 8082);
         assert!(cli_default.command.is_none());
 
@@ -325,6 +429,10 @@ mod tests {
             "start",
             "--kafka-port",
             "9095",
+            "--ssl-port",
+            "9097",
+            "--enable-ssl",
+            "false",
             "--admin-port",
             "9096",
             "--host",
@@ -334,10 +442,15 @@ mod tests {
         match cli_start.command {
             Some(Commands::Start {
                 kafka_port,
+                ssl_port,
+                enable_ssl,
                 admin_port,
                 host,
+                ..
             }) => {
                 assert_eq!(kafka_port, 9095);
+                assert_eq!(ssl_port, 9097);
+                assert!(!enable_ssl);
                 assert_eq!(admin_port, 9096);
                 assert_eq!(host, "127.0.0.1");
             }
@@ -440,6 +553,10 @@ mod tests {
                 addr: addr.to_string(),
             }),
             kafka_port: 9092,
+            ssl_port: 9093,
+            enable_ssl: false,
+            tls_cert: None,
+            tls_key: None,
             admin_port: 8082,
             host: "127.0.0.1".into(),
         };
@@ -450,6 +567,10 @@ mod tests {
                 addr: addr.to_string(),
             }),
             kafka_port: 9092,
+            ssl_port: 9093,
+            enable_ssl: false,
+            tls_cert: None,
+            tls_key: None,
             admin_port: 8082,
             host: "127.0.0.1".into(),
         };
@@ -464,6 +585,10 @@ mod tests {
                     error_prob: 0.1,
                 }),
                 kafka_port: 9092,
+                ssl_port: 9093,
+                enable_ssl: false,
+                tls_cert: None,
+                tls_key: None,
                 admin_port: 8082,
                 host: "127.0.0.1".into(),
             };

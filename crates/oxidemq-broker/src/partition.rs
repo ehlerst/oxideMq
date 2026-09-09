@@ -17,6 +17,8 @@ pub struct Partition {
     pub stream: Arc<S3Stream>,
     producer_states: ProducerStateMap,
     append_lock: Arc<Mutex<()>>,
+    ongoing_txns: Arc<RwLock<HashMap<i64, i64>>>,
+    aborted_txns: Arc<RwLock<Vec<(i64, i64)>>>,
 }
 
 fn patch_record_batches(records: Bytes, base_offset: i64) -> (Bytes, i64) {
@@ -69,6 +71,8 @@ impl Partition {
             stream,
             producer_states: Arc::new(RwLock::new(HashMap::new())),
             append_lock: Arc::new(Mutex::new(())),
+            ongoing_txns: Arc::new(RwLock::new(HashMap::new())),
+            aborted_txns: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -78,6 +82,15 @@ impl Partition {
         let _guard = self.append_lock.lock();
         let base_offset = self.stream.next_offset();
         let (patched_records, count) = patch_record_batches(records, base_offset);
+        if patched_records.len() >= 61 && patched_records[16] == 2 {
+            let attr = i16::from_be_bytes(patched_records[21..23].try_into().unwrap());
+            let is_tx = (attr & 0x0010) != 0;
+            let is_ctrl = (attr & 0x0020) != 0;
+            let pid = i64::from_be_bytes(patched_records[39..47].try_into().unwrap());
+            if is_tx && !is_ctrl && pid != -1 {
+                self.ongoing_txns.write().entry(pid).or_insert(base_offset);
+            }
+        }
         self.stream.append_with_count(patched_records, count)?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -144,6 +157,33 @@ impl Partition {
 
     pub fn log_start_offset(&self) -> i64 {
         self.stream.start_offset()
+    }
+
+    pub fn complete_txn(&self, producer_id: i64) {
+        self.ongoing_txns.write().remove(&producer_id);
+    }
+
+    pub fn record_aborted_txn(&self, producer_id: i64, first_offset: i64) {
+        let actual_first = self
+            .ongoing_txns
+            .write()
+            .remove(&producer_id)
+            .unwrap_or(first_offset);
+        self.aborted_txns.write().push((producer_id, actual_first));
+    }
+
+    pub fn last_stable_offset(&self) -> i64 {
+        let ongoing = self.ongoing_txns.read();
+        let hw = self.high_watermark();
+        if let Some(&min_ongoing) = ongoing.values().min() {
+            min_ongoing.min(hw)
+        } else {
+            hw
+        }
+    }
+
+    pub fn aborted_transactions(&self) -> Vec<(i64, i64)> {
+        self.aborted_txns.read().clone()
     }
 }
 

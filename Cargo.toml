@@ -76,6 +76,13 @@ aws-sdk-s3 = "1"
 aws-config = "1"
 aws-credential-types = "1"
 
+# TLS & Encryption
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pki-types = "1"
+rustls-pemfile = "2"
+rcgen = "0.13"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

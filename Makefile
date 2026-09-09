@@ -16,7 +16,7 @@ release: ## Build optimized release binary
 	cargo build --release --workspace
 
 ## 🚀 Execution & Operations
-run: ## Run oxideMq broker daemon locally with info logging (Kafka :9092, Admin :8082)
+run: ## Run oxideMq broker daemon locally with info logging (Kafka :9092, TLS :9093, Admin :8082)
 	RUST_LOG=info cargo run -p oxidemq-server -- start
 
 run-file-wal: ## Run oxideMq broker with local Write-Ahead Log (WAL) on disk
@@ -75,7 +75,7 @@ docker-build: ## Build local Docker container image (ehlers320/oxidemq:latest)
 	docker build --build-arg TARGETARCH=amd64 -t ehlers320/oxidemq:latest .
 
 docker-run: ## Run Docker container daemon in detached mode
-	docker run -d --name oxidemq -p 9092:9092 -p 8082:8082 ehlers320/oxidemq:latest
+	docker run -d --name oxidemq -p 9092:9092 -p 9093:9093 -p 8082:8082 ehlers320/oxidemq:latest
 
 docker-stop: ## Stop and remove running local Docker container
 	docker rm -f oxidemq || true

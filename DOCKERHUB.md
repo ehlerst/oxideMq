@@ -30,6 +30,7 @@
 docker run -d \
   --name oxidemq \
   -p 9092:9092 \
+  -p 9093:9093 \
   -p 8082:8082 \
   ehlers320/oxidemq:latest
 ```
@@ -57,11 +58,13 @@ services:
     image: ehlers320/oxidemq:latest
     container_name: oxidemq
     ports:
-      - "9092:9092"   # Kafka Protocol
+      - "9092:9092"   # Kafka Protocol (PLAINTEXT)
+      - "9093:9093"   # Kafka Protocol (SSL/TLS)
       - "8082:8082"   # Admin REST API & Dark Web Console
     environment:
       - HOST=0.0.0.0
       - KAFKA_PORT=9092
+      - SSL_PORT=9093
       - ADMIN_PORT=8082
       - OXIDEMQ_STORAGE_ENGINE=file
       - OXIDEMQ_WAL_DIR=/data/wal
@@ -96,11 +99,13 @@ services:
     depends_on:
       - s3
     ports:
-      - "9092:9092"
-      - "8082:8082"
+      - "9092:9092"   # Kafka PLAINTEXT
+      - "9093:9093"   # Kafka SSL/TLS
+      - "8082:8082"   # Admin Web Console
     environment:
       - HOST=0.0.0.0
       - KAFKA_PORT=9092
+      - SSL_PORT=9093
       - ADMIN_PORT=8082
       - OXIDEMQ_STORAGE_ENGINE=s3
       - OXIDEMQ_S3_BUCKET=oxidemq-data
@@ -117,7 +122,11 @@ services:
 | Variable | Default | Description |
 |---|---|---|
 | `HOST` | `0.0.0.0` | Bind address for Kafka and Admin servers |
-| `KAFKA_PORT` | `9092` | Port for Apache Kafka wire protocol (TCP) |
+| `KAFKA_PORT` | `9092` | Port for Apache Kafka wire protocol (PLAINTEXT) |
+| `SSL_PORT` | `9093` | Port for Apache Kafka wire protocol (SSL/TLS encrypted) |
+| `OXIDEMQ_ENABLE_SSL` | `true` | Enable or disable Kafka SSL/TLS listener |
+| `OXIDEMQ_TLS_CERT` | *(None)* | Path to PEM TLS certificate file (auto-generates self-signed if omitted) |
+| `OXIDEMQ_TLS_KEY` | *(None)* | Path to PEM TLS private key file |
 | `ADMIN_PORT` | `8082` | Port for Admin Web Console & REST API (HTTP) |
 | `OXIDEMQ_STORAGE_ENGINE` | `memory` | Backend engine: `memory`, `file` (WAL), or `s3` (S3Stream) |
 | `OXIDEMQ_WAL_DIR` | `./data/wal` | Local disk directory for Write-Ahead Log segments |

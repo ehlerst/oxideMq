@@ -103,6 +103,7 @@ fn bench_broker_fetch(c: &mut Criterion) {
             max_wait_ms: 100,
             min_bytes: 1,
             max_bytes: 65536,
+            isolation_level: 0,
             topics: vec![oxidemq_protocol::FetchTopic {
                 topic: "bench-fetch-topic".to_string(),
                 partitions: vec![FetchPartition {

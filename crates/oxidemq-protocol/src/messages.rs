@@ -129,6 +129,26 @@ impl ApiVersionsResponse {
                 min_version: 0,
                 max_version: 3,
             }, // DeleteTopics
+            ApiVersionKey {
+                api_key: 22,
+                min_version: 0,
+                max_version: 4,
+            }, // InitProducerId
+            ApiVersionKey {
+                api_key: 24,
+                min_version: 0,
+                max_version: 3,
+            }, // AddPartitionsToTxn
+            ApiVersionKey {
+                api_key: 25,
+                min_version: 0,
+                max_version: 3,
+            }, // AddOffsetsToTxn
+            ApiVersionKey {
+                api_key: 26,
+                min_version: 0,
+                max_version: 3,
+            }, // EndTxn
         ];
         Self::new(KafkaErrorCode::None, keys)
     }
@@ -938,6 +958,7 @@ pub struct FetchRequest {
     pub max_wait_ms: i32,
     pub min_bytes: i32,
     pub max_bytes: i32,
+    pub isolation_level: i8,
     pub topics: Vec<FetchTopic>,
 }
 
@@ -952,9 +973,7 @@ impl FetchRequest {
             0x7FFFFFFF
         };
 
-        if version >= 4 {
-            let _isolation_level = src.get_u8();
-        }
+        let isolation_level = if version >= 4 { src.get_i8() } else { 0 };
         if version >= 7 {
             let _session_id = src.get_i32();
             let _session_epoch = src.get_i32();
@@ -991,6 +1010,7 @@ impl FetchRequest {
             max_wait_ms,
             min_bytes,
             max_bytes,
+            isolation_level,
             topics,
         })
     }
@@ -1003,7 +1023,7 @@ impl FetchRequest {
             dst.put_i32(self.max_bytes);
         }
         if version >= 4 {
-            dst.put_u8(0); // read_uncommitted
+            dst.put_i8(self.isolation_level);
         }
         if version >= 7 {
             dst.put_i32(0); // session_id
@@ -1758,6 +1778,360 @@ impl LeaveGroupResponse {
     }
 }
 
+// ==========================================
+// InitProducerId (Key 22)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitProducerIdRequest {
+    pub transactional_id: Option<String>,
+    pub transaction_timeout_ms: i32,
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+}
+
+impl InitProducerIdRequest {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let transactional_id = KafkaDecoder::read_string(src)?;
+        let transaction_timeout_ms = src.get_i32();
+        let (producer_id, producer_epoch) = if version >= 3 {
+            (src.get_i64(), src.get_i16())
+        } else {
+            (-1, -1)
+        };
+        Ok(Self {
+            transactional_id,
+            transaction_timeout_ms,
+            producer_id,
+            producer_epoch,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        KafkaEncoder::write_string(dst, self.transactional_id.as_deref());
+        dst.put_i32(self.transaction_timeout_ms);
+        if version >= 3 {
+            dst.put_i64(self.producer_id);
+            dst.put_i16(self.producer_epoch);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitProducerIdResponse {
+    pub throttle_time_ms: i32,
+    pub error_code: KafkaErrorCode,
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+}
+
+impl InitProducerIdResponse {
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.throttle_time_ms);
+        dst.put_i16(self.error_code.code());
+        dst.put_i64(self.producer_id);
+        dst.put_i16(self.producer_epoch);
+    }
+
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        let throttle_time_ms = src.get_i32();
+        let error_code = KafkaErrorCode::from_i16(src.get_i16());
+        let producer_id = src.get_i64();
+        let producer_epoch = src.get_i16();
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            producer_id,
+            producer_epoch,
+        })
+    }
+}
+
+// ==========================================
+// AddPartitionsToTxn (Key 24)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddPartitionsToTxnTopic {
+    pub name: String,
+    pub partitions: Vec<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddPartitionsToTxnRequest {
+    pub transactional_id: String,
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    pub topics: Vec<AddPartitionsToTxnTopic>,
+}
+
+impl AddPartitionsToTxnRequest {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        let transactional_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+        let producer_id = src.get_i64();
+        let producer_epoch = src.get_i16();
+        let topic_count = src.get_i32() as usize;
+        let mut topics = Vec::with_capacity(topic_count);
+        for _ in 0..topic_count {
+            let name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            let p_count = src.get_i32() as usize;
+            let mut partitions = Vec::with_capacity(p_count);
+            for _ in 0..p_count {
+                partitions.push(src.get_i32());
+            }
+            topics.push(AddPartitionsToTxnTopic { name, partitions });
+        }
+        Ok(Self {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            topics,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        KafkaEncoder::write_string(dst, Some(&self.transactional_id));
+        dst.put_i64(self.producer_id);
+        dst.put_i16(self.producer_epoch);
+        dst.put_i32(self.topics.len() as i32);
+        for t in &self.topics {
+            KafkaEncoder::write_string(dst, Some(&t.name));
+            dst.put_i32(t.partitions.len() as i32);
+            for &p in &t.partitions {
+                dst.put_i32(p);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddPartitionsToTxnPartitionResult {
+    pub partition_index: i32,
+    pub error_code: KafkaErrorCode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddPartitionsToTxnTopicResult {
+    pub name: String,
+    pub results: Vec<AddPartitionsToTxnPartitionResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddPartitionsToTxnResponse {
+    pub throttle_time_ms: i32,
+    pub errors: Vec<AddPartitionsToTxnTopicResult>,
+}
+
+impl AddPartitionsToTxnResponse {
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.throttle_time_ms);
+        dst.put_i32(self.errors.len() as i32);
+        for t in &self.errors {
+            KafkaEncoder::write_string(dst, Some(&t.name));
+            dst.put_i32(t.results.len() as i32);
+            for p in &t.results {
+                dst.put_i32(p.partition_index);
+                dst.put_i16(p.error_code.code());
+            }
+        }
+    }
+
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        let throttle_time_ms = src.get_i32();
+        let topic_count = src.get_i32() as usize;
+        let mut errors = Vec::with_capacity(topic_count);
+        for _ in 0..topic_count {
+            let name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            let p_count = src.get_i32() as usize;
+            let mut results = Vec::with_capacity(p_count);
+            for _ in 0..p_count {
+                let partition_index = src.get_i32();
+                let error_code = KafkaErrorCode::from_i16(src.get_i16());
+                results.push(AddPartitionsToTxnPartitionResult {
+                    partition_index,
+                    error_code,
+                });
+            }
+            errors.push(AddPartitionsToTxnTopicResult { name, results });
+        }
+        Ok(Self {
+            throttle_time_ms,
+            errors,
+        })
+    }
+}
+
+// ==========================================
+// AddOffsetsToTxn (Key 25)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddOffsetsToTxnRequest {
+    pub transactional_id: String,
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    pub group_id: String,
+}
+
+impl AddOffsetsToTxnRequest {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        let transactional_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+        let producer_id = src.get_i64();
+        let producer_epoch = src.get_i16();
+        let group_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+        Ok(Self {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            group_id,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        KafkaEncoder::write_string(dst, Some(&self.transactional_id));
+        dst.put_i64(self.producer_id);
+        dst.put_i16(self.producer_epoch);
+        KafkaEncoder::write_string(dst, Some(&self.group_id));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddOffsetsToTxnResponse {
+    pub throttle_time_ms: i32,
+    pub error_code: KafkaErrorCode,
+}
+
+impl AddOffsetsToTxnResponse {
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.throttle_time_ms);
+        dst.put_i16(self.error_code.code());
+    }
+
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        let throttle_time_ms = src.get_i32();
+        let error_code = KafkaErrorCode::from_i16(src.get_i16());
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+        })
+    }
+}
+
+// ==========================================
+// EndTxn (Key 26)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndTxnRequest {
+    pub transactional_id: String,
+    pub producer_id: i64,
+    pub producer_epoch: i16,
+    pub committed: bool,
+}
+
+impl EndTxnRequest {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        let transactional_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+        let producer_id = src.get_i64();
+        let producer_epoch = src.get_i16();
+        let committed = src.get_i8() != 0;
+        Ok(Self {
+            transactional_id,
+            producer_id,
+            producer_epoch,
+            committed,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        KafkaEncoder::write_string(dst, Some(&self.transactional_id));
+        dst.put_i64(self.producer_id);
+        dst.put_i16(self.producer_epoch);
+        dst.put_i8(if self.committed { 1 } else { 0 });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndTxnResponse {
+    pub throttle_time_ms: i32,
+    pub error_code: KafkaErrorCode,
+}
+
+impl EndTxnResponse {
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.throttle_time_ms);
+        dst.put_i16(self.error_code.code());
+    }
+
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        let throttle_time_ms = src.get_i32();
+        let error_code = KafkaErrorCode::from_i16(src.get_i16());
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+        })
+    }
+}
+
+/// Encodes a control batch (e.g. EndTxn Commit or Abort) for a given partition, producer ID, and epoch.
+pub fn encode_control_batch(
+    base_offset: i64,
+    producer_id: i64,
+    producer_epoch: i16,
+    is_commit: bool,
+) -> Bytes {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let control_type: i16 = if is_commit { 1 } else { 0 };
+
+    let mut rec_body = BytesMut::new();
+    rec_body.put_i8(0);
+    KafkaEncoder::write_varint(&mut rec_body, 0); // timestamp delta
+    KafkaEncoder::write_varint(&mut rec_body, 0); // offset delta
+
+    // Key: 4 bytes: version (0), type (0 = abort, 1 = commit)
+    KafkaEncoder::write_varint(&mut rec_body, 4);
+    rec_body.put_i16(0);
+    rec_body.put_i16(control_type);
+
+    // Value: 2 bytes: version (0)
+    KafkaEncoder::write_varint(&mut rec_body, 2);
+    rec_body.put_i16(0);
+
+    // Headers count: 0
+    KafkaEncoder::write_varint(&mut rec_body, 0);
+
+    let mut payload = BytesMut::new();
+    KafkaEncoder::write_varint(&mut payload, rec_body.len() as i64);
+    payload.extend_from_slice(&rec_body);
+
+    let batch_len = (49 + payload.len()) as i32;
+    let mut out = BytesMut::with_capacity(12 + batch_len as usize);
+    out.put_i64(base_offset);
+    out.put_i32(batch_len);
+    out.put_i32(0); // partition leader epoch
+    out.put_i8(2); // magic v2
+    out.put_u32(0); // crc placeholder
+
+    // Attributes: 0x0030 = is_control_batch (0x0020) | is_transactional (0x0010)
+    out.put_i16(0x0030);
+    out.put_i32(0); // last offset delta
+    out.put_i64(now); // base timestamp
+    out.put_i64(now); // max timestamp
+    out.put_i64(producer_id);
+    out.put_i16(producer_epoch);
+    out.put_i32(-1); // base sequence
+    out.put_i32(1); // record count = 1
+    out.extend_from_slice(&payload);
+
+    let crc = oxidemq_core::compute_crc32c(&out[21..]);
+    out[17..21].copy_from_slice(&crc.to_be_bytes());
+
+    out.freeze()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1894,6 +2268,7 @@ mod tests {
             max_wait_ms: 500,
             min_bytes: 1,
             max_bytes: 1048576,
+            isolation_level: 0,
             topics: vec![FetchTopic {
                 topic: "topic-1".into(),
                 partitions: vec![FetchPartition {
@@ -2338,5 +2713,128 @@ mod tests {
 
         let res = decompress_record_batch(&corrupted.freeze());
         assert!(res.is_err(), "Expected error for corrupted gzip stream");
+    }
+
+    #[test]
+    fn test_transactional_messages_roundtrip() {
+        // InitProducerId
+        let init_req = InitProducerIdRequest {
+            transactional_id: Some("tx-123".into()),
+            transaction_timeout_ms: 10000,
+            producer_id: 42,
+            producer_epoch: 1,
+        };
+        for v in [0, 1, 3] {
+            let mut buf = BytesMut::new();
+            init_req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = InitProducerIdRequest::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.transactional_id, init_req.transactional_id);
+            assert_eq!(
+                decoded.transaction_timeout_ms,
+                init_req.transaction_timeout_ms
+            );
+            if v >= 3 {
+                assert_eq!(decoded.producer_id, 42);
+                assert_eq!(decoded.producer_epoch, 1);
+            }
+        }
+
+        let init_resp = InitProducerIdResponse {
+            throttle_time_ms: 5,
+            error_code: KafkaErrorCode::None,
+            producer_id: 1000,
+            producer_epoch: 2,
+        };
+        let mut buf = BytesMut::new();
+        init_resp.encode(&mut buf, 0);
+        let mut read_buf = buf.freeze();
+        let decoded = InitProducerIdResponse::decode(&mut read_buf, 0).unwrap();
+        assert_eq!(decoded, init_resp);
+
+        // AddPartitionsToTxn
+        let add_p_req = AddPartitionsToTxnRequest {
+            transactional_id: "tx-order".into(),
+            producer_id: 1000,
+            producer_epoch: 2,
+            topics: vec![AddPartitionsToTxnTopic {
+                name: "orders".into(),
+                partitions: vec![0, 1],
+            }],
+        };
+        let mut buf = BytesMut::new();
+        add_p_req.encode(&mut buf, 0);
+        let mut read_buf = buf.freeze();
+        let decoded_p_req = AddPartitionsToTxnRequest::decode(&mut read_buf, 0).unwrap();
+        assert_eq!(decoded_p_req, add_p_req);
+
+        let add_p_resp = AddPartitionsToTxnResponse {
+            throttle_time_ms: 0,
+            errors: vec![AddPartitionsToTxnTopicResult {
+                name: "orders".into(),
+                results: vec![AddPartitionsToTxnPartitionResult {
+                    partition_index: 0,
+                    error_code: KafkaErrorCode::None,
+                }],
+            }],
+        };
+        let mut buf = BytesMut::new();
+        add_p_resp.encode(&mut buf, 0);
+        let mut read_buf = buf.freeze();
+        let decoded_p_resp = AddPartitionsToTxnResponse::decode(&mut read_buf, 0).unwrap();
+        assert_eq!(decoded_p_resp, add_p_resp);
+
+        // AddOffsetsToTxn
+        let add_off_req = AddOffsetsToTxnRequest {
+            transactional_id: "tx-order".into(),
+            producer_id: 1000,
+            producer_epoch: 2,
+            group_id: "payment-group".into(),
+        };
+        let mut buf = BytesMut::new();
+        add_off_req.encode(&mut buf, 0);
+        let mut read_buf = buf.freeze();
+        let decoded_off_req = AddOffsetsToTxnRequest::decode(&mut read_buf, 0).unwrap();
+        assert_eq!(decoded_off_req, add_off_req);
+
+        let add_off_resp = AddOffsetsToTxnResponse {
+            throttle_time_ms: 0,
+            error_code: KafkaErrorCode::None,
+        };
+        let mut buf = BytesMut::new();
+        add_off_resp.encode(&mut buf, 0);
+        let mut read_buf = buf.freeze();
+        let decoded_off_resp = AddOffsetsToTxnResponse::decode(&mut read_buf, 0).unwrap();
+        assert_eq!(decoded_off_resp, add_off_resp);
+
+        // EndTxn
+        let end_req = EndTxnRequest {
+            transactional_id: "tx-order".into(),
+            producer_id: 1000,
+            producer_epoch: 2,
+            committed: true,
+        };
+        let mut buf = BytesMut::new();
+        end_req.encode(&mut buf, 0);
+        let mut read_buf = buf.freeze();
+        let decoded_end_req = EndTxnRequest::decode(&mut read_buf, 0).unwrap();
+        assert_eq!(decoded_end_req, end_req);
+
+        let end_resp = EndTxnResponse {
+            throttle_time_ms: 0,
+            error_code: KafkaErrorCode::None,
+        };
+        let mut buf = BytesMut::new();
+        end_resp.encode(&mut buf, 0);
+        let mut read_buf = buf.freeze();
+        let decoded_end_resp = EndTxnResponse::decode(&mut read_buf, 0).unwrap();
+        assert_eq!(decoded_end_resp, end_resp);
+
+        // encode_control_batch
+        let ctrl_bytes = encode_control_batch(50, 1000, 2, true);
+        assert!(ctrl_bytes.len() >= 61);
+        let records = parse_record_batch_records(&ctrl_bytes).unwrap();
+        assert_eq!(records.len(), 1);
+        assert!(records[0].key.is_some());
     }
 }

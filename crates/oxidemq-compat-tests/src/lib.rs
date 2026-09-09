@@ -106,6 +106,7 @@ mod tests {
             max_wait_ms: 1000,
             min_bytes: 1,
             max_bytes: 10 * 1024 * 1024,
+            isolation_level: 0,
             topics: vec![FetchTopic {
                 topic: "high-throughput-topic".to_string(),
                 partitions: vec![FetchPartition {

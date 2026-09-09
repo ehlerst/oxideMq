@@ -1,14 +1,18 @@
 use crate::chaos::{ChaosEngine, FaultTarget};
 use crate::coordinator::GroupCoordinator;
 use crate::router::ClusterState;
+use crate::transaction::TransactionCoordinator;
 use bytes::{BufMut, Bytes, BytesMut};
 use oxidemq_core::error::{OxideMqError, Result};
 use oxidemq_core::types::{CompressionCodec, TopicPartition};
 use oxidemq_protocol::header::{RequestHeader, ResponseHeader};
 use oxidemq_protocol::messages::{
-    ApiVersionsRequest, ApiVersionsResponse, FetchPartitionResponse, FetchRequest, FetchResponse,
-    FetchTopicResponse, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest,
-    HeartbeatResponse, LeaveGroupRequest, LeaveGroupResponse, ListOffsetsPartitionResponse,
+    AddOffsetsToTxnRequest, AddOffsetsToTxnResponse, AddPartitionsToTxnPartitionResult,
+    AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, AddPartitionsToTxnTopicResult,
+    ApiVersionsRequest, ApiVersionsResponse, EndTxnRequest, EndTxnResponse, FetchPartitionResponse,
+    FetchRequest, FetchResponse, FetchTopicResponse, FindCoordinatorRequest,
+    FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse, InitProducerIdRequest,
+    InitProducerIdResponse, LeaveGroupRequest, LeaveGroupResponse, ListOffsetsPartitionResponse,
     ListOffsetsRequest, ListOffsetsResponse, ListOffsetsTopicResponse, MetadataRequest,
     OffsetCommitPartitionResponse, OffsetCommitRequest, OffsetCommitResponse,
     OffsetCommitTopicResponse, OffsetFetchPartitionResponse, OffsetFetchRequest,
@@ -25,6 +29,7 @@ use tracing::{debug, error, trace};
 pub struct BrokerEngine {
     cluster_state: Arc<ClusterState>,
     coordinator: Arc<GroupCoordinator>,
+    txn_coordinator: Arc<TransactionCoordinator>,
     chaos: Arc<ChaosEngine>,
 }
 
@@ -33,6 +38,7 @@ impl BrokerEngine {
         Self {
             cluster_state,
             coordinator,
+            txn_coordinator: Arc::new(TransactionCoordinator::new()),
             chaos: Arc::new(ChaosEngine::new()),
         }
     }
@@ -42,12 +48,21 @@ impl BrokerEngine {
         self
     }
 
+    pub fn with_txn_coordinator(mut self, txn_coordinator: Arc<TransactionCoordinator>) -> Self {
+        self.txn_coordinator = txn_coordinator;
+        self
+    }
+
     pub fn cluster_state(&self) -> &Arc<ClusterState> {
         &self.cluster_state
     }
 
     pub fn coordinator(&self) -> &Arc<GroupCoordinator> {
         &self.coordinator
+    }
+
+    pub fn txn_coordinator(&self) -> &Arc<TransactionCoordinator> {
+        &self.txn_coordinator
     }
 
     pub fn chaos(&self) -> &Arc<ChaosEngine> {
@@ -151,7 +166,39 @@ impl BrokerEngine {
                             {
                                 Ok(batches) => {
                                     let mut b = BytesMut::new();
-                                    for (_off, batch_bytes) in batches {
+                                    let aborted = partition.aborted_transactions();
+                                    let lso = partition.last_stable_offset();
+
+                                    for (off, batch_bytes) in batches {
+                                        if batch_bytes.len() >= 61 && batch_bytes[16] == 2 {
+                                            let attr = i16::from_be_bytes(
+                                                batch_bytes[21..23].try_into().unwrap(),
+                                            );
+                                            let is_ctrl = (attr & 0x0020) != 0;
+                                            let is_tx = (attr & 0x0010) != 0;
+                                            let pid = i64::from_be_bytes(
+                                                batch_bytes[39..47].try_into().unwrap(),
+                                            );
+
+                                            // 1. Never expose control batches to consumer applications
+                                            if is_ctrl {
+                                                continue;
+                                            }
+
+                                            // 2. ReadCommitted isolation level:
+                                            if req.isolation_level == 1 {
+                                                // Do not expose uncommitted batches at or beyond LSO
+                                                if off >= lso {
+                                                    continue;
+                                                }
+                                                // Do not expose messages from aborted transactions
+                                                if is_tx
+                                                    && aborted.iter().any(|&(apid, _)| apid == pid)
+                                                {
+                                                    continue;
+                                                }
+                                            }
+                                        }
                                         b.extend_from_slice(&batch_bytes);
                                     }
                                     (KafkaErrorCode::None, b.freeze())
@@ -164,11 +211,12 @@ impl BrokerEngine {
                         };
 
                         let hw = partition.high_watermark();
+                        let lso = partition.last_stable_offset();
                         let mut resp_part = FetchPartitionResponse {
                             partition_index: p.partition,
                             error_code: err,
                             high_watermark: hw,
-                            last_stable_offset: hw,
+                            last_stable_offset: lso,
                             records: records_bytes,
                         };
                         if let Ok(comp_str) = std::env::var("OXIDEMQ_FETCH_COMPRESSION") {
@@ -331,6 +379,99 @@ impl BrokerEngine {
                 };
                 resp.encode(&mut out, header.api_version);
             }
+            ApiKey::InitProducerId => {
+                let req = InitProducerIdRequest::decode(body, header.api_version)?;
+                let (error_code, producer_id, producer_epoch) = match self
+                    .txn_coordinator
+                    .init_producer_id(req.transactional_id.as_deref(), req.transaction_timeout_ms)
+                {
+                    Ok((pid, ep)) => (KafkaErrorCode::None, pid, ep),
+                    Err(code) => (code, -1, -1),
+                };
+
+                let resp = InitProducerIdResponse {
+                    throttle_time_ms: 0,
+                    error_code,
+                    producer_id,
+                    producer_epoch,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::AddPartitionsToTxn => {
+                let req = AddPartitionsToTxnRequest::decode(body, header.api_version)?;
+                let mut all_tps = Vec::new();
+                for t in &req.topics {
+                    for &p in &t.partitions {
+                        all_tps.push(TopicPartition::new(&t.name, p));
+                    }
+                }
+
+                let overall_err = match self.txn_coordinator.add_partitions_to_txn(
+                    &req.transactional_id,
+                    req.producer_id,
+                    req.producer_epoch,
+                    all_tps,
+                ) {
+                    Ok(()) => KafkaErrorCode::None,
+                    Err(code) => code,
+                };
+
+                let mut topic_results = Vec::with_capacity(req.topics.len());
+                for t in req.topics {
+                    let mut part_results = Vec::with_capacity(t.partitions.len());
+                    for p in t.partitions {
+                        part_results.push(AddPartitionsToTxnPartitionResult {
+                            partition_index: p,
+                            error_code: overall_err,
+                        });
+                    }
+                    topic_results.push(AddPartitionsToTxnTopicResult {
+                        name: t.name,
+                        results: part_results,
+                    });
+                }
+
+                let resp = AddPartitionsToTxnResponse {
+                    throttle_time_ms: 0,
+                    errors: topic_results,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::AddOffsetsToTxn => {
+                let req = AddOffsetsToTxnRequest::decode(body, header.api_version)?;
+                let error_code = match self.txn_coordinator.add_offsets_to_txn(
+                    &req.transactional_id,
+                    req.producer_id,
+                    req.producer_epoch,
+                    &req.group_id,
+                ) {
+                    Ok(()) => KafkaErrorCode::None,
+                    Err(code) => code,
+                };
+                let resp = AddOffsetsToTxnResponse {
+                    throttle_time_ms: 0,
+                    error_code,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::EndTxn => {
+                let req = EndTxnRequest::decode(body, header.api_version)?;
+                let error_code = match self.txn_coordinator.end_txn(
+                    &req.transactional_id,
+                    req.producer_id,
+                    req.producer_epoch,
+                    req.committed,
+                    &self.cluster_state,
+                ) {
+                    Ok(()) => KafkaErrorCode::None,
+                    Err(code) => code,
+                };
+                let resp = EndTxnResponse {
+                    throttle_time_ms: 0,
+                    error_code,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
             _ => {
                 return Err(OxideMqError::Protocol(format!(
                     "Unsupported Kafka API Key {:?}",
@@ -404,6 +545,9 @@ impl BrokerEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use oxidemq_protocol::messages::{
+        AddPartitionsToTxnTopic, PartitionProduceData, TopicProduceData,
+    };
     use oxidemq_s3stream::block_cache::BlockCache;
     use oxidemq_s3stream::client::MemoryObjectStorage;
     use oxidemq_s3stream::log_cache::LogCache;
@@ -482,6 +626,7 @@ mod tests {
             max_wait_ms: 500,
             min_bytes: 1,
             max_bytes: 1024 * 1024,
+            isolation_level: 0,
             topics: vec![oxidemq_protocol::FetchTopic {
                 topic: "orders".to_string(),
                 partitions: vec![oxidemq_protocol::FetchPartition {
@@ -650,5 +795,253 @@ mod tests {
         assert_eq!(hdr.correlation_id, 777);
 
         drop(client);
+    }
+
+    #[tokio::test]
+    async fn test_transactional_pipeline_commit_and_abort() {
+        use oxidemq_core::types::Record;
+        use oxidemq_protocol::messages::encode_record_batch_v2;
+
+        let wal = Arc::new(MemoryWal::new());
+        let storage = Arc::new(MemoryObjectStorage::new());
+        let log_cache = Arc::new(LogCache::new(1024 * 1024));
+        let block_cache = Arc::new(BlockCache::new(1024 * 1024));
+        let cluster_state = Arc::new(ClusterState::new(
+            0,
+            "127.0.0.1",
+            9092,
+            "test-cluster".to_string(),
+            wal,
+            storage,
+            log_cache,
+            block_cache,
+        ));
+        let coordinator = Arc::new(GroupCoordinator::new());
+        let engine = BrokerEngine::new(cluster_state, coordinator);
+
+        // 1. InitProducerId
+        let init_hdr = RequestHeader::new(ApiKey::InitProducerId, 0, 1001, Some("txn-client"));
+        let init_req = InitProducerIdRequest {
+            transactional_id: Some("orders-tx".into()),
+            transaction_timeout_ms: 60000,
+            producer_id: -1,
+            producer_epoch: -1,
+        };
+        let mut init_buf = BytesMut::new();
+        init_req.encode(&mut init_buf, 0);
+        let mut resp_bytes = engine
+            .handle_request(&init_hdr, &mut init_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp_bytes).unwrap();
+        let init_resp = InitProducerIdResponse::decode(&mut resp_bytes, 0).unwrap();
+        assert_eq!(init_resp.error_code, KafkaErrorCode::None);
+        let pid = init_resp.producer_id;
+        let epoch = init_resp.producer_epoch;
+
+        // 2. AddPartitionsToTxn
+        let add_p_hdr = RequestHeader::new(ApiKey::AddPartitionsToTxn, 0, 1002, Some("txn-client"));
+        let add_p_req = AddPartitionsToTxnRequest {
+            transactional_id: "orders-tx".into(),
+            producer_id: pid,
+            producer_epoch: epoch,
+            topics: vec![AddPartitionsToTxnTopic {
+                name: "txn-orders".into(),
+                partitions: vec![0],
+            }],
+        };
+        let mut add_p_buf = BytesMut::new();
+        add_p_req.encode(&mut add_p_buf, 0);
+        let mut resp_bytes = engine
+            .handle_request(&add_p_hdr, &mut add_p_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp_bytes).unwrap();
+        let add_p_resp = AddPartitionsToTxnResponse::decode(&mut resp_bytes, 0).unwrap();
+        assert_eq!(
+            add_p_resp.errors[0].results[0].error_code,
+            KafkaErrorCode::None
+        );
+
+        // 3. Produce a transactional record
+        let record = Record::new(
+            0,
+            1000,
+            Some(Bytes::from("tx-key-1")),
+            Some(Bytes::from("tx-val-1")),
+        );
+        let mut raw_batch = BytesMut::from(
+            encode_record_batch_v2(0, &[record], CompressionCodec::None)
+                .unwrap()
+                .as_ref(),
+        );
+        let orig_attr = i16::from_be_bytes(raw_batch[21..23].try_into().unwrap());
+        raw_batch[21..23].copy_from_slice(&(orig_attr | 0x0010).to_be_bytes());
+        raw_batch[39..47].copy_from_slice(&pid.to_be_bytes());
+        raw_batch[47..49].copy_from_slice(&epoch.to_be_bytes());
+        let crc = oxidemq_core::compute_crc32c(&raw_batch[21..]);
+        raw_batch[17..21].copy_from_slice(&crc.to_be_bytes());
+
+        let prod_hdr = RequestHeader::new(ApiKey::Produce, 0, 1003, Some("txn-client"));
+        let prod_req = ProduceRequest {
+            acks: -1,
+            timeout_ms: 5000,
+            topic_data: vec![TopicProduceData {
+                topic: "txn-orders".into(),
+                partitions: vec![PartitionProduceData {
+                    partition: 0,
+                    records: raw_batch.freeze(),
+                }],
+            }],
+        };
+        let mut prod_buf = BytesMut::new();
+        prod_req.encode(&mut prod_buf, 0);
+        let _ = engine
+            .handle_request(&prod_hdr, &mut prod_buf.freeze())
+            .unwrap();
+
+        // 4. Fetch with ReadCommitted before EndTxn: should receive NOTHING (uncommitted!)
+        let fetch_committed_hdr =
+            RequestHeader::new(ApiKey::Fetch, 4, 1004, Some("read-committed-consumer"));
+        let fetch_committed_req = FetchRequest {
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1048576,
+            isolation_level: 1, // READ_COMMITTED
+            topics: vec![oxidemq_protocol::FetchTopic {
+                topic: "txn-orders".into(),
+                partitions: vec![oxidemq_protocol::FetchPartition {
+                    partition: 0,
+                    fetch_offset: 0,
+                    partition_max_bytes: 65536,
+                }],
+            }],
+        };
+        let mut f_buf = BytesMut::new();
+        fetch_committed_req.encode(&mut f_buf, 4);
+        let mut resp_bytes = engine
+            .handle_request(&fetch_committed_hdr, &mut f_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp_bytes).unwrap();
+        let fetch_resp = FetchResponse::decode(&mut resp_bytes, 4).unwrap();
+        assert_eq!(fetch_resp.responses[0].partitions[0].records.len(), 0);
+
+        // 5. Fetch with ReadUncommitted before EndTxn: should receive the message!
+        let fetch_uncommitted_hdr =
+            RequestHeader::new(ApiKey::Fetch, 4, 1005, Some("read-uncommitted-consumer"));
+        let mut fetch_uncommitted_req = fetch_committed_req.clone();
+        fetch_uncommitted_req.isolation_level = 0; // READ_UNCOMMITTED
+        let mut f_buf2 = BytesMut::new();
+        fetch_uncommitted_req.encode(&mut f_buf2, 4);
+        let mut resp_bytes2 = engine
+            .handle_request(&fetch_uncommitted_hdr, &mut f_buf2.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp_bytes2).unwrap();
+        let fetch_resp2 = FetchResponse::decode(&mut resp_bytes2, 4).unwrap();
+        assert!(!fetch_resp2.responses[0].partitions[0].records.is_empty());
+
+        // 6. Commit transaction via EndTxn
+        let end_hdr = RequestHeader::new(ApiKey::EndTxn, 0, 1006, Some("txn-client"));
+        let end_req = EndTxnRequest {
+            transactional_id: "orders-tx".into(),
+            producer_id: pid,
+            producer_epoch: epoch,
+            committed: true,
+        };
+        let mut end_buf = BytesMut::new();
+        end_req.encode(&mut end_buf, 0);
+        let mut resp_bytes = engine
+            .handle_request(&end_hdr, &mut end_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp_bytes).unwrap();
+        let end_resp = EndTxnResponse::decode(&mut resp_bytes, 0).unwrap();
+        assert_eq!(end_resp.error_code, KafkaErrorCode::None);
+
+        // 7. Fetch with ReadCommitted AFTER Commit: now returns the message!
+        let mut f_buf3 = BytesMut::new();
+        fetch_committed_req.encode(&mut f_buf3, 4);
+        let mut resp_bytes3 = engine
+            .handle_request(&fetch_committed_hdr, &mut f_buf3.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp_bytes3).unwrap();
+        let fetch_resp3 = FetchResponse::decode(&mut resp_bytes3, 4).unwrap();
+        assert!(!fetch_resp3.responses[0].partitions[0].records.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_producer_epoch_fencing() {
+        let wal = Arc::new(MemoryWal::new());
+        let storage = Arc::new(MemoryObjectStorage::new());
+        let log_cache = Arc::new(LogCache::new(1024 * 1024));
+        let block_cache = Arc::new(BlockCache::new(1024 * 1024));
+        let cluster_state = Arc::new(ClusterState::new(
+            0,
+            "127.0.0.1",
+            9092,
+            "test-cluster".to_string(),
+            wal,
+            storage,
+            log_cache,
+            block_cache,
+        ));
+        let coordinator = Arc::new(GroupCoordinator::new());
+        let engine = BrokerEngine::new(cluster_state, coordinator);
+
+        // First producer initializes "my-tx"
+        let init_hdr = RequestHeader::new(ApiKey::InitProducerId, 0, 1, Some("p1"));
+        let init_req = InitProducerIdRequest {
+            transactional_id: Some("my-tx".into()),
+            transaction_timeout_ms: 60000,
+            producer_id: -1,
+            producer_epoch: -1,
+        };
+        let mut buf = BytesMut::new();
+        init_req.encode(&mut buf, 0);
+        let mut resp_bytes = engine
+            .handle_request(&init_hdr, &mut buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp_bytes).unwrap();
+        let p1_resp = InitProducerIdResponse::decode(&mut resp_bytes, 0).unwrap();
+        assert_eq!(p1_resp.producer_epoch, 0);
+
+        // Second producer (or rebooted producer) initializes "my-tx" -> epoch bumped to 1
+        let mut buf2 = BytesMut::new();
+        init_req.encode(&mut buf2, 0);
+        let mut resp_bytes2 = engine
+            .handle_request(&init_hdr, &mut buf2.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp_bytes2).unwrap();
+        let p2_resp = InitProducerIdResponse::decode(&mut resp_bytes2, 0).unwrap();
+        assert_eq!(p2_resp.producer_epoch, 1);
+
+        // Old producer with epoch 0 attempts AddPartitionsToTxn -> Must be FENCED!
+        let add_p_hdr = RequestHeader::new(ApiKey::AddPartitionsToTxn, 0, 2, Some("p1"));
+        let add_p_req = AddPartitionsToTxnRequest {
+            transactional_id: "my-tx".into(),
+            producer_id: p1_resp.producer_id,
+            producer_epoch: 0,
+            topics: vec![AddPartitionsToTxnTopic {
+                name: "topic-fence".into(),
+                partitions: vec![0],
+            }],
+        };
+        let mut add_buf = BytesMut::new();
+        add_p_req.encode(&mut add_buf, 0);
+        let mut resp_bytes = engine
+            .handle_request(&add_p_hdr, &mut add_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp_bytes).unwrap();
+        let add_resp = AddPartitionsToTxnResponse::decode(&mut resp_bytes, 0).unwrap();
+        assert_eq!(
+            add_resp.errors[0].results[0].error_code,
+            KafkaErrorCode::ProducerFenced
+        );
     }
 }

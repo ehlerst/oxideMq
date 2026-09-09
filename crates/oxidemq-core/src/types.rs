@@ -1,5 +1,5 @@
 use crate::error::{OxideMqError, Result};
-use bytes::Bytes;
+use bytes::{BufMut, Bytes, BytesMut};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::io::{Read, Write};
@@ -267,6 +267,75 @@ impl RecordBatch {
     pub fn size_in_bytes(&self) -> usize {
         self.raw_bytes.len()
     }
+
+    pub fn is_transactional(&self) -> bool {
+        (self.attributes & 0x0010) != 0
+    }
+
+    pub fn is_control_batch(&self) -> bool {
+        (self.attributes & 0x0020) != 0
+    }
+
+    pub fn is_commit_control(&self) -> bool {
+        if !self.is_control_batch() || self.records.is_empty() {
+            return false;
+        }
+        if let Some(ref key) = self.records[0].key {
+            if key.len() >= 4 {
+                return key[2] == 0 && key[3] == 1;
+            }
+        }
+        false
+    }
+
+    pub fn is_abort_control(&self) -> bool {
+        if !self.is_control_batch() || self.records.is_empty() {
+            return false;
+        }
+        if let Some(ref key) = self.records[0].key {
+            if key.len() >= 4 {
+                return key[2] == 0 && key[3] == 0;
+            }
+        }
+        false
+    }
+
+    pub fn new_control_batch(
+        base_offset: i64,
+        producer_id: i64,
+        producer_epoch: i16,
+        is_commit: bool,
+    ) -> Self {
+        let now = chrono::Utc::now().timestamp_millis();
+        let control_type: i16 = if is_commit { 1 } else { 0 };
+        let mut key = BytesMut::with_capacity(4);
+        key.put_i16(0); // version 0
+        key.put_i16(control_type); // 1 = COMMIT, 0 = ABORT
+
+        let record = Record {
+            offset: base_offset,
+            timestamp: now,
+            key: Some(key.freeze()),
+            value: Some(Bytes::new()),
+            headers: Vec::new(),
+        };
+
+        Self {
+            base_offset,
+            partition_leader_epoch: 0,
+            magic: 2,
+            crc: 0,
+            attributes: 0x0030, // is_control_batch | is_transactional
+            last_offset_delta: 0,
+            base_timestamp: now,
+            max_timestamp: now,
+            producer_id,
+            producer_epoch,
+            base_sequence: -1,
+            records: vec![record],
+            raw_bytes: Bytes::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -418,5 +487,20 @@ mod tests {
         assert!(CompressionCodec::Snappy.decompress(invalid).is_err());
         assert!(CompressionCodec::Lz4.decompress(invalid).is_err());
         assert!(CompressionCodec::Zstd.decompress(invalid).is_err());
+    }
+
+    #[test]
+    fn test_record_batch_control_and_transactional() {
+        let commit_batch = RecordBatch::new_control_batch(100, 1001, 1, true);
+        assert!(commit_batch.is_control_batch());
+        assert!(commit_batch.is_transactional());
+        assert!(commit_batch.is_commit_control());
+        assert!(!commit_batch.is_abort_control());
+
+        let abort_batch = RecordBatch::new_control_batch(101, 1001, 1, false);
+        assert!(abort_batch.is_control_batch());
+        assert!(abort_batch.is_transactional());
+        assert!(!abort_batch.is_commit_control());
+        assert!(abort_batch.is_abort_control());
     }
 }
