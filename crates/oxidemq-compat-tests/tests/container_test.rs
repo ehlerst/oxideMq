@@ -187,7 +187,7 @@ async fn test_real_docker_testcontainers_suite() {
 
     let image = GenericImage::new("ehlers320/oxidemq", "latest")
         .with_exposed_port(9092.tcp())
-        .with_exposed_port(9093.tcp());
+        .with_exposed_port(8082.tcp());
 
     let container = match image.start().await {
         Ok(c) => c,
@@ -200,7 +200,7 @@ async fn test_real_docker_testcontainers_suite() {
         }
     };
 
-    let admin_port = match container.get_host_port_ipv4(9093.tcp()).await {
+    let admin_port = match container.get_host_port_ipv4(8082.tcp()).await {
         Ok(p) => p,
         Err(e) => {
             eprintln!("Failed to get host port for admin: {}", e);

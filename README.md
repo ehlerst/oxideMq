@@ -40,7 +40,7 @@ oxideMq/
 │   ├── oxidemq-s3stream/           # S3Stream storage, LogCache, BlockCache, Uploader, Compactor
 │   ├── oxidemq-protocol/           # Pure-Rust zero-copy Kafka binary wire protocol
 │   ├── oxidemq-broker/             # Broker engine, partition state machine, group coordinator, chaos
-│   ├── oxidemq-server/             # Dual-port daemon (Kafka 9092 & Admin 9093), Web UI, CLI
+│   ├── oxidemq-server/             # Dual-port daemon (Kafka 9092 & Admin 8082), Web UI, CLI
 │   ├── oxidemq-benchmarks/         # Criterion benchmark suites across all phases (Phase 0–6)
 │   └── oxidemq-compat-tests/       # Tier 1 in-memory and Tier 2 daemon integration tests
 ```
@@ -129,12 +129,12 @@ Pre-built multi-arch (`linux/amd64`, `linux/arm64`) distroless images are publis
 docker run -d \
   --name oxidemq \
   -p 9092:9092 \
-  -p 9093:9093 \
+  -p 8082:8082 \
   ehlers320/oxidemq:latest
 ```
 
 - **Kafka Wire Protocol**: `127.0.0.1:9092`
-- **Embedded Web Console & Admin API**: `http://127.0.0.1:9093`
+- **Embedded Web Console & Admin API**: `http://127.0.0.1:8082`
 
 ---
 
@@ -175,7 +175,7 @@ use testcontainers::GenericImage;
 
 let image = GenericImage::new("ehlers320/oxidemq", "latest")
     .with_exposed_port(9092.tcp())
-    .with_exposed_port(9093.tcp());
+    .with_exposed_port(8082.tcp());
 let container = image.start().await.unwrap();
 let kafka_port = container.get_host_port_ipv4(9092.tcp()).await.unwrap();
 ```
@@ -188,23 +188,23 @@ The standalone `oxidemq` binary provides built-in operations commands:
 
 ```bash
 # Start broker daemon (Kafka TCP + Admin Web Console concurrently)
-oxidemq start --kafka-port 9092 --admin-port 9093 --host 0.0.0.0
+oxidemq start --kafka-port 9092 --admin-port 8082 --host 0.0.0.0
 
 # Inspect cluster health and status
-oxidemq status --addr 127.0.0.1:9093
+oxidemq status --addr 127.0.0.1:8082
 
 # Export deterministic cluster state snapshot (JSON)
-oxidemq dump-state --addr 127.0.0.1:9093
+oxidemq dump-state --addr 127.0.0.1:8082
 
 # Inject fault injection rules via CLI
-oxidemq chaos --addr 127.0.0.1:9093 --target Produce --latency-ms 50 --error-prob 0.1
+oxidemq chaos --addr 127.0.0.1:8082 --target Produce --latency-ms 50 --error-prob 0.1
 ```
 
 ---
 
 ## 🌐 Embedded Dark-Mode Web Console
 
-Served directly from the binary at `http://127.0.0.1:9093/` with **zero external asset dependencies**:
+Served directly from the binary at `http://127.0.0.1:8082/` with **zero external asset dependencies**:
 - **Real-Time Overview**: Node ID, Cluster ID, Status, Memory RSS, Uptime.
 - **Partition Visualizer**: Topic, partition index, high watermark, log start offset.
 - **Consumer Group Monitor**: Group ID, rebalance state, generation ID, committed partition offsets.

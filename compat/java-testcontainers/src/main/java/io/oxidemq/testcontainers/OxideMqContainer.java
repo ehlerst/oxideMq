@@ -21,7 +21,7 @@ public class OxideMqContainer extends GenericContainer<OxideMqContainer> {
             DockerImageName.parse("ehlers320/oxidemq:latest");
 
     public static final int KAFKA_PORT = 9092;
-    public static final int ADMIN_PORT = 9093;
+    public static final int ADMIN_PORT = 8082;
 
     public OxideMqContainer() {
         this(DEFAULT_IMAGE_NAME);

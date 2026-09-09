@@ -20,7 +20,7 @@ class ProducerConsumerContainersTest {
 
     private static Process brokerProcess;
     private static final int KAFKA_PORT = 9092;
-    private static final int ADMIN_PORT = 9093;
+    private static final int ADMIN_PORT = 8082;
 
     @BeforeAll
     static void setUp() throws Exception {

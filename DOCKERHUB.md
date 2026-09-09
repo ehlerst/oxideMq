@@ -17,7 +17,7 @@
 - **🛡️ 100% Deterministic Latency**: Zero GC pauses, zero JVM warmups, pure Rust memory safety and RAII.
 - **☁️ S3Stream Cloud-Native Storage**: Native tiering to AWS S3, RustStack S3, or MinIO with zero local EBS/disk requirements.
 - **🗜️ Native Compression Codecs**: Wire-level hardware-accelerated decompression and re-compression for **Snappy**, **LZ4**, **Zstandard (zstd)**, and **Gzip**.
-- **🌐 Embedded Dark-Mode Web Console**: Single-binary dashboard served directly at `http://localhost:9093/` with partition visualizer, consumer group monitor, and live chaos injection.
+- **🌐 Embedded Dark-Mode Web Console**: Single-binary dashboard served directly at `http://localhost:8082/` with partition visualizer, consumer group monitor, and live chaos injection.
 - **🧪 Testcontainers Native**: Purpose-built for blazing-fast integration testing with Java, Rust, Go, or Python testcontainers.
 
 ---
@@ -30,18 +30,18 @@
 docker run -d \
   --name oxidemq \
   -p 9092:9092 \
-  -p 9093:9093 \
+  -p 8082:8082 \
   ehlers320/oxidemq:latest
 ```
 
 Verify the broker is healthy:
 ```bash
-curl http://localhost:9093/v1/health
-# {"status":"UP","node_id":0,"cluster_id":"oxide-cluster-0"}
+curl http://localhost:8082/_oxidemq/health
+# OK
 ```
 
 Open the dark-mode dashboard in your browser:
-👉 **http://localhost:9093**
+👉 **http://localhost:8082**
 
 ---
 
@@ -58,11 +58,11 @@ services:
     container_name: oxidemq
     ports:
       - "9092:9092"   # Kafka Protocol
-      - "9093:9093"   # Admin REST API & Dark Web Console
+      - "8082:8082"   # Admin REST API & Dark Web Console
     environment:
       - HOST=0.0.0.0
       - KAFKA_PORT=9092
-      - ADMIN_PORT=9093
+      - ADMIN_PORT=8082
       - OXIDEMQ_STORAGE_ENGINE=file
       - OXIDEMQ_WAL_DIR=/data/wal
       - RUST_LOG=info
@@ -97,11 +97,11 @@ services:
       - s3
     ports:
       - "9092:9092"
-      - "9093:9093"
+      - "8082:8082"
     environment:
       - HOST=0.0.0.0
       - KAFKA_PORT=9092
-      - ADMIN_PORT=9093
+      - ADMIN_PORT=8082
       - OXIDEMQ_STORAGE_ENGINE=s3
       - OXIDEMQ_S3_BUCKET=oxidemq-data
       - OXIDEMQ_S3_ENDPOINT=http://s3:9000
@@ -118,7 +118,7 @@ services:
 |---|---|---|
 | `HOST` | `0.0.0.0` | Bind address for Kafka and Admin servers |
 | `KAFKA_PORT` | `9092` | Port for Apache Kafka wire protocol (TCP) |
-| `ADMIN_PORT` | `9093` | Port for Admin Web Console & REST API (HTTP) |
+| `ADMIN_PORT` | `8082` | Port for Admin Web Console & REST API (HTTP) |
 | `OXIDEMQ_STORAGE_ENGINE` | `memory` | Backend engine: `memory`, `file` (WAL), or `s3` (S3Stream) |
 | `OXIDEMQ_WAL_DIR` | `./data/wal` | Local disk directory for Write-Ahead Log segments |
 | `OXIDEMQ_S3_BUCKET` | `oxidemq-data` | S3 bucket name for historical block tiering |
@@ -168,7 +168,7 @@ await producer.send({
 class StreamingTest {
     @Container
     static final GenericContainer<?> oxidemq = new GenericContainer<>("ehlers320/oxidemq:latest")
-        .withExposedPorts(9092, 9093);
+        .withExposedPorts(9092, 8082);
 
     @Test
     void testProduce() {

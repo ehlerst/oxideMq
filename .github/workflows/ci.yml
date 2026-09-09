@@ -79,7 +79,7 @@ jobs:
 
       - name: Start oxideMq Background Daemon
         run: |
-          ./target/release/oxidemq start --kafka-port 9092 --admin-port 9093 &
+          ./target/release/oxidemq start --kafka-port 9092 --admin-port 8082 &
           sleep 2
 
       - name: Run Java Testcontainers Suite

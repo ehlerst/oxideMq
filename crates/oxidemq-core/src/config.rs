@@ -27,7 +27,7 @@ impl Default for BrokerConfig {
             cluster_id: "oxidemq-cluster-local".to_string(),
             host: "0.0.0.0".to_string(),
             kafka_port: 9092,
-            admin_port: 9093,
+            admin_port: 8082,
         }
     }
 }
@@ -112,7 +112,7 @@ mod tests {
         assert_eq!(config.broker.node_id, 1);
         assert_eq!(config.broker.cluster_id, "oxidemq-cluster-local");
         assert_eq!(config.broker.kafka_port, 9092);
-        assert_eq!(config.broker.admin_port, 9093);
+        assert_eq!(config.broker.admin_port, 8082);
         assert_eq!(config.broker.host, "0.0.0.0");
 
         assert_eq!(config.wal.max_batch_records, 4096);

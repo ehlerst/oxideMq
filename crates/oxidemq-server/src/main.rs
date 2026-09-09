@@ -30,7 +30,7 @@ struct Cli {
     #[arg(short, long, default_value_t = 9092)]
     kafka_port: u16,
 
-    #[arg(short, long, default_value_t = 9093)]
+    #[arg(short, long, default_value_t = 8082)]
     admin_port: u16,
 
     #[arg(long, default_value = "0.0.0.0")]
@@ -43,24 +43,24 @@ enum Commands {
     Start {
         #[arg(short, long, default_value_t = 9092)]
         kafka_port: u16,
-        #[arg(short, long, default_value_t = 9093)]
+        #[arg(short, long, default_value_t = 8082)]
         admin_port: u16,
         #[arg(long, default_value = "0.0.0.0")]
         host: String,
     },
     /// Inspect broker status and health
     Status {
-        #[arg(long, default_value = "127.0.0.1:9093")]
+        #[arg(long, default_value = "127.0.0.1:8082")]
         addr: String,
     },
     /// Export cluster state snapshot
     DumpState {
-        #[arg(long, default_value = "127.0.0.1:9093")]
+        #[arg(long, default_value = "127.0.0.1:8082")]
         addr: String,
     },
     /// Inject chaos fault rules into a running broker
     Chaos {
-        #[arg(long, default_value = "127.0.0.1:9093")]
+        #[arg(long, default_value = "127.0.0.1:8082")]
         addr: String,
         #[arg(long)]
         target: String,
@@ -317,7 +317,7 @@ mod tests {
     fn test_cli_parsing() {
         let cli_default = Cli::try_parse_from(["oxidemq"]).unwrap();
         assert_eq!(cli_default.kafka_port, 9092);
-        assert_eq!(cli_default.admin_port, 9093);
+        assert_eq!(cli_default.admin_port, 8082);
         assert!(cli_default.command.is_none());
 
         let cli_start = Cli::try_parse_from([
@@ -345,10 +345,10 @@ mod tests {
         }
 
         let cli_status =
-            Cli::try_parse_from(["oxidemq", "status", "--addr", "10.0.0.1:9093"]).unwrap();
+            Cli::try_parse_from(["oxidemq", "status", "--addr", "10.0.0.1:8082"]).unwrap();
         match cli_status.command {
             Some(Commands::Status { addr }) => {
-                assert_eq!(addr, "10.0.0.1:9093");
+                assert_eq!(addr, "10.0.0.1:8082");
             }
             _ => panic!("Expected Status command"),
         }
@@ -356,7 +356,7 @@ mod tests {
         let cli_dump = Cli::try_parse_from(["oxidemq", "dump-state"]).unwrap();
         match cli_dump.command {
             Some(Commands::DumpState { addr }) => {
-                assert_eq!(addr, "127.0.0.1:9093");
+                assert_eq!(addr, "127.0.0.1:8082");
             }
             _ => panic!("Expected DumpState command"),
         }
@@ -440,7 +440,7 @@ mod tests {
                 addr: addr.to_string(),
             }),
             kafka_port: 9092,
-            admin_port: 9093,
+            admin_port: 8082,
             host: "127.0.0.1".into(),
         };
         assert!(run_cli_command(cli_status).await.is_ok());
@@ -450,7 +450,7 @@ mod tests {
                 addr: addr.to_string(),
             }),
             kafka_port: 9092,
-            admin_port: 9093,
+            admin_port: 8082,
             host: "127.0.0.1".into(),
         };
         assert!(run_cli_command(cli_dump).await.is_ok());
@@ -464,7 +464,7 @@ mod tests {
                     error_prob: 0.1,
                 }),
                 kafka_port: 9092,
-                admin_port: 9093,
+                admin_port: 8082,
                 host: "127.0.0.1".into(),
             };
             assert!(run_cli_command(cli_chaos).await.is_ok());
