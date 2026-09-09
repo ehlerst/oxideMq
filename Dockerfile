@@ -1,6 +1,8 @@
-FROM gcr.io/distroless/cc-debian12:latest
+FROM debian:trixie-slim
 
 ARG TARGETARCH
+
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 COPY docker-bin/${TARGETARCH}/oxidemq /usr/local/bin/oxidemq
