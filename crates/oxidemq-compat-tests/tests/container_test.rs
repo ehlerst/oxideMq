@@ -176,9 +176,12 @@ async fn test_real_docker_testcontainers_suite() {
     use testcontainers::runners::AsyncRunner;
     use testcontainers::GenericImage;
 
-    // Check if Docker socket is available; if not, skip gracefully
-    if !std::path::Path::new("/var/run/docker.sock").exists() {
-        eprintln!("Docker socket not found; skipping testcontainers test.");
+    // Check if Docker socket is available and real testcontainers are enabled.
+    // In pure unit test runs or before the Docker image has been built, skip gracefully.
+    if std::env::var("RUN_TESTCONTAINERS").unwrap_or_default() != "1"
+        || !std::path::Path::new("/var/run/docker.sock").exists()
+    {
+        eprintln!("Skipping Docker testcontainers integration test (set RUN_TESTCONTAINERS=1).");
         return;
     }
 

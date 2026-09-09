@@ -40,7 +40,7 @@ test-compat: ## Run protocol and broker compatibility test suites
 	cargo test -p oxidemq-compat-tests
 
 test-containers: ## Run Testcontainers integration tests (requires Docker daemon)
-	cargo test -p oxidemq-compat-tests --test container_test
+	RUN_TESTCONTAINERS=1 cargo test -p oxidemq-compat-tests --test container_test
 
 test-all: test test-containers ## Run full test suite including container tests
 
