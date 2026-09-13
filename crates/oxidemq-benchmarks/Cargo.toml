@@ -16,6 +16,11 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 criterion = { workspace = true }
 tempfile = { workspace = true }
+clap = { workspace = true }
+
+[[bin]]
+name = "oxidemq-bench"
+path = "src/bin/oxidemq_bench.rs"
 
 [[bench]]
 name = "phase0_baseline"
@@ -47,4 +52,8 @@ harness = false
 
 [[bench]]
 name = "phase7_head_to_head"
+harness = false
+
+[[bench]]
+name = "phase9_network_saturation"
 harness = false

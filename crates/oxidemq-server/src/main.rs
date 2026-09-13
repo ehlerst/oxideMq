@@ -3,11 +3,15 @@ use oxidemq_broker::chaos::{ChaosEngine, ChaosRule, FaultTarget};
 use oxidemq_broker::coordinator::GroupCoordinator;
 use oxidemq_broker::handler::BrokerEngine;
 use oxidemq_broker::router::ClusterState;
+use oxidemq_broker::schema_registry::SchemaRegistry;
 use oxidemq_core::config::OxideConfig;
 use oxidemq_s3stream::block_cache::BlockCache;
 use oxidemq_s3stream::client::{MemoryObjectStorage, ObjectStorage, S3ClientStorage};
 use oxidemq_s3stream::log_cache::LogCache;
 use oxidemq_server::admin::{create_admin_router, AppState};
+use oxidemq_server::schema_registry_http::{
+    create_schema_registry_router, create_schema_registry_routes,
+};
 use oxidemq_server::tls::{create_tls_acceptor, TlsConfig};
 use oxidemq_wal::memory::MemoryWal;
 use std::net::SocketAddr;
@@ -47,13 +51,22 @@ struct Cli {
     #[arg(short, long, default_value_t = 8082)]
     admin_port: u16,
 
+    #[arg(long, default_value_t = 8081, env = "OXIDEMQ_SCHEMA_REGISTRY_PORT")]
+    schema_registry_port: u16,
+
+    #[arg(long, default_value_t = true, env = "OXIDEMQ_ENABLE_SCHEMA_REGISTRY", action = clap::ArgAction::Set)]
+    enable_schema_registry: bool,
+
+    #[arg(long, default_value_t = false, env = "OXIDEMQ_ENABLE_SCHEMA_VALIDATION", action = clap::ArgAction::Set)]
+    enable_schema_validation: bool,
+
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Start the oxideMq broker daemon (Kafka TCP + Admin Web Console)
+    /// Start the oxideMq broker daemon (Kafka TCP + Admin Web Console + Schema Registry)
     Start {
         #[arg(short, long, default_value_t = 9092)]
         kafka_port: u16,
@@ -67,6 +80,12 @@ enum Commands {
         tls_key: Option<std::path::PathBuf>,
         #[arg(short, long, default_value_t = 8082)]
         admin_port: u16,
+        #[arg(long, default_value_t = 8081, env = "OXIDEMQ_SCHEMA_REGISTRY_PORT")]
+        schema_registry_port: u16,
+        #[arg(long, default_value_t = true, env = "OXIDEMQ_ENABLE_SCHEMA_REGISTRY", action = clap::ArgAction::Set)]
+        enable_schema_registry: bool,
+        #[arg(long, default_value_t = false, env = "OXIDEMQ_ENABLE_SCHEMA_VALIDATION", action = clap::ArgAction::Set)]
+        enable_schema_validation: bool,
         #[arg(long, default_value = "0.0.0.0")]
         host: String,
     },
@@ -100,6 +119,36 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     run_cli_command(cli).await
 }
 
+struct ServerOptions {
+    host: String,
+    kafka_port: u16,
+    ssl_port: u16,
+    enable_ssl: bool,
+    tls_cert: Option<PathBuf>,
+    tls_key: Option<PathBuf>,
+    admin_port: u16,
+    schema_registry_port: u16,
+    enable_schema_registry: bool,
+    enable_schema_validation: bool,
+}
+
+impl From<&Cli> for ServerOptions {
+    fn from(cli: &Cli) -> Self {
+        Self {
+            host: cli.host.clone(),
+            kafka_port: cli.kafka_port,
+            ssl_port: cli.ssl_port,
+            enable_ssl: cli.enable_ssl,
+            tls_cert: cli.tls_cert.clone(),
+            tls_key: cli.tls_key.clone(),
+            admin_port: cli.admin_port,
+            schema_registry_port: cli.schema_registry_port,
+            enable_schema_registry: cli.enable_schema_registry,
+            enable_schema_validation: cli.enable_schema_validation,
+        }
+    }
+}
+
 async fn run_cli_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     match cli.command {
         Some(Commands::Status { addr }) => {
@@ -121,12 +170,9 @@ async fn run_cli_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 "fetch" => FaultTarget::Fetch,
                 "wal" => FaultTarget::Wal,
                 "s3" | "s3storage" => FaultTarget::S3Storage,
-                _ => {
-                    eprintln!(
-                        "Invalid target: {}. Must be Produce, Fetch, Wal, or S3Storage",
-                        target
-                    );
-                    return Ok(());
+                other => {
+                    eprintln!("Unknown fault target '{}', defaulting to Produce", other);
+                    FaultTarget::Produce
                 }
             };
             let rule_id = format!(
@@ -154,39 +200,47 @@ async fn run_cli_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             tls_cert,
             tls_key,
             admin_port,
+            schema_registry_port,
+            enable_schema_registry,
+            enable_schema_validation,
             host,
         }) => {
-            run_server(
-                &host, kafka_port, ssl_port, enable_ssl, tls_cert, tls_key, admin_port,
-            )
-            .await?;
+            let opts = ServerOptions {
+                host,
+                kafka_port,
+                ssl_port,
+                enable_ssl,
+                tls_cert,
+                tls_key,
+                admin_port,
+                schema_registry_port,
+                enable_schema_registry,
+                enable_schema_validation,
+            };
+            run_server(opts).await?;
         }
         None => {
-            run_server(
-                &cli.host,
-                cli.kafka_port,
-                cli.ssl_port,
-                cli.enable_ssl,
-                cli.tls_cert,
-                cli.tls_key,
-                cli.admin_port,
-            )
-            .await?;
+            let opts = ServerOptions::from(&cli);
+            run_server(opts).await?;
         }
     }
 
     Ok(())
 }
 
-async fn run_server(
-    host: &str,
-    kafka_port: u16,
-    ssl_port: u16,
-    enable_ssl: bool,
-    tls_cert: Option<PathBuf>,
-    tls_key: Option<PathBuf>,
-    admin_port: u16,
-) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_server(opts: ServerOptions) -> Result<(), Box<dyn std::error::Error>> {
+    let ServerOptions {
+        host,
+        kafka_port,
+        ssl_port,
+        enable_ssl,
+        tls_cert,
+        tls_key,
+        admin_port,
+        schema_registry_port,
+        enable_schema_registry,
+        enable_schema_validation,
+    } = opts;
     let config = OxideConfig::default();
     let start_time = Instant::now();
 
@@ -247,10 +301,13 @@ async fn run_server(
     ));
     let coordinator = Arc::new(GroupCoordinator::new());
     let chaos = Arc::new(ChaosEngine::new());
+    let schema_registry = Arc::new(SchemaRegistry::new());
 
     let broker_engine = Arc::new(
         BrokerEngine::new(Arc::clone(&cluster_state), Arc::clone(&coordinator))
-            .with_chaos(Arc::clone(&chaos)),
+            .with_chaos(Arc::clone(&chaos))
+            .with_schema_registry(Arc::clone(&schema_registry))
+            .with_schema_validation(enable_schema_validation),
     );
 
     // 2. Start Kafka TCP Listener
@@ -338,6 +395,31 @@ async fn run_server(
         }
     }
 
+    // 2c. Start Confluent Schema Registry HTTP Listener (Port 8081)
+    if enable_schema_registry {
+        let schema_router = create_schema_registry_router(Arc::clone(&schema_registry));
+        let schema_addr: SocketAddr = format!("{}:{}", host, schema_registry_port).parse()?;
+        match TcpListener::bind(schema_addr).await {
+            Ok(schema_listener) => {
+                info!(
+                    "Confluent-compatible Schema Registry v1 ready on http://{}",
+                    schema_addr
+                );
+                tokio::spawn(async move {
+                    if let Err(e) = axum::serve(schema_listener, schema_router).await {
+                        error!("Schema Registry server error: {}", e);
+                    }
+                });
+            }
+            Err(e) => {
+                error!(
+                    "Failed to bind Schema Registry listener on {}: {}",
+                    schema_addr, e
+                );
+            }
+        }
+    }
+
     // 3. Start Axum Admin & Web Console Server
     let admin_state = AppState {
         cluster_state,
@@ -345,7 +427,10 @@ async fn run_server(
         chaos,
         start_time,
     };
-    let app = create_admin_router(admin_state);
+    let mut app = create_admin_router(admin_state);
+    if enable_schema_registry {
+        app = app.merge(create_schema_registry_routes(Arc::clone(&schema_registry)));
+    }
     let admin_addr: SocketAddr = format!("{}:{}", host, admin_port).parse()?;
     let admin_listener = TcpListener::bind(admin_addr).await?;
     info!(
@@ -422,6 +507,9 @@ mod tests {
         assert_eq!(cli_default.ssl_port, 9093);
         assert!(cli_default.enable_ssl);
         assert_eq!(cli_default.admin_port, 8082);
+        assert_eq!(cli_default.schema_registry_port, 8081);
+        assert!(cli_default.enable_schema_registry);
+        assert!(!cli_default.enable_schema_validation);
         assert!(cli_default.command.is_none());
 
         let cli_start = Cli::try_parse_from([
@@ -435,6 +523,12 @@ mod tests {
             "false",
             "--admin-port",
             "9096",
+            "--schema-registry-port",
+            "8085",
+            "--enable-schema-registry",
+            "false",
+            "--enable-schema-validation",
+            "true",
             "--host",
             "127.0.0.1",
         ])
@@ -445,6 +539,9 @@ mod tests {
                 ssl_port,
                 enable_ssl,
                 admin_port,
+                schema_registry_port,
+                enable_schema_registry,
+                enable_schema_validation,
                 host,
                 ..
             }) => {
@@ -452,6 +549,9 @@ mod tests {
                 assert_eq!(ssl_port, 9097);
                 assert!(!enable_ssl);
                 assert_eq!(admin_port, 9096);
+                assert_eq!(schema_registry_port, 8085);
+                assert!(!enable_schema_registry);
+                assert!(enable_schema_validation);
                 assert_eq!(host, "127.0.0.1");
             }
             _ => panic!("Expected Start command"),
@@ -558,6 +658,9 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             admin_port: 8082,
+            schema_registry_port: 8081,
+            enable_schema_registry: false,
+            enable_schema_validation: false,
             host: "127.0.0.1".into(),
         };
         assert!(run_cli_command(cli_status).await.is_ok());
@@ -572,6 +675,9 @@ mod tests {
             tls_cert: None,
             tls_key: None,
             admin_port: 8082,
+            schema_registry_port: 8081,
+            enable_schema_registry: false,
+            enable_schema_validation: false,
             host: "127.0.0.1".into(),
         };
         assert!(run_cli_command(cli_dump).await.is_ok());
@@ -590,6 +696,9 @@ mod tests {
                 tls_cert: None,
                 tls_key: None,
                 admin_port: 8082,
+                schema_registry_port: 8081,
+                enable_schema_registry: false,
+                enable_schema_validation: false,
                 host: "127.0.0.1".into(),
             };
             assert!(run_cli_command(cli_chaos).await.is_ok());

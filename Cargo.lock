@@ -2468,6 +2468,7 @@ name = "oxidemq-benchmarks"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "clap",
  "criterion",
  "oxidemq-broker",
  "oxidemq-core",

@@ -16,7 +16,7 @@ release: ## Build optimized release binary
 	cargo build --release --workspace
 
 ## 🚀 Execution & Operations
-run: ## Run oxideMq broker daemon locally with info logging (Kafka :9092, TLS :9093, Admin :8082)
+run: ## Run oxideMq broker daemon locally with info logging (Kafka :9092, TLS :9093, Schema Registry :8081, Admin :8082)
 	RUST_LOG=info cargo run -p oxidemq-server -- start
 
 run-file-wal: ## Run oxideMq broker with local Write-Ahead Log (WAL) on disk
@@ -63,8 +63,14 @@ check: check-fmt lint ## Run both formatting check and strict clippy
 bench: ## Run comparative Criterion benchmarks (Phase 6)
 	cargo bench -p oxidemq-benchmarks --bench phase6_comparative
 
-bench-all: ## Run all Criterion benchmark suites (Phases 0 through 7)
+bench-all: ## Run all Criterion benchmark suites (Phases 0 through 9)
 	cargo bench -p oxidemq-benchmarks
+
+bench-load: ## Run local high-throughput load benchmark (100 partitions, 8 producers)
+	cargo run --release -p oxidemq-benchmarks --bin oxidemq-bench -- --partitions 100 --producers 8 --records-per-producer 10000
+
+bench-remote: ## Run remote line-rate 2.5GbE network stress test (usage: make bench-remote TARGET=host:9092)
+	cargo run --release -p oxidemq-benchmarks --bin oxidemq-bench -- --broker $${TARGET:-127.0.0.1:9092} --partitions 100 --producers 16 --records-per-producer 25000
 
 ## 🐳 Docker Targets
 docker-build: ## Build local Docker container image (ehlers320/oxidemq:latest)
@@ -75,7 +81,7 @@ docker-build: ## Build local Docker container image (ehlers320/oxidemq:latest)
 	docker build --build-arg TARGETARCH=amd64 -t ehlers320/oxidemq:latest .
 
 docker-run: ## Run Docker container daemon in detached mode
-	docker run -d --name oxidemq -p 9092:9092 -p 9093:9093 -p 8082:8082 ehlers320/oxidemq:latest
+	docker run -d --name oxidemq -p 9092:9092 -p 9093:9093 -p 8081:8081 -p 8082:8082 ehlers320/oxidemq:latest
 
 docker-stop: ## Stop and remove running local Docker container
 	docker rm -f oxidemq || true

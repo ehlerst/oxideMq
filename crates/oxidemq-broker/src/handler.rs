@@ -1,8 +1,9 @@
 use crate::chaos::{ChaosEngine, FaultTarget};
 use crate::coordinator::GroupCoordinator;
 use crate::router::ClusterState;
+use crate::schema_registry::SchemaRegistry;
 use crate::transaction::TransactionCoordinator;
-use bytes::{BufMut, Bytes, BytesMut};
+use bytes::{Buf, BufMut, Bytes, BytesMut};
 use oxidemq_core::error::{OxideMqError, Result};
 use oxidemq_core::types::{CompressionCodec, TopicPartition};
 use oxidemq_protocol::header::{RequestHeader, ResponseHeader};
@@ -30,7 +31,9 @@ pub struct BrokerEngine {
     cluster_state: Arc<ClusterState>,
     coordinator: Arc<GroupCoordinator>,
     txn_coordinator: Arc<TransactionCoordinator>,
+    schema_registry: Arc<SchemaRegistry>,
     chaos: Arc<ChaosEngine>,
+    enable_schema_validation: bool,
 }
 
 impl BrokerEngine {
@@ -39,7 +42,9 @@ impl BrokerEngine {
             cluster_state,
             coordinator,
             txn_coordinator: Arc::new(TransactionCoordinator::new()),
+            schema_registry: Arc::new(SchemaRegistry::new()),
             chaos: Arc::new(ChaosEngine::new()),
+            enable_schema_validation: false,
         }
     }
 
@@ -53,6 +58,16 @@ impl BrokerEngine {
         self
     }
 
+    pub fn with_schema_registry(mut self, schema_registry: Arc<SchemaRegistry>) -> Self {
+        self.schema_registry = schema_registry;
+        self
+    }
+
+    pub fn with_schema_validation(mut self, enabled: bool) -> Self {
+        self.enable_schema_validation = enabled;
+        self
+    }
+
     pub fn cluster_state(&self) -> &Arc<ClusterState> {
         &self.cluster_state
     }
@@ -63,6 +78,14 @@ impl BrokerEngine {
 
     pub fn txn_coordinator(&self) -> &Arc<TransactionCoordinator> {
         &self.txn_coordinator
+    }
+
+    pub fn schema_registry(&self) -> &Arc<SchemaRegistry> {
+        &self.schema_registry
+    }
+
+    pub fn is_schema_validation_enabled(&self) -> bool {
+        self.enable_schema_validation
     }
 
     pub fn chaos(&self) -> &Arc<ChaosEngine> {
@@ -103,23 +126,36 @@ impl BrokerEngine {
                             (KafkaErrorCode::UnknownServer, -1, -1, 0)
                         } else {
                             // Validate and decompress if compressed, ensuring payload integrity
-                            if let Err(e) = p.decompressed_records() {
-                                error!(
-                                    "Corrupted compressed record batch produced to {}: {}",
-                                    tp, e
-                                );
-                                (KafkaErrorCode::CorruptMessage, -1, -1, 0)
-                            } else {
-                                match partition.append_records(p.records) {
-                                    Ok((b_off, a_time)) => (
-                                        KafkaErrorCode::None,
-                                        b_off,
-                                        a_time,
-                                        partition.log_start_offset(),
-                                    ),
-                                    Err(e) => {
-                                        error!("Failed to append records to {}: {}", tp, e);
-                                        (KafkaErrorCode::UnknownServer, -1, -1, 0)
+                            match p.decompressed_records() {
+                                Err(e) => {
+                                    error!(
+                                        "Corrupted compressed record batch produced to {}: {}",
+                                        tp, e
+                                    );
+                                    (KafkaErrorCode::CorruptMessage, -1, -1, 0)
+                                }
+                                Ok(decompressed) => {
+                                    if self.enable_schema_validation
+                                        && !self.validate_record_payloads(&decompressed)
+                                    {
+                                        error!(
+                                            "Schema validation failed for record produced to {}",
+                                            tp
+                                        );
+                                        (KafkaErrorCode::InvalidRecord, -1, -1, 0)
+                                    } else {
+                                        match partition.append_records(p.records) {
+                                            Ok((b_off, a_time)) => (
+                                                KafkaErrorCode::None,
+                                                b_off,
+                                                a_time,
+                                                partition.log_start_offset(),
+                                            ),
+                                            Err(e) => {
+                                                error!("Failed to append records to {}: {}", tp, e);
+                                                (KafkaErrorCode::UnknownServer, -1, -1, 0)
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -539,6 +575,84 @@ impl BrokerEngine {
         }
 
         Ok(())
+    }
+
+    /// Validates record payloads against the Schema Registry catalog if schema validation is enabled.
+    pub fn validate_record_payloads(&self, records_bytes: &[u8]) -> bool {
+        if records_bytes.is_empty() {
+            return true;
+        }
+
+        // Direct Confluent magic byte payload (0x00 + 4-byte BE schema_id)
+        if records_bytes.len() >= 5 && records_bytes[0] == 0x00 {
+            return self
+                .schema_registry
+                .validate_magic_byte_payload(records_bytes)
+                .map(|opt| opt.is_some())
+                .unwrap_or(false);
+        }
+
+        // Check if it's a RecordBatch v2 (magic byte at offset 16 is 2)
+        if records_bytes.len() >= 61 && records_bytes[16] == 2 {
+            let mut buf = bytes::Bytes::copy_from_slice(records_bytes);
+            buf.advance(61); // Advance past batch header to records
+
+            while buf.has_remaining() {
+                // Record length (varint)
+                let rec_len = match oxidemq_protocol::parser::KafkaDecoder::read_varint(&mut buf) {
+                    Ok(l) if l > 0 => l as usize,
+                    _ => break,
+                };
+                if buf.remaining() < rec_len {
+                    break;
+                }
+                let mut rec_buf = buf.copy_to_bytes(rec_len);
+                // attributes (1 byte)
+                if rec_buf.is_empty() {
+                    break;
+                }
+                rec_buf.advance(1);
+                // timestamp delta (varint)
+                if oxidemq_protocol::parser::KafkaDecoder::read_varint(&mut rec_buf).is_err() {
+                    break;
+                }
+                // offset delta (varint)
+                if oxidemq_protocol::parser::KafkaDecoder::read_varint(&mut rec_buf).is_err() {
+                    break;
+                }
+                // key length (varint)
+                let key_len =
+                    match oxidemq_protocol::parser::KafkaDecoder::read_varint(&mut rec_buf) {
+                        Ok(l) => l,
+                        Err(_) => break,
+                    };
+                if key_len > 0 {
+                    if rec_buf.remaining() < key_len as usize {
+                        break;
+                    }
+                    rec_buf.advance(key_len as usize);
+                }
+                // value length (varint)
+                let val_len =
+                    match oxidemq_protocol::parser::KafkaDecoder::read_varint(&mut rec_buf) {
+                        Ok(l) => l,
+                        Err(_) => break,
+                    };
+                if val_len > 0 {
+                    if rec_buf.remaining() < val_len as usize {
+                        break;
+                    }
+                    let val_bytes = rec_buf.copy_to_bytes(val_len as usize);
+                    match self.schema_registry.validate_record(&val_bytes, true) {
+                        Ok(Some(_)) => {}
+                        _ => return false,
+                    }
+                }
+            }
+            return true;
+        }
+
+        false
     }
 }
 
@@ -1042,6 +1156,84 @@ mod tests {
         assert_eq!(
             add_resp.errors[0].results[0].error_code,
             KafkaErrorCode::ProducerFenced
+        );
+    }
+
+    #[tokio::test]
+    async fn test_produce_schema_validation() {
+        let registry = Arc::new(SchemaRegistry::new());
+        let schema_id = registry
+            .register_schema(
+                "test-schema-topic-value",
+                r#"{"type":"record","name":"User","fields":[]}"#,
+                None,
+                vec![],
+            )
+            .unwrap();
+
+        let engine = create_test_engine()
+            .with_schema_registry(registry)
+            .with_schema_validation(true);
+
+        // 1. Produce with valid Confluent magic byte payload -> should succeed
+        let mut valid_payload = Vec::new();
+        valid_payload.push(0x00);
+        valid_payload.extend_from_slice(&schema_id.to_be_bytes());
+        valid_payload.extend_from_slice(b"payload content");
+
+        let prod_hdr = RequestHeader::new(ApiKey::Produce, 0, 999, Some("schema-client"));
+        let prod_req = ProduceRequest {
+            acks: 1,
+            timeout_ms: 1000,
+            topic_data: vec![TopicProduceData {
+                topic: "test-schema-topic".into(),
+                partitions: vec![PartitionProduceData {
+                    partition: 0,
+                    records: Bytes::from(valid_payload),
+                }],
+            }],
+        };
+        let mut buf = BytesMut::new();
+        prod_req.encode(&mut buf, 0);
+        let mut resp_bytes = engine
+            .handle_request(&prod_hdr, &mut buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp_bytes).unwrap();
+        let resp = ProduceResponse::decode(&mut resp_bytes, 0).unwrap();
+        assert_eq!(
+            resp.responses[0].partitions[0].error_code,
+            KafkaErrorCode::None
+        );
+
+        // 2. Produce with invalid schema ID -> should return InvalidRecord
+        let mut invalid_payload = Vec::new();
+        invalid_payload.push(0x00);
+        invalid_payload.extend_from_slice(&9999_i32.to_be_bytes());
+        invalid_payload.extend_from_slice(b"payload content");
+
+        let prod_req_invalid = ProduceRequest {
+            acks: 1,
+            timeout_ms: 1000,
+            topic_data: vec![TopicProduceData {
+                topic: "test-schema-topic".into(),
+                partitions: vec![PartitionProduceData {
+                    partition: 0,
+                    records: Bytes::from(invalid_payload),
+                }],
+            }],
+        };
+        let mut buf_inv = BytesMut::new();
+        prod_req_invalid.encode(&mut buf_inv, 0);
+        let mut resp_bytes_inv = engine
+            .handle_request(&prod_hdr, &mut buf_inv.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp_bytes_inv).unwrap();
+        let resp_inv = ProduceResponse::decode(&mut resp_bytes_inv, 0).unwrap();
+        assert_eq!(
+            resp_inv.responses[0].partitions[0].error_code,
+            KafkaErrorCode::InvalidRecord
         );
     }
 }
