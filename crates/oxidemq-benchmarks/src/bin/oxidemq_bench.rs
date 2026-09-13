@@ -48,16 +48,33 @@ struct Args {
     /// Baseline network interface speed in Gbps for saturation measurement
     #[arg(long, default_value_t = 2.5)]
     line_rate_gbps: f64,
+
+    /// Enable TLS/SSL encrypted connection (automatically inferred if port is 9093)
+    #[arg(long, default_value_t = false)]
+    tls: bool,
+
+    /// TLS SNI server name for certificate validation
+    #[arg(long, default_value = "localhost")]
+    tls_server_name: String,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
+    let use_tls = args.tls || args.broker.ends_with(":9093");
 
     println!("================================================================================");
     println!("🦀 oxideMq Line-Rate Network Benchmark Harness");
     println!("================================================================================");
     println!("Target Broker:        {}", args.broker);
+    println!(
+        "Security Protocol:    {}",
+        if use_tls {
+            "SSL/TLS (Encrypted)"
+        } else {
+            "PLAINTEXT"
+        }
+    );
     println!("Topic:                {}", args.topic);
     println!("Partitions:           {}", args.partitions);
     println!("Concurrent Producers: {}", args.producers);
@@ -81,6 +98,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let completed_records = Arc::new(AtomicUsize::new(0));
     let mut handles = Vec::with_capacity(args.producers);
 
+    let tls_connector = if use_tls {
+        Some(oxidemq_server::tls::create_insecure_tls_connector())
+    } else {
+        None
+    };
+
     let start_time = Instant::now();
 
     for producer_idx in 0..args.producers {
@@ -91,10 +114,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let batch_size = args.batch_size;
         let payload = Arc::clone(&shared_payload);
         let counter = Arc::clone(&completed_records);
+        let tls_conn = tls_connector.clone();
+        let tls_sni = args.tls_server_name.clone();
 
         let handle = tokio::spawn(async move {
             let mut latencies_ms = Vec::new();
-            let mut stream = match TcpStream::connect(&broker).await {
+            let tcp_stream = match TcpStream::connect(&broker).await {
                 Ok(s) => s,
                 Err(e) => {
                     eprintln!(
@@ -103,6 +128,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     return latencies_ms;
                 }
+            };
+
+            let mut stream = if let Some(connector) = tls_conn {
+                let server_name = match tls_sni.try_into() {
+                    Ok(name) => name,
+                    Err(e) => {
+                        eprintln!("Producer {} invalid SNI server name: {}", producer_idx, e);
+                        return latencies_ms;
+                    }
+                };
+                match connector.connect(server_name, tcp_stream).await {
+                    Ok(s) => tokio_util::either::Either::Right(s),
+                    Err(e) => {
+                        eprintln!("Producer {} TLS handshake failed: {}", producer_idx, e);
+                        return latencies_ms;
+                    }
+                }
+            } else {
+                tokio_util::either::Either::Left(tcp_stream)
             };
 
             let mut produced = 0;

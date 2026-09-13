@@ -69,6 +69,12 @@ bench-all: ## Run all Criterion benchmark suites (Phases 0 through 9)
 bench-load: ## Run local high-throughput load benchmark (100 partitions, 8 producers)
 	cargo run --release -p oxidemq-benchmarks --bin oxidemq-bench -- --partitions 100 --producers 8 --records-per-producer 10000
 
+bench-tls: ## Run local encrypted TLS stress test against port 9093 (100 partitions, 8 producers)
+	cargo run --release -p oxidemq-benchmarks --bin oxidemq-bench -- --broker 127.0.0.1:9093 --tls --partitions 100 --producers 8 --records-per-producer 10000
+
+bench-tls-vs-plain: ## Run comparative Criterion benchmarks for TLS vs PLAINTEXT (Phase 10)
+	cargo bench -p oxidemq-benchmarks --bench phase10_tls_vs_plaintext
+
 bench-remote: ## Run remote line-rate 2.5GbE network stress test (usage: make bench-remote TARGET=host:9092)
 	cargo run --release -p oxidemq-benchmarks --bin oxidemq-bench -- --broker $${TARGET:-127.0.0.1:9092} --partitions 100 --producers 16 --records-per-producer 25000
 

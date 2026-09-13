@@ -2474,9 +2474,12 @@ dependencies = [
  "oxidemq-core",
  "oxidemq-protocol",
  "oxidemq-s3stream",
+ "oxidemq-server",
  "oxidemq-wal",
+ "rustls 0.23.44",
  "tempfile",
  "tokio",
+ "tokio-rustls 0.26.5",
  "tokio-util",
 ]
 

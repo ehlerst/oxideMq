@@ -69,7 +69,8 @@ fn load_certs_and_key(
     Ok((certs, key))
 }
 
-fn generate_self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)> {
+pub fn generate_self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateKeyDer<'static>)>
+{
     let subject_alt_names = vec![
         "localhost".to_string(),
         "127.0.0.1".to_string(),
@@ -82,6 +83,60 @@ fn generate_self_signed_cert() -> Result<(Vec<CertificateDer<'static>>, PrivateK
     let key_der = PrivateKeyDer::Pkcs8(certified_key.key_pair.serialize_der().into());
 
     Ok((vec![cert_der], key_der))
+}
+
+/// A custom certificate verifier that accepts any server certificate, useful for testing and benchmarking against self-signed certs.
+#[derive(Debug)]
+pub struct InsecureCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for InsecureCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::RSA_PKCS1_SHA256,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::ED25519,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+        ]
+    }
+}
+
+/// Create a TLS connector configured to accept self-signed certificates for benchmarking and local testing.
+pub fn create_insecure_tls_connector() -> tokio_rustls::TlsConnector {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let client_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(InsecureCertVerifier))
+        .with_no_client_auth();
+    tokio_rustls::TlsConnector::from(Arc::new(client_config))
 }
 
 #[cfg(test)]
