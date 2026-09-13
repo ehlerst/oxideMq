@@ -238,6 +238,27 @@ curl http://localhost:8081/subjects/orders-value/versions/latest
 
 ---
 
+## 🔐 SASL Wire Authentication (PLAIN, SCRAM-SHA-256, SCRAM-SHA-512)
+
+oxideMq provides production-grade SASL authentication adhering strictly to Apache Kafka wire protocol specifications (ApiKey 17 `SaslHandshake` and ApiKey 36 `SaslAuthenticate`):
+- **Mechanisms**:
+  - `PLAIN` (RFC 4616)
+  - `SCRAM-SHA-256` (RFC 7677 / RFC 5802) with hardware PBKDF2-HMAC-SHA256 salted derivations
+  - `SCRAM-SHA-512` (RFC 5802 / RFC 7677) with hardware PBKDF2-HMAC-SHA512 salted derivations
+- **Strict Enforcement**: When `--require-sasl` (or `OXIDEMQ_REQUIRE_SASL=true`) is enabled, clients must authenticate before issuing metadata, produce, or fetch requests, or connection is rejected with `SaslAuthenticationFailed` (code 58).
+- **Transport Security**: Operates seamlessly over standard PLAINTEXT (`9092`) or encrypted TLS/SSL (`9093`).
+
+```bash
+# Start broker requiring SASL SCRAM-SHA-256 or PLAIN authentication
+oxidemq start \
+  --enable-sasl \
+  --require-sasl \
+  --sasl-mechanisms PLAIN,SCRAM-SHA-256,SCRAM-SHA-512 \
+  --sasl-users "alice=secret123,bob=topsecret456"
+```
+
+---
+
 ## 🚀 Line-Rate 2.5GbE Network Benchmark (`oxidemq-bench`)
 
 oxideMq includes a dedicated, multi-threaded stress-test tool capable of saturating 2.5GbE network links across hundreds of partitions:

@@ -115,6 +115,11 @@ impl ApiVersionsResponse {
                 max_version: 3,
             }, // SyncGroup
             ApiVersionKey {
+                api_key: 17,
+                min_version: 0,
+                max_version: 1,
+            }, // SaslHandshake
+            ApiVersionKey {
                 api_key: 18,
                 min_version: 0,
                 max_version: 3,
@@ -149,6 +154,11 @@ impl ApiVersionsResponse {
                 min_version: 0,
                 max_version: 3,
             }, // EndTxn
+            ApiVersionKey {
+                api_key: 36,
+                min_version: 0,
+                max_version: 2,
+            }, // SaslAuthenticate
         ];
         Self::new(KafkaErrorCode::None, keys)
     }
@@ -2132,6 +2142,167 @@ pub fn encode_control_batch(
     out.freeze()
 }
 
+// ==========================================
+// SaslHandshake (Key 17)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaslHandshakeRequest {
+    pub mechanism: String,
+}
+
+impl SaslHandshakeRequest {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        let mechanism = KafkaDecoder::read_string(src)?
+            .ok_or_else(|| OxideMqError::Protocol("Missing SASL mechanism".into()))?;
+        Ok(Self { mechanism })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        KafkaEncoder::write_string(dst, Some(&self.mechanism));
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaslHandshakeResponse {
+    pub error_code: KafkaErrorCode,
+    pub enabled_mechanisms: Vec<String>,
+}
+
+impl SaslHandshakeResponse {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        if src.len() < 2 {
+            return Err(OxideMqError::Protocol(
+                "Truncated SaslHandshakeResponse error code".into(),
+            ));
+        }
+        let error_code = KafkaErrorCode::from_i16(src.get_i16());
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol(
+                "Truncated SaslHandshakeResponse array count".into(),
+            ));
+        }
+        let count = src.get_i32();
+        let mut enabled_mechanisms = Vec::new();
+        if count > 0 {
+            for _ in 0..count {
+                if let Some(mech) = KafkaDecoder::read_string(src)? {
+                    enabled_mechanisms.push(mech);
+                }
+            }
+        }
+        Ok(Self {
+            error_code,
+            enabled_mechanisms,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i16(self.error_code.code());
+        dst.put_i32(self.enabled_mechanisms.len() as i32);
+        for mech in &self.enabled_mechanisms {
+            KafkaEncoder::write_string(dst, Some(mech));
+        }
+    }
+}
+
+// ==========================================
+// SaslAuthenticate (Key 36)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaslAuthenticateRequest {
+    pub auth_bytes: Bytes,
+}
+
+impl SaslAuthenticateRequest {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let bytes = if version >= 2 {
+            KafkaDecoder::read_compact_bytes(src)?
+        } else {
+            KafkaDecoder::read_bytes(src)?
+        };
+        let auth_bytes = bytes.unwrap_or_default();
+        if version >= 2 && src.has_remaining() {
+            let _tag_count = KafkaDecoder::read_unsigned_varint(src)?;
+        }
+        Ok(Self { auth_bytes })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        if version >= 2 {
+            KafkaEncoder::write_compact_bytes(dst, Some(&self.auth_bytes));
+            KafkaEncoder::write_unsigned_varint(dst, 0); // tagged fields
+        } else {
+            KafkaEncoder::write_bytes(dst, Some(&self.auth_bytes));
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaslAuthenticateResponse {
+    pub error_code: KafkaErrorCode,
+    pub error_message: Option<String>,
+    pub auth_bytes: Bytes,
+    pub session_lifetime_ms: i64,
+}
+
+impl SaslAuthenticateResponse {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        if src.len() < 2 {
+            return Err(OxideMqError::Protocol(
+                "Truncated SaslAuthenticateResponse error code".into(),
+            ));
+        }
+        let error_code = KafkaErrorCode::from_i16(src.get_i16());
+        let error_message = if version >= 2 {
+            KafkaDecoder::read_compact_string(src)?
+        } else {
+            KafkaDecoder::read_string(src)?
+        };
+        let auth_bytes = if version >= 2 {
+            KafkaDecoder::read_compact_bytes(src)?.unwrap_or_default()
+        } else {
+            KafkaDecoder::read_bytes(src)?.unwrap_or_default()
+        };
+        let session_lifetime_ms = if version >= 1 {
+            if src.len() < 8 {
+                return Err(OxideMqError::Protocol(
+                    "Truncated session_lifetime_ms".into(),
+                ));
+            }
+            src.get_i64()
+        } else {
+            0
+        };
+        if version >= 2 && src.has_remaining() {
+            let _tag_count = KafkaDecoder::read_unsigned_varint(src)?;
+        }
+        Ok(Self {
+            error_code,
+            error_message,
+            auth_bytes,
+            session_lifetime_ms,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        dst.put_i16(self.error_code.code());
+        if version >= 2 {
+            KafkaEncoder::write_compact_string(dst, self.error_message.as_deref());
+            KafkaEncoder::write_compact_bytes(dst, Some(&self.auth_bytes));
+            dst.put_i64(self.session_lifetime_ms);
+            KafkaEncoder::write_unsigned_varint(dst, 0); // tagged fields
+        } else {
+            KafkaEncoder::write_string(dst, self.error_message.as_deref());
+            KafkaEncoder::write_bytes(dst, Some(&self.auth_bytes));
+            if version >= 1 {
+                dst.put_i64(self.session_lifetime_ms);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2836,5 +3007,58 @@ mod tests {
         let records = parse_record_batch_records(&ctrl_bytes).unwrap();
         assert_eq!(records.len(), 1);
         assert!(records[0].key.is_some());
+
+        // SaslHandshakeRequest & Response
+        let hs_req = SaslHandshakeRequest {
+            mechanism: "PLAIN".into(),
+        };
+        let mut buf = BytesMut::new();
+        hs_req.encode(&mut buf, 0);
+        let mut read_buf = buf.freeze();
+        let decoded_hs_req = SaslHandshakeRequest::decode(&mut read_buf, 0).unwrap();
+        assert_eq!(decoded_hs_req, hs_req);
+
+        let hs_resp = SaslHandshakeResponse {
+            error_code: KafkaErrorCode::None,
+            enabled_mechanisms: vec!["PLAIN".into(), "SCRAM-SHA-256".into()],
+        };
+        let mut buf = BytesMut::new();
+        hs_resp.encode(&mut buf, 0);
+        let mut read_buf = buf.freeze();
+        let decoded_hs_resp = SaslHandshakeResponse::decode(&mut read_buf, 0).unwrap();
+        assert_eq!(decoded_hs_resp, hs_resp);
+
+        // SaslAuthenticateRequest & Response
+        for version in [0, 1, 2] {
+            let auth_req = SaslAuthenticateRequest {
+                auth_bytes: Bytes::from_static(b"\0alice\0secret123"),
+            };
+            let mut buf = BytesMut::new();
+            auth_req.encode(&mut buf, version);
+            let mut read_buf = buf.freeze();
+            let decoded_auth_req = SaslAuthenticateRequest::decode(&mut read_buf, version).unwrap();
+            assert_eq!(decoded_auth_req, auth_req);
+
+            let auth_resp = SaslAuthenticateResponse {
+                error_code: KafkaErrorCode::None,
+                error_message: Some("Authenticated successfully".into()),
+                auth_bytes: Bytes::from_static(b"challenge-data"),
+                session_lifetime_ms: 3_600_000,
+            };
+            let mut buf = BytesMut::new();
+            auth_resp.encode(&mut buf, version);
+            let mut read_buf = buf.freeze();
+            let decoded_auth_resp =
+                SaslAuthenticateResponse::decode(&mut read_buf, version).unwrap();
+            assert_eq!(decoded_auth_resp.error_code, auth_resp.error_code);
+            assert_eq!(decoded_auth_resp.error_message, auth_resp.error_message);
+            assert_eq!(decoded_auth_resp.auth_bytes, auth_resp.auth_bytes);
+            if version >= 1 {
+                assert_eq!(
+                    decoded_auth_resp.session_lifetime_ms,
+                    auth_resp.session_lifetime_ms
+                );
+            }
+        }
     }
 }

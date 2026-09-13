@@ -26,7 +26,9 @@ pub use messages::{
     OffsetCommitResponse, OffsetCommitTopic, OffsetCommitTopicResponse,
     OffsetFetchPartitionResponse, OffsetFetchRequest, OffsetFetchResponse, OffsetFetchTopic,
     OffsetFetchTopicResponse, PartitionMetadata, PartitionProduceData, PartitionProduceResponse,
-    ProduceRequest, ProduceResponse, TopicMetadata, TopicProduceData, TopicProduceResponse,
+    ProduceRequest, ProduceResponse, SaslAuthenticateRequest, SaslAuthenticateResponse,
+    SaslHandshakeRequest, SaslHandshakeResponse, TopicMetadata, TopicProduceData,
+    TopicProduceResponse,
 };
 
 pub use parser::{KafkaDecoder, KafkaEncoder};
@@ -46,6 +48,7 @@ pub enum ApiKey {
     Heartbeat = 12,
     LeaveGroup = 13,
     SyncGroup = 14,
+    SaslHandshake = 17,
     ApiVersions = 18,
     CreateTopics = 19,
     DeleteTopics = 20,
@@ -53,6 +56,7 @@ pub enum ApiKey {
     AddPartitionsToTxn = 24,
     AddOffsetsToTxn = 25,
     EndTxn = 26,
+    SaslAuthenticate = 36,
 }
 
 impl ApiKey {
@@ -69,6 +73,7 @@ impl ApiKey {
             12 => Some(Self::Heartbeat),
             13 => Some(Self::LeaveGroup),
             14 => Some(Self::SyncGroup),
+            17 => Some(Self::SaslHandshake),
             18 => Some(Self::ApiVersions),
             19 => Some(Self::CreateTopics),
             20 => Some(Self::DeleteTopics),
@@ -76,6 +81,7 @@ impl ApiKey {
             24 => Some(Self::AddPartitionsToTxn),
             25 => Some(Self::AddOffsetsToTxn),
             26 => Some(Self::EndTxn),
+            36 => Some(Self::SaslAuthenticate),
             _ => None,
         }
     }
@@ -98,6 +104,7 @@ mod tests {
         assert_eq!(ApiKey::from_i16(12), Some(ApiKey::Heartbeat));
         assert_eq!(ApiKey::from_i16(13), Some(ApiKey::LeaveGroup));
         assert_eq!(ApiKey::from_i16(14), Some(ApiKey::SyncGroup));
+        assert_eq!(ApiKey::from_i16(17), Some(ApiKey::SaslHandshake));
         assert_eq!(ApiKey::from_i16(18), Some(ApiKey::ApiVersions));
         assert_eq!(ApiKey::from_i16(19), Some(ApiKey::CreateTopics));
         assert_eq!(ApiKey::from_i16(20), Some(ApiKey::DeleteTopics));
@@ -105,6 +112,7 @@ mod tests {
         assert_eq!(ApiKey::from_i16(24), Some(ApiKey::AddPartitionsToTxn));
         assert_eq!(ApiKey::from_i16(25), Some(ApiKey::AddOffsetsToTxn));
         assert_eq!(ApiKey::from_i16(26), Some(ApiKey::EndTxn));
+        assert_eq!(ApiKey::from_i16(36), Some(ApiKey::SaslAuthenticate));
         assert_eq!(ApiKey::from_i16(99), None);
     }
 }

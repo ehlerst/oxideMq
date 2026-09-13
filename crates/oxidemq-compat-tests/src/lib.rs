@@ -308,4 +308,330 @@ mod tests {
         assert_eq!(meta_resp.topics.len(), 1);
         assert_eq!(meta_resp.topics[0].name, "tcp-telemetry");
     }
+
+    #[tokio::test]
+    async fn test_e2e_sasl_authentication_over_tcp() {
+        use base64::prelude::*;
+        use oxidemq_broker::sasl::{SaslAuthenticator, SaslMechanism};
+        use oxidemq_protocol::messages::{
+            SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
+            SaslHandshakeResponse,
+        };
+        use ring::digest;
+        use ring::hmac;
+        use ring::pbkdf2;
+        use std::num::NonZeroU32;
+
+        let wal = Arc::new(MemoryWal::new());
+        let storage = Arc::new(MemoryObjectStorage::new());
+        let log_cache = Arc::new(LogCache::new(10 * 1024 * 1024));
+        let block_cache = Arc::new(BlockCache::new(10 * 1024 * 1024));
+        let state = Arc::new(ClusterState::new(
+            1,
+            "127.0.0.1",
+            9092,
+            "sasl-test-cluster",
+            wal,
+            storage,
+            log_cache,
+            block_cache,
+        ));
+        let coord = Arc::new(GroupCoordinator::new());
+        let auth = Arc::new(SaslAuthenticator::new(
+            vec![SaslMechanism::Plain, SaslMechanism::ScramSha256],
+            true, // require SASL
+        ));
+        auth.add_user("kafka-client", "topsecret123");
+        let engine = Arc::new(BrokerEngine::new(state, coord).with_authenticator(auth));
+
+        // Bind TCP listener
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let engine_clone = Arc::clone(&engine);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let eng = Arc::clone(&engine_clone);
+                    tokio::spawn(async move {
+                        let _ = eng.process_connection(stream).await;
+                    });
+                }
+            }
+        });
+
+        // 1. Client 1: Unauthenticated request should fail when require_sasl is true
+        {
+            let mut client1 = TcpStream::connect(addr).await.unwrap();
+            let meta_header = RequestHeader::new(ApiKey::Metadata, 0, 101, Some("unauth-client"));
+            let mut meta_req_buf = BytesMut::new();
+            meta_header.encode(&mut meta_req_buf);
+            let meta_req = MetadataRequest {
+                topics: Some(vec!["secret-topic".to_string()]),
+                allow_auto_topic_creation: true,
+            };
+            meta_req.encode(&mut meta_req_buf, 0);
+
+            let mut meta_frame = BytesMut::new();
+            meta_frame.put_i32(meta_req_buf.len() as i32);
+            meta_frame.put_slice(&meta_req_buf);
+            client1.write_all(&meta_frame).await.unwrap();
+            client1.flush().await.unwrap();
+
+            // The connection should be terminated or error returned
+            let read_res = client1.read_i32().await;
+            assert!(read_res.is_err());
+        }
+
+        // 2. Client 2: SASL PLAIN authentication over TCP
+        {
+            let mut client2 = TcpStream::connect(addr).await.unwrap();
+
+            // ApiVersions allowed before auth
+            let api_ver_hdr = RequestHeader::new(ApiKey::ApiVersions, 0, 201, Some("plain-client"));
+            let mut api_ver_buf = BytesMut::new();
+            api_ver_hdr.encode(&mut api_ver_buf);
+            let api_req = ApiVersionsRequest::default();
+            api_req.encode(&mut api_ver_buf, 0);
+            let mut frame = BytesMut::new();
+            frame.put_i32(api_ver_buf.len() as i32);
+            frame.put_slice(&api_ver_buf);
+            client2.write_all(&frame).await.unwrap();
+            client2.flush().await.unwrap();
+
+            let resp_len = client2.read_i32().await.unwrap() as usize;
+            let mut resp_buf = vec![0u8; resp_len];
+            client2.read_exact(&mut resp_buf).await.unwrap();
+            let mut resp_bytes = Bytes::from(resp_buf);
+            let _ = ResponseHeader::decode(&mut resp_bytes).unwrap();
+            let api_resp = ApiVersionsResponse::decode(&mut resp_bytes, 0).unwrap();
+            assert_eq!(api_resp.error_code, KafkaErrorCode::None);
+
+            // SaslHandshake
+            let hs_hdr = RequestHeader::new(ApiKey::SaslHandshake, 0, 202, Some("plain-client"));
+            let mut hs_buf = BytesMut::new();
+            hs_hdr.encode(&mut hs_buf);
+            let hs_req = SaslHandshakeRequest {
+                mechanism: "PLAIN".into(),
+            };
+            hs_req.encode(&mut hs_buf, 0);
+            let mut hs_frame = BytesMut::new();
+            hs_frame.put_i32(hs_buf.len() as i32);
+            hs_frame.put_slice(&hs_buf);
+            client2.write_all(&hs_frame).await.unwrap();
+            client2.flush().await.unwrap();
+
+            let hs_len = client2.read_i32().await.unwrap() as usize;
+            let mut hs_resp_buf = vec![0u8; hs_len];
+            client2.read_exact(&mut hs_resp_buf).await.unwrap();
+            let mut hs_bytes = Bytes::from(hs_resp_buf);
+            let _ = ResponseHeader::decode(&mut hs_bytes).unwrap();
+            let hs_resp = SaslHandshakeResponse::decode(&mut hs_bytes, 0).unwrap();
+            assert_eq!(hs_resp.error_code, KafkaErrorCode::None);
+
+            // SaslAuthenticate with PLAIN
+            let auth_hdr =
+                RequestHeader::new(ApiKey::SaslAuthenticate, 0, 203, Some("plain-client"));
+            let mut auth_buf = BytesMut::new();
+            auth_hdr.encode(&mut auth_buf);
+            let auth_req = SaslAuthenticateRequest {
+                auth_bytes: Bytes::from_static(b"\0kafka-client\0topsecret123"),
+            };
+            auth_req.encode(&mut auth_buf, 0);
+            let mut auth_frame = BytesMut::new();
+            auth_frame.put_i32(auth_buf.len() as i32);
+            auth_frame.put_slice(&auth_buf);
+            client2.write_all(&auth_frame).await.unwrap();
+            client2.flush().await.unwrap();
+
+            let auth_len = client2.read_i32().await.unwrap() as usize;
+            let mut auth_resp_buf = vec![0u8; auth_len];
+            client2.read_exact(&mut auth_resp_buf).await.unwrap();
+            let mut auth_bytes = Bytes::from(auth_resp_buf);
+            let _ = ResponseHeader::decode(&mut auth_bytes).unwrap();
+            let auth_resp = SaslAuthenticateResponse::decode(&mut auth_bytes, 0).unwrap();
+            assert_eq!(auth_resp.error_code, KafkaErrorCode::None);
+
+            // Now Metadata succeeds over the authenticated connection
+            let meta_hdr = RequestHeader::new(ApiKey::Metadata, 0, 204, Some("plain-client"));
+            let mut meta_buf = BytesMut::new();
+            meta_hdr.encode(&mut meta_buf);
+            let meta_req = MetadataRequest {
+                topics: Some(vec!["authenticated-topic".to_string()]),
+                allow_auto_topic_creation: true,
+            };
+            meta_req.encode(&mut meta_buf, 0);
+            let mut m_frame = BytesMut::new();
+            m_frame.put_i32(meta_buf.len() as i32);
+            m_frame.put_slice(&meta_buf);
+            client2.write_all(&m_frame).await.unwrap();
+            client2.flush().await.unwrap();
+
+            let m_len = client2.read_i32().await.unwrap() as usize;
+            let mut m_buf = vec![0u8; m_len];
+            client2.read_exact(&mut m_buf).await.unwrap();
+            let mut m_bytes = Bytes::from(m_buf);
+            let _ = ResponseHeader::decode(&mut m_bytes).unwrap();
+            let meta_resp = MetadataResponse::decode(&mut m_bytes, 0).unwrap();
+            assert_eq!(meta_resp.topics[0].name, "authenticated-topic");
+        }
+
+        // 3. Client 3: SASL SCRAM-SHA-256 authentication over TCP
+        {
+            let mut client3 = TcpStream::connect(addr).await.unwrap();
+
+            // SaslHandshake
+            let hs_hdr = RequestHeader::new(ApiKey::SaslHandshake, 0, 301, Some("scram-client"));
+            let mut hs_buf = BytesMut::new();
+            hs_hdr.encode(&mut hs_buf);
+            let hs_req = SaslHandshakeRequest {
+                mechanism: "SCRAM-SHA-256".into(),
+            };
+            hs_req.encode(&mut hs_buf, 0);
+            let mut hs_frame = BytesMut::new();
+            hs_frame.put_i32(hs_buf.len() as i32);
+            hs_frame.put_slice(&hs_buf);
+            client3.write_all(&hs_frame).await.unwrap();
+            client3.flush().await.unwrap();
+
+            let hs_len = client3.read_i32().await.unwrap() as usize;
+            let mut hs_resp_buf = vec![0u8; hs_len];
+            client3.read_exact(&mut hs_resp_buf).await.unwrap();
+            let mut hs_bytes = Bytes::from(hs_resp_buf);
+            let _ = ResponseHeader::decode(&mut hs_bytes).unwrap();
+            let hs_resp = SaslHandshakeResponse::decode(&mut hs_bytes, 0).unwrap();
+            assert_eq!(hs_resp.error_code, KafkaErrorCode::None);
+
+            // SaslAuthenticate Round 1: client-first
+            let client_nonce = "clientNonceRandom789";
+            let client_first = format!("n,,n=kafka-client,r={}", client_nonce);
+            let auth1_hdr =
+                RequestHeader::new(ApiKey::SaslAuthenticate, 0, 302, Some("scram-client"));
+            let mut auth1_buf = BytesMut::new();
+            auth1_hdr.encode(&mut auth1_buf);
+            let auth1_req = SaslAuthenticateRequest {
+                auth_bytes: Bytes::from(client_first),
+            };
+            auth1_req.encode(&mut auth1_buf, 0);
+            let mut auth1_frame = BytesMut::new();
+            auth1_frame.put_i32(auth1_buf.len() as i32);
+            auth1_frame.put_slice(&auth1_buf);
+            client3.write_all(&auth1_frame).await.unwrap();
+            client3.flush().await.unwrap();
+
+            let auth1_len = client3.read_i32().await.unwrap() as usize;
+            let mut auth1_resp_buf = vec![0u8; auth1_len];
+            client3.read_exact(&mut auth1_resp_buf).await.unwrap();
+            let mut auth1_bytes = Bytes::from(auth1_resp_buf);
+            let _ = ResponseHeader::decode(&mut auth1_bytes).unwrap();
+            let auth1_resp = SaslAuthenticateResponse::decode(&mut auth1_bytes, 0).unwrap();
+            assert_eq!(auth1_resp.error_code, KafkaErrorCode::None);
+
+            let server_first_str = std::str::from_utf8(&auth1_resp.auth_bytes).unwrap();
+            let mut full_nonce = "";
+            let mut salt_b64 = "";
+            for part in server_first_str.split(',') {
+                if let Some(val) = part.strip_prefix("r=") {
+                    full_nonce = val;
+                } else if let Some(val) = part.strip_prefix("s=") {
+                    salt_b64 = val;
+                }
+            }
+            let salt = BASE64_STANDARD.decode(salt_b64).unwrap();
+
+            // Client computes proof
+            let client_final_without_proof = format!("c=biws,r={}", full_nonce);
+            let auth_message = format!(
+                "n=kafka-client,r={},{},{}",
+                client_nonce, server_first_str, client_final_without_proof
+            );
+
+            let mut salted_password = [0u8; 32];
+            pbkdf2::derive(
+                pbkdf2::PBKDF2_HMAC_SHA256,
+                NonZeroU32::new(4096).unwrap(),
+                &salt,
+                b"topsecret123",
+                &mut salted_password,
+            );
+
+            let s_key = hmac::Key::new(hmac::HMAC_SHA256, &salted_password);
+            let client_key = hmac::sign(&s_key, b"Client Key");
+            let stored_key = digest::digest(&digest::SHA256, client_key.as_ref());
+            let stored_key_hmac = hmac::Key::new(hmac::HMAC_SHA256, stored_key.as_ref());
+            let client_sig = hmac::sign(&stored_key_hmac, auth_message.as_bytes());
+
+            let client_proof: Vec<u8> = client_key
+                .as_ref()
+                .iter()
+                .zip(client_sig.as_ref().iter())
+                .map(|(k, s)| k ^ s)
+                .collect();
+
+            let client_final = format!(
+                "{},p={}",
+                client_final_without_proof,
+                BASE64_STANDARD.encode(&client_proof)
+            );
+
+            // SaslAuthenticate Round 2: client-final
+            let auth2_hdr =
+                RequestHeader::new(ApiKey::SaslAuthenticate, 0, 303, Some("scram-client"));
+            let mut auth2_buf = BytesMut::new();
+            auth2_hdr.encode(&mut auth2_buf);
+            let auth2_req = SaslAuthenticateRequest {
+                auth_bytes: Bytes::from(client_final),
+            };
+            auth2_req.encode(&mut auth2_buf, 0);
+            let mut auth2_frame = BytesMut::new();
+            auth2_frame.put_i32(auth2_buf.len() as i32);
+            auth2_frame.put_slice(&auth2_buf);
+            client3.write_all(&auth2_frame).await.unwrap();
+            client3.flush().await.unwrap();
+
+            let auth2_len = client3.read_i32().await.unwrap() as usize;
+            let mut auth2_resp_buf = vec![0u8; auth2_len];
+            client3.read_exact(&mut auth2_resp_buf).await.unwrap();
+            let mut auth2_bytes = Bytes::from(auth2_resp_buf);
+            let _ = ResponseHeader::decode(&mut auth2_bytes).unwrap();
+            let auth2_resp = SaslAuthenticateResponse::decode(&mut auth2_bytes, 0).unwrap();
+            assert_eq!(auth2_resp.error_code, KafkaErrorCode::None);
+
+            let server_final_str = std::str::from_utf8(&auth2_resp.auth_bytes).unwrap();
+            assert!(server_final_str.starts_with("v="));
+
+            // Produce a record over authenticated connection
+            let prod_hdr = RequestHeader::new(ApiKey::Produce, 0, 304, Some("scram-client"));
+            let mut prod_buf = BytesMut::new();
+            prod_hdr.encode(&mut prod_buf);
+            let prod_req = ProduceRequest {
+                acks: 1,
+                timeout_ms: 5000,
+                topic_data: vec![TopicProduceData {
+                    topic: "authenticated-topic".into(),
+                    partitions: vec![PartitionProduceData {
+                        partition: 0,
+                        records: Bytes::from_static(b"authenticated-secret-message"),
+                    }],
+                }],
+            };
+            prod_req.encode(&mut prod_buf, 0);
+            let mut prod_frame = BytesMut::new();
+            prod_frame.put_i32(prod_buf.len() as i32);
+            prod_frame.put_slice(&prod_buf);
+            client3.write_all(&prod_frame).await.unwrap();
+            client3.flush().await.unwrap();
+
+            let p_len = client3.read_i32().await.unwrap() as usize;
+            let mut p_buf = vec![0u8; p_len];
+            client3.read_exact(&mut p_buf).await.unwrap();
+            let mut p_bytes = Bytes::from(p_buf);
+            let _ = ResponseHeader::decode(&mut p_bytes).unwrap();
+            let prod_resp = ProduceResponse::decode(&mut p_bytes, 0).unwrap();
+            assert_eq!(
+                prod_resp.responses[0].partitions[0].error_code,
+                KafkaErrorCode::None
+            );
+        }
+    }
 }

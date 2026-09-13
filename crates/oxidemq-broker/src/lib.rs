@@ -8,6 +8,7 @@ pub mod coordinator;
 pub mod handler;
 pub mod partition;
 pub mod router;
+pub mod sasl;
 pub mod schema_registry;
 pub mod state;
 pub mod transaction;
@@ -17,6 +18,7 @@ pub use coordinator::{ConsumerGroup, GroupCoordinator, GroupMember, GroupState};
 pub use handler::BrokerEngine;
 pub use partition::Partition;
 pub use router::ClusterState;
+pub use sasl::{ConnectionAuthState, SaslAuthenticator, SaslMechanism, ScramServerSession};
 pub use schema_registry::{
     CompatibilityLevel, SchemaEntry, SchemaReference, SchemaRegistry, SchemaRegistryError,
     SchemaType,

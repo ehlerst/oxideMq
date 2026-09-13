@@ -19,6 +19,7 @@
 - **🗜️ Native Compression Codecs**: Wire-level hardware-accelerated decompression and re-compression for **Snappy**, **LZ4**, **Zstandard (zstd)**, and **Gzip**.
 - **📋 Embedded Confluent Schema Registry**: Native v1 HTTP Schema Registry on port `8081` with Avro, Protobuf, JSON Schema catalog, and magic byte wire validation.
 - **🔒 Wire-Protocol TLS/SSL Encryption**: Hardware-accelerated zero-overhead TLS termination on port `9093` using pure-Rust `tokio-rustls`.
+- **🔐 SASL Wire Authentication**: Standard Kafka SASL support (**PLAIN**, **SCRAM-SHA-256**, **SCRAM-SHA-512**) with strict enforcement over plaintext and TLS.
 - **🚀 Line-Rate 2.5GbE Benchmarking**: Over 1,190,000+ msg/s sustained throughput with sub-millisecond p99 latency across 100 partitions.
 - **🌐 Embedded Dark-Mode Web Console**: Single-binary dashboard served directly at `http://localhost:8082/` with partition visualizer, consumer group monitor, and live chaos injection.
 - **🧪 Testcontainers Native**: Purpose-built for blazing-fast integration testing with Java, Rust, Go, or Python testcontainers.
@@ -134,6 +135,10 @@ services:
 | `SCHEMA_REGISTRY_PORT` | `8081` | Port for Confluent-compatible Schema Registry v1 (HTTP) |
 | `OXIDEMQ_ENABLE_SCHEMA_REGISTRY` | `true` | Enable built-in Confluent Schema Registry |
 | `OXIDEMQ_ENABLE_SCHEMA_VALIDATION` | `false` | Enforce strict Magic Byte Confluent schema validation on produce |
+| `OXIDEMQ_ENABLE_SASL` | `false` | Enable Kafka SASL authentication engine |
+| `OXIDEMQ_REQUIRE_SASL` | `false` | Enforce mandatory authentication; reject unauthenticated clients |
+| `OXIDEMQ_SASL_MECHANISMS` | `PLAIN,SCRAM-SHA-256` | Allowed SASL mechanisms (`PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`) |
+| `OXIDEMQ_SASL_USERS` | `admin=admin-secret,user=user-secret` | Comma-separated user credentials in `username=password` format |
 | `ADMIN_PORT` | `8082` | Port for Admin Web Console & REST API (HTTP) |
 | `OXIDEMQ_STORAGE_ENGINE` | `memory` | Backend engine: `memory`, `file` (WAL), or `s3` (S3Stream) |
 | `OXIDEMQ_WAL_DIR` | `./data/wal` | Local disk directory for Write-Ahead Log segments |
@@ -199,6 +204,21 @@ class StreamingTest {
         }
     }
 }
+```
+
+### Python with SASL SCRAM-SHA-256 (`kafka-python` / `confluent-kafka`)
+```python
+from kafka import KafkaProducer
+
+producer = KafkaProducer(
+    bootstrap_servers='localhost:9092',
+    security_protocol='SASL_PLAINTEXT',
+    sasl_mechanism='SCRAM-SHA-256',
+    sasl_plain_username='admin',
+    sasl_plain_password='admin-secret',
+)
+producer.send('secure-topic', b'authenticated-payload')
+producer.flush()
 ```
 
 ---

@@ -3,6 +3,7 @@ use oxidemq_broker::chaos::{ChaosEngine, ChaosRule, FaultTarget};
 use oxidemq_broker::coordinator::GroupCoordinator;
 use oxidemq_broker::handler::BrokerEngine;
 use oxidemq_broker::router::ClusterState;
+use oxidemq_broker::sasl::{SaslAuthenticator, SaslMechanism};
 use oxidemq_broker::schema_registry::SchemaRegistry;
 use oxidemq_core::config::OxideConfig;
 use oxidemq_s3stream::block_cache::BlockCache;
@@ -60,6 +61,26 @@ struct Cli {
     #[arg(long, default_value_t = false, env = "OXIDEMQ_ENABLE_SCHEMA_VALIDATION", action = clap::ArgAction::Set)]
     enable_schema_validation: bool,
 
+    #[arg(long, default_value_t = false, env = "OXIDEMQ_ENABLE_SASL", action = clap::ArgAction::Set)]
+    enable_sasl: bool,
+
+    #[arg(long, default_value_t = false, env = "OXIDEMQ_REQUIRE_SASL", action = clap::ArgAction::Set)]
+    require_sasl: bool,
+
+    #[arg(
+        long,
+        default_value = "PLAIN,SCRAM-SHA-256",
+        env = "OXIDEMQ_SASL_MECHANISMS"
+    )]
+    sasl_mechanisms: String,
+
+    #[arg(
+        long,
+        default_value = "admin=admin-secret,user=user-secret",
+        env = "OXIDEMQ_SASL_USERS"
+    )]
+    sasl_users: String,
+
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
 }
@@ -86,9 +107,26 @@ enum Commands {
         enable_schema_registry: bool,
         #[arg(long, default_value_t = false, env = "OXIDEMQ_ENABLE_SCHEMA_VALIDATION", action = clap::ArgAction::Set)]
         enable_schema_validation: bool,
+        #[arg(long, default_value_t = false, env = "OXIDEMQ_ENABLE_SASL", action = clap::ArgAction::Set)]
+        enable_sasl: bool,
+        #[arg(long, default_value_t = false, env = "OXIDEMQ_REQUIRE_SASL", action = clap::ArgAction::Set)]
+        require_sasl: bool,
+        #[arg(
+            long,
+            default_value = "PLAIN,SCRAM-SHA-256",
+            env = "OXIDEMQ_SASL_MECHANISMS"
+        )]
+        sasl_mechanisms: String,
+        #[arg(
+            long,
+            default_value = "admin=admin-secret,user=user-secret",
+            env = "OXIDEMQ_SASL_USERS"
+        )]
+        sasl_users: String,
         #[arg(long, default_value = "0.0.0.0")]
         host: String,
     },
+
     /// Inspect broker status and health
     Status {
         #[arg(long, default_value = "127.0.0.1:8082")]
@@ -130,6 +168,10 @@ struct ServerOptions {
     schema_registry_port: u16,
     enable_schema_registry: bool,
     enable_schema_validation: bool,
+    enable_sasl: bool,
+    require_sasl: bool,
+    sasl_mechanisms: String,
+    sasl_users: String,
 }
 
 impl From<&Cli> for ServerOptions {
@@ -145,6 +187,10 @@ impl From<&Cli> for ServerOptions {
             schema_registry_port: cli.schema_registry_port,
             enable_schema_registry: cli.enable_schema_registry,
             enable_schema_validation: cli.enable_schema_validation,
+            enable_sasl: cli.enable_sasl,
+            require_sasl: cli.require_sasl,
+            sasl_mechanisms: cli.sasl_mechanisms.clone(),
+            sasl_users: cli.sasl_users.clone(),
         }
     }
 }
@@ -203,6 +249,10 @@ async fn run_cli_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             schema_registry_port,
             enable_schema_registry,
             enable_schema_validation,
+            enable_sasl,
+            require_sasl,
+            sasl_mechanisms,
+            sasl_users,
             host,
         }) => {
             let opts = ServerOptions {
@@ -216,6 +266,10 @@ async fn run_cli_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 schema_registry_port,
                 enable_schema_registry,
                 enable_schema_validation,
+                enable_sasl,
+                require_sasl,
+                sasl_mechanisms,
+                sasl_users,
             };
             run_server(opts).await?;
         }
@@ -240,7 +294,12 @@ async fn run_server(opts: ServerOptions) -> Result<(), Box<dyn std::error::Error
         schema_registry_port,
         enable_schema_registry,
         enable_schema_validation,
+        enable_sasl,
+        require_sasl,
+        sasl_mechanisms,
+        sasl_users,
     } = opts;
+
     let config = OxideConfig::default();
     let start_time = Instant::now();
 
@@ -303,10 +362,31 @@ async fn run_server(opts: ServerOptions) -> Result<(), Box<dyn std::error::Error
     let chaos = Arc::new(ChaosEngine::new());
     let schema_registry = Arc::new(SchemaRegistry::new());
 
+    let mut mechanisms = Vec::new();
+    for m in sasl_mechanisms.split(',') {
+        if let Some(mech) = SaslMechanism::from_str_case_insensitive(m) {
+            mechanisms.push(mech);
+        }
+    }
+    if mechanisms.is_empty() {
+        mechanisms.push(SaslMechanism::Plain);
+        mechanisms.push(SaslMechanism::ScramSha256);
+    }
+    let authenticator = Arc::new(SaslAuthenticator::new(mechanisms, require_sasl));
+    if enable_sasl || require_sasl || !sasl_users.is_empty() {
+        authenticator.load_user_list(&sasl_users);
+        info!(
+            "SASL Authentication active: mechanisms={:?}, require_sasl={}",
+            authenticator.enabled_mechanism_names(),
+            require_sasl
+        );
+    }
+
     let broker_engine = Arc::new(
         BrokerEngine::new(Arc::clone(&cluster_state), Arc::clone(&coordinator))
             .with_chaos(Arc::clone(&chaos))
             .with_schema_registry(Arc::clone(&schema_registry))
+            .with_authenticator(authenticator)
             .with_schema_validation(enable_schema_validation),
     );
 
@@ -661,6 +741,10 @@ mod tests {
             schema_registry_port: 8081,
             enable_schema_registry: false,
             enable_schema_validation: false,
+            enable_sasl: false,
+            require_sasl: false,
+            sasl_mechanisms: "PLAIN,SCRAM-SHA-256".into(),
+            sasl_users: "admin=admin-secret".into(),
             host: "127.0.0.1".into(),
         };
         assert!(run_cli_command(cli_status).await.is_ok());
@@ -678,6 +762,10 @@ mod tests {
             schema_registry_port: 8081,
             enable_schema_registry: false,
             enable_schema_validation: false,
+            enable_sasl: false,
+            require_sasl: false,
+            sasl_mechanisms: "PLAIN,SCRAM-SHA-256".into(),
+            sasl_users: "admin=admin-secret".into(),
             host: "127.0.0.1".into(),
         };
         assert!(run_cli_command(cli_dump).await.is_ok());
@@ -699,6 +787,10 @@ mod tests {
                 schema_registry_port: 8081,
                 enable_schema_registry: false,
                 enable_schema_validation: false,
+                enable_sasl: false,
+                require_sasl: false,
+                sasl_mechanisms: "PLAIN,SCRAM-SHA-256".into(),
+                sasl_users: "admin=admin-secret".into(),
                 host: "127.0.0.1".into(),
             };
             assert!(run_cli_command(cli_chaos).await.is_ok());

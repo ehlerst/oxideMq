@@ -48,6 +48,7 @@ pub enum KafkaErrorCode {
     ConcurrentTransactions = 51,
     ProducerFenced = 52,
     TransactionalIdAuthorizationFailed = 53,
+    SaslAuthenticationFailed = 58,
     InvalidRecord = 87,
     UnknownServer = -1,
 }
@@ -104,6 +105,7 @@ impl KafkaErrorCode {
             51 => Self::ConcurrentTransactions,
             52 => Self::ProducerFenced,
             53 => Self::TransactionalIdAuthorizationFailed,
+            58 => Self::SaslAuthenticationFailed,
             87 => Self::InvalidRecord,
             _ => Self::UnknownServer,
         }
@@ -162,6 +164,7 @@ mod tests {
             (KafkaErrorCode::ConcurrentTransactions, 51),
             (KafkaErrorCode::ProducerFenced, 52),
             (KafkaErrorCode::TransactionalIdAuthorizationFailed, 53),
+            (KafkaErrorCode::SaslAuthenticationFailed, 58),
             (KafkaErrorCode::InvalidRecord, 87),
             (KafkaErrorCode::UnknownServer, -1),
         ];

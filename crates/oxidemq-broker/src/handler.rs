@@ -1,6 +1,7 @@
 use crate::chaos::{ChaosEngine, FaultTarget};
 use crate::coordinator::GroupCoordinator;
 use crate::router::ClusterState;
+use crate::sasl::{ConnectionAuthState, SaslAuthenticator, SaslMechanism, ScramServerSession};
 use crate::schema_registry::SchemaRegistry;
 use crate::transaction::TransactionCoordinator;
 use bytes::{Buf, BufMut, Bytes, BytesMut};
@@ -18,7 +19,8 @@ use oxidemq_protocol::messages::{
     OffsetCommitPartitionResponse, OffsetCommitRequest, OffsetCommitResponse,
     OffsetCommitTopicResponse, OffsetFetchPartitionResponse, OffsetFetchRequest,
     OffsetFetchResponse, OffsetFetchTopicResponse, PartitionProduceResponse, ProduceRequest,
-    ProduceResponse, TopicProduceResponse,
+    ProduceResponse, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
+    SaslHandshakeResponse, TopicProduceResponse,
 };
 use oxidemq_protocol::{ApiKey, KafkaErrorCode};
 use std::sync::Arc;
@@ -32,6 +34,7 @@ pub struct BrokerEngine {
     coordinator: Arc<GroupCoordinator>,
     txn_coordinator: Arc<TransactionCoordinator>,
     schema_registry: Arc<SchemaRegistry>,
+    authenticator: Arc<SaslAuthenticator>,
     chaos: Arc<ChaosEngine>,
     enable_schema_validation: bool,
 }
@@ -43,6 +46,7 @@ impl BrokerEngine {
             coordinator,
             txn_coordinator: Arc::new(TransactionCoordinator::new()),
             schema_registry: Arc::new(SchemaRegistry::new()),
+            authenticator: Arc::new(SaslAuthenticator::default()),
             chaos: Arc::new(ChaosEngine::new()),
             enable_schema_validation: false,
         }
@@ -63,9 +67,18 @@ impl BrokerEngine {
         self
     }
 
+    pub fn with_authenticator(mut self, authenticator: Arc<SaslAuthenticator>) -> Self {
+        self.authenticator = authenticator;
+        self
+    }
+
     pub fn with_schema_validation(mut self, enabled: bool) -> Self {
         self.enable_schema_validation = enabled;
         self
+    }
+
+    pub fn authenticator(&self) -> &Arc<SaslAuthenticator> {
+        &self.authenticator
     }
 
     pub fn cluster_state(&self) -> &Arc<ClusterState> {
@@ -95,15 +108,178 @@ impl BrokerEngine {
     /// Dispatches and processes an individual Kafka request given its header and body payload.
     /// Returns the serialized ResponseHeader + ResponsePayload (unframed).
     pub fn handle_request(&self, header: &RequestHeader, body: &mut Bytes) -> Result<BytesMut> {
+        let mut session = ConnectionAuthState::Authenticated {
+            principal: "ANONYMOUS".to_string(),
+        };
+        self.handle_connection_request(&mut session, header, body)
+    }
+
+    /// Dispatches and processes a Kafka request within an active connection session.
+    pub fn handle_connection_request(
+        &self,
+        session: &mut ConnectionAuthState,
+        header: &RequestHeader,
+        body: &mut Bytes,
+    ) -> Result<BytesMut> {
         let mut out = BytesMut::with_capacity(1024);
         let resp_header = ResponseHeader::new(header.correlation_id);
         resp_header.encode(&mut out);
+
+        // Security check: if SASL is required and connection is not authenticated, reject non-auth requests
+        if self.authenticator.is_sasl_required()
+            && !session.is_authenticated()
+            && header.api_key != ApiKey::ApiVersions
+            && header.api_key != ApiKey::SaslHandshake
+            && header.api_key != ApiKey::SaslAuthenticate
+        {
+            return Err(OxideMqError::Protocol(format!(
+                "Rejected unauthenticated request {:?}: SASL authentication required on this broker",
+                header.api_key
+            )));
+        }
 
         match header.api_key {
             ApiKey::ApiVersions => {
                 let _req = ApiVersionsRequest::decode(body, header.api_version)?;
                 let resp = ApiVersionsResponse::default_supported();
                 resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::SaslHandshake => {
+                let req = SaslHandshakeRequest::decode(body, header.api_version)?;
+                let mech = SaslMechanism::from_str_case_insensitive(&req.mechanism);
+                let (error_code, enabled_mechanisms) = match mech {
+                    Some(m) if self.authenticator.is_mechanism_enabled(m) => {
+                        *session = ConnectionAuthState::HandshakeReceived { mechanism: m };
+                        (
+                            KafkaErrorCode::None,
+                            self.authenticator.enabled_mechanism_names(),
+                        )
+                    }
+                    _ => (
+                        KafkaErrorCode::UnsupportedSaslMechanism,
+                        self.authenticator.enabled_mechanism_names(),
+                    ),
+                };
+                let resp = SaslHandshakeResponse {
+                    error_code,
+                    enabled_mechanisms,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::SaslAuthenticate => {
+                let req = SaslAuthenticateRequest::decode(body, header.api_version)?;
+                match session {
+                    ConnectionAuthState::HandshakeReceived {
+                        mechanism: SaslMechanism::Plain,
+                    } => match self.authenticator.authenticate_plain(&req.auth_bytes) {
+                        Ok(user) => {
+                            *session = ConnectionAuthState::Authenticated { principal: user };
+                            let resp = SaslAuthenticateResponse {
+                                error_code: KafkaErrorCode::None,
+                                error_message: None,
+                                auth_bytes: Bytes::new(),
+                                session_lifetime_ms: 0,
+                            };
+                            resp.encode(&mut out, header.api_version);
+                        }
+                        Err(err) => {
+                            *session = ConnectionAuthState::Failed;
+                            let resp = SaslAuthenticateResponse {
+                                error_code: err,
+                                error_message: Some("SASL PLAIN authentication failed".into()),
+                                auth_bytes: Bytes::new(),
+                                session_lifetime_ms: 0,
+                            };
+                            resp.encode(&mut out, header.api_version);
+                        }
+                    },
+                    ConnectionAuthState::HandshakeReceived {
+                        mechanism: m @ (SaslMechanism::ScramSha256 | SaslMechanism::ScramSha512),
+                    } => {
+                        let mut scram_session = ScramServerSession::new(*m);
+                        match scram_session.process_client_first(&req.auth_bytes, None, None) {
+                            Ok(server_first) => {
+                                *session = ConnectionAuthState::ScramChallengeSent {
+                                    session: scram_session,
+                                };
+                                let resp = SaslAuthenticateResponse {
+                                    error_code: KafkaErrorCode::None,
+                                    error_message: None,
+                                    auth_bytes: Bytes::from(server_first),
+                                    session_lifetime_ms: 0,
+                                };
+                                resp.encode(&mut out, header.api_version);
+                            }
+                            Err(err) => {
+                                *session = ConnectionAuthState::Failed;
+                                let resp = SaslAuthenticateResponse {
+                                    error_code: err,
+                                    error_message: Some(
+                                        "SCRAM client-first message validation failed".into(),
+                                    ),
+                                    auth_bytes: Bytes::new(),
+                                    session_lifetime_ms: 0,
+                                };
+                                resp.encode(&mut out, header.api_version);
+                            }
+                        }
+                    }
+                    ConnectionAuthState::ScramChallengeSent {
+                        session: scram_session,
+                    } => {
+                        let password = self.authenticator.get_password(&scram_session.username);
+                        match password {
+                            Some(pass) => {
+                                match scram_session.process_client_final(&req.auth_bytes, &pass) {
+                                    Ok((user, server_final)) => {
+                                        *session =
+                                            ConnectionAuthState::Authenticated { principal: user };
+                                        let resp = SaslAuthenticateResponse {
+                                            error_code: KafkaErrorCode::None,
+                                            error_message: None,
+                                            auth_bytes: Bytes::from(server_final),
+                                            session_lifetime_ms: 0,
+                                        };
+                                        resp.encode(&mut out, header.api_version);
+                                    }
+                                    Err(err) => {
+                                        *session = ConnectionAuthState::Failed;
+                                        let resp = SaslAuthenticateResponse {
+                                            error_code: err,
+                                            error_message: Some(
+                                                "SCRAM proof verification failed".into(),
+                                            ),
+                                            auth_bytes: Bytes::new(),
+                                            session_lifetime_ms: 0,
+                                        };
+                                        resp.encode(&mut out, header.api_version);
+                                    }
+                                }
+                            }
+                            None => {
+                                *session = ConnectionAuthState::Failed;
+                                let resp = SaslAuthenticateResponse {
+                                    error_code: KafkaErrorCode::SaslAuthenticationFailed,
+                                    error_message: Some("Unknown user".into()),
+                                    auth_bytes: Bytes::new(),
+                                    session_lifetime_ms: 0,
+                                };
+                                resp.encode(&mut out, header.api_version);
+                            }
+                        }
+                    }
+                    _ => {
+                        let resp = SaslAuthenticateResponse {
+                            error_code: KafkaErrorCode::IllegalSaslState,
+                            error_message: Some(
+                                "SaslAuthenticate request received in unexpected state".into(),
+                            ),
+                            auth_bytes: Bytes::new(),
+                            session_lifetime_ms: 0,
+                        };
+                        resp.encode(&mut out, header.api_version);
+                    }
+                }
             }
             ApiKey::Metadata => {
                 let req = MetadataRequest::decode(body, header.api_version)?;
@@ -521,7 +697,19 @@ impl BrokerEngine {
 
     /// Handles a raw 4-byte length-prefixed frame.
     /// Returns the length-prefixed response frame.
-    pub fn handle_frame(&self, mut frame: Bytes) -> Result<BytesMut> {
+    pub fn handle_frame(&self, frame: Bytes) -> Result<BytesMut> {
+        let mut session = ConnectionAuthState::Authenticated {
+            principal: "ANONYMOUS".to_string(),
+        };
+        self.handle_connection_frame(&mut session, frame)
+    }
+
+    /// Handles a raw 4-byte length-prefixed frame within an active connection session.
+    pub fn handle_connection_frame(
+        &self,
+        session: &mut ConnectionAuthState,
+        mut frame: Bytes,
+    ) -> Result<BytesMut> {
         let header = RequestHeader::decode(&mut frame)?;
         trace!(
             "Received Kafka request api_key={:?} version={} corr_id={}",
@@ -530,7 +718,7 @@ impl BrokerEngine {
             header.correlation_id
         );
 
-        let response_payload = self.handle_request(&header, &mut frame)?;
+        let response_payload = self.handle_connection_request(session, &header, &mut frame)?;
         let mut framed = BytesMut::with_capacity(response_payload.len() + 4);
         framed.put_i32(response_payload.len() as i32);
         framed.put_slice(&response_payload);
@@ -542,6 +730,7 @@ impl BrokerEngine {
     where
         S: AsyncRead + AsyncWrite + Unpin,
     {
+        let mut session = ConnectionAuthState::Unauthenticated;
         loop {
             // Read 4-byte frame length prefix
             let frame_len = match stream.read_i32().await {
@@ -563,15 +752,21 @@ impl BrokerEngine {
             let mut frame_buf = vec![0u8; frame_len];
             stream.read_exact(&mut frame_buf).await?;
 
-            let response_frame = match self.handle_frame(Bytes::from(frame_buf)) {
-                Ok(f) => f,
-                Err(e) => {
-                    error!("Error handling Kafka frame: {:?}", e);
-                    return Err(e);
-                }
-            };
+            let response_frame =
+                match self.handle_connection_frame(&mut session, Bytes::from(frame_buf)) {
+                    Ok(f) => f,
+                    Err(e) => {
+                        error!("Error handling Kafka frame: {:?}", e);
+                        return Err(e);
+                    }
+                };
             stream.write_all(&response_frame).await?;
             stream.flush().await?;
+
+            if matches!(session, ConnectionAuthState::Failed) {
+                debug!("Closing connection following SASL authentication failure");
+                break;
+            }
         }
 
         Ok(())
@@ -1235,5 +1430,232 @@ mod tests {
             resp_inv.responses[0].partitions[0].error_code,
             KafkaErrorCode::InvalidRecord
         );
+    }
+
+    #[test]
+    fn test_sasl_plain_connection_flow() {
+        let wal = Arc::new(MemoryWal::new());
+        let storage = Arc::new(MemoryObjectStorage::new());
+        let log_cache = Arc::new(LogCache::new(1024 * 1024));
+        let block_cache = Arc::new(BlockCache::new(1024 * 1024));
+        let cs = Arc::new(ClusterState::new(
+            1,
+            "127.0.0.1",
+            9092,
+            "test-cluster",
+            wal,
+            storage,
+            log_cache,
+            block_cache,
+        ));
+        let coord = Arc::new(GroupCoordinator::new());
+        let auth = Arc::new(SaslAuthenticator::new(
+            vec![SaslMechanism::Plain, SaslMechanism::ScramSha256],
+            true, // require SASL
+        ));
+        auth.add_user("admin", "admin-secret");
+
+        let engine = BrokerEngine::new(cs, coord).with_authenticator(auth);
+        let mut session = ConnectionAuthState::Unauthenticated;
+
+        // 1. ApiVersions is allowed before authentication
+        let api_ver_hdr = RequestHeader::new(ApiKey::ApiVersions, 0, 1, Some("client"));
+        let empty_req = BytesMut::new();
+        let api_ver_resp = engine
+            .handle_connection_request(&mut session, &api_ver_hdr, &mut empty_req.freeze())
+            .unwrap();
+        assert!(!api_ver_resp.is_empty());
+
+        // 2. Metadata without authentication should be rejected
+        let meta_hdr = RequestHeader::new(ApiKey::Metadata, 0, 2, Some("client"));
+        let mut meta_body = BytesMut::new();
+        let meta_req = MetadataRequest {
+            topics: None,
+            allow_auto_topic_creation: true,
+        };
+        meta_req.encode(&mut meta_body, 0);
+        assert!(engine
+            .handle_connection_request(&mut session, &meta_hdr, &mut meta_body.freeze())
+            .is_err());
+
+        // 3. SaslHandshake with PLAIN
+        let hs_hdr = RequestHeader::new(ApiKey::SaslHandshake, 0, 3, Some("client"));
+        let mut hs_body = BytesMut::new();
+        let hs_req = SaslHandshakeRequest {
+            mechanism: "PLAIN".into(),
+        };
+        hs_req.encode(&mut hs_body, 0);
+        let mut hs_resp_bytes = engine
+            .handle_connection_request(&mut session, &hs_hdr, &mut hs_body.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut hs_resp_bytes).unwrap();
+        let hs_resp = SaslHandshakeResponse::decode(&mut hs_resp_bytes, 0).unwrap();
+        assert_eq!(hs_resp.error_code, KafkaErrorCode::None);
+        assert!(hs_resp.enabled_mechanisms.contains(&"PLAIN".to_string()));
+        assert!(matches!(
+            session,
+            ConnectionAuthState::HandshakeReceived {
+                mechanism: SaslMechanism::Plain
+            }
+        ));
+
+        // 4. SaslAuthenticate with PLAIN (valid credentials)
+        let auth_hdr = RequestHeader::new(ApiKey::SaslAuthenticate, 0, 4, Some("client"));
+        let mut auth_body = BytesMut::new();
+        let auth_req = SaslAuthenticateRequest {
+            auth_bytes: Bytes::from_static(b"\0admin\0admin-secret"),
+        };
+        auth_req.encode(&mut auth_body, 0);
+        let mut auth_resp_bytes = engine
+            .handle_connection_request(&mut session, &auth_hdr, &mut auth_body.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut auth_resp_bytes).unwrap();
+        let auth_resp = SaslAuthenticateResponse::decode(&mut auth_resp_bytes, 0).unwrap();
+        assert_eq!(auth_resp.error_code, KafkaErrorCode::None);
+        assert!(session.is_authenticated());
+        assert_eq!(session.principal(), Some("admin"));
+
+        // 5. Metadata now succeeds because connection is authenticated
+        let mut meta_body2 = BytesMut::new();
+        meta_req.encode(&mut meta_body2, 0);
+        let meta_resp = engine
+            .handle_connection_request(&mut session, &meta_hdr, &mut meta_body2.freeze())
+            .unwrap();
+        assert!(!meta_resp.is_empty());
+    }
+
+    #[test]
+    fn test_sasl_scram_sha256_connection_flow() {
+        use base64::prelude::*;
+        use ring::digest;
+        use ring::hmac;
+        use ring::pbkdf2;
+        use std::num::NonZeroU32;
+
+        let wal = Arc::new(MemoryWal::new());
+        let storage = Arc::new(MemoryObjectStorage::new());
+        let log_cache = Arc::new(LogCache::new(1024 * 1024));
+        let block_cache = Arc::new(BlockCache::new(1024 * 1024));
+        let cs = Arc::new(ClusterState::new(
+            1,
+            "127.0.0.1",
+            9092,
+            "test-cluster",
+            wal,
+            storage,
+            log_cache,
+            block_cache,
+        ));
+        let coord = Arc::new(GroupCoordinator::new());
+        let auth = Arc::new(SaslAuthenticator::new(
+            vec![SaslMechanism::ScramSha256],
+            false,
+        ));
+        auth.add_user("scram-user", "topsecret");
+
+        let engine = BrokerEngine::new(cs, coord).with_authenticator(auth);
+        let mut session = ConnectionAuthState::Unauthenticated;
+
+        // 1. SaslHandshake with SCRAM-SHA-256
+        let hs_hdr = RequestHeader::new(ApiKey::SaslHandshake, 0, 1, Some("client"));
+        let mut hs_body = BytesMut::new();
+        let hs_req = SaslHandshakeRequest {
+            mechanism: "SCRAM-SHA-256".into(),
+        };
+        hs_req.encode(&mut hs_body, 0);
+        let _ = engine
+            .handle_connection_request(&mut session, &hs_hdr, &mut hs_body.freeze())
+            .unwrap();
+        assert!(matches!(
+            session,
+            ConnectionAuthState::HandshakeReceived {
+                mechanism: SaslMechanism::ScramSha256
+            }
+        ));
+
+        // 2. SaslAuthenticate Round 1 (client-first-message)
+        let client_nonce = "clientNonce12345";
+        let client_first = format!("n,,n=scram-user,r={}", client_nonce);
+        let auth_hdr1 = RequestHeader::new(ApiKey::SaslAuthenticate, 0, 2, Some("client"));
+        let mut auth_body1 = BytesMut::new();
+        let auth_req1 = SaslAuthenticateRequest {
+            auth_bytes: Bytes::from(client_first),
+        };
+        auth_req1.encode(&mut auth_body1, 0);
+        let mut resp1_bytes = engine
+            .handle_connection_request(&mut session, &auth_hdr1, &mut auth_body1.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp1_bytes).unwrap();
+        let auth_resp1 = SaslAuthenticateResponse::decode(&mut resp1_bytes, 0).unwrap();
+        assert_eq!(auth_resp1.error_code, KafkaErrorCode::None);
+
+        let server_first_str = std::str::from_utf8(&auth_resp1.auth_bytes).unwrap();
+        let mut full_nonce = "";
+        let mut salt_b64 = "";
+        for part in server_first_str.split(',') {
+            if let Some(val) = part.strip_prefix("r=") {
+                full_nonce = val;
+            } else if let Some(val) = part.strip_prefix("s=") {
+                salt_b64 = val;
+            }
+        }
+        let salt = BASE64_STANDARD.decode(salt_b64).unwrap();
+
+        // 3. Client computes proof
+        let client_final_without_proof = format!("c=biws,r={}", full_nonce);
+        let auth_message = format!(
+            "n=scram-user,r={},{},{}",
+            client_nonce, server_first_str, client_final_without_proof
+        );
+
+        let mut salted_password = [0u8; 32];
+        pbkdf2::derive(
+            pbkdf2::PBKDF2_HMAC_SHA256,
+            NonZeroU32::new(4096).unwrap(),
+            &salt,
+            b"topsecret",
+            &mut salted_password,
+        );
+
+        let s_key = hmac::Key::new(hmac::HMAC_SHA256, &salted_password);
+        let client_key = hmac::sign(&s_key, b"Client Key");
+        let stored_key = digest::digest(&digest::SHA256, client_key.as_ref());
+        let stored_key_hmac = hmac::Key::new(hmac::HMAC_SHA256, stored_key.as_ref());
+        let client_sig = hmac::sign(&stored_key_hmac, auth_message.as_bytes());
+
+        let client_proof: Vec<u8> = client_key
+            .as_ref()
+            .iter()
+            .zip(client_sig.as_ref().iter())
+            .map(|(k, s)| k ^ s)
+            .collect();
+
+        let client_final = format!(
+            "{},p={}",
+            client_final_without_proof,
+            BASE64_STANDARD.encode(&client_proof)
+        );
+
+        // 4. SaslAuthenticate Round 2 (client-final-message)
+        let auth_hdr2 = RequestHeader::new(ApiKey::SaslAuthenticate, 0, 3, Some("client"));
+        let mut auth_body2 = BytesMut::new();
+        let auth_req2 = SaslAuthenticateRequest {
+            auth_bytes: Bytes::from(client_final),
+        };
+        auth_req2.encode(&mut auth_body2, 0);
+        let mut resp2_bytes = engine
+            .handle_connection_request(&mut session, &auth_hdr2, &mut auth_body2.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp2_bytes).unwrap();
+        let auth_resp2 = SaslAuthenticateResponse::decode(&mut resp2_bytes, 0).unwrap();
+        assert_eq!(auth_resp2.error_code, KafkaErrorCode::None);
+        assert!(session.is_authenticated());
+        assert_eq!(session.principal(), Some("scram-user"));
+        let server_final_str = std::str::from_utf8(&auth_resp2.auth_bytes).unwrap();
+        assert!(server_final_str.starts_with("v="));
     }
 }
