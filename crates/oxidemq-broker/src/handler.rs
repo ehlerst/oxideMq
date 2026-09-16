@@ -1,3 +1,4 @@
+use crate::acl::AclAuthorizer;
 use crate::chaos::{ChaosEngine, FaultTarget};
 use crate::coordinator::GroupCoordinator;
 use crate::router::ClusterState;
@@ -9,20 +10,22 @@ use oxidemq_core::error::{OxideMqError, Result};
 use oxidemq_core::types::{CompressionCodec, TopicPartition};
 use oxidemq_protocol::header::{RequestHeader, ResponseHeader};
 use oxidemq_protocol::messages::{
-    AddOffsetsToTxnRequest, AddOffsetsToTxnResponse, AddPartitionsToTxnPartitionResult,
-    AddPartitionsToTxnRequest, AddPartitionsToTxnResponse, AddPartitionsToTxnTopicResult,
-    ApiVersionsRequest, ApiVersionsResponse, EndTxnRequest, EndTxnResponse, FetchPartitionResponse,
-    FetchRequest, FetchResponse, FetchTopicResponse, FindCoordinatorRequest,
-    FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse, InitProducerIdRequest,
-    InitProducerIdResponse, LeaveGroupRequest, LeaveGroupResponse, ListOffsetsPartitionResponse,
-    ListOffsetsRequest, ListOffsetsResponse, ListOffsetsTopicResponse, MetadataRequest,
-    OffsetCommitPartitionResponse, OffsetCommitRequest, OffsetCommitResponse,
-    OffsetCommitTopicResponse, OffsetFetchPartitionResponse, OffsetFetchRequest,
-    OffsetFetchResponse, OffsetFetchTopicResponse, PartitionProduceResponse, ProduceRequest,
-    ProduceResponse, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
-    SaslHandshakeResponse, TopicProduceResponse,
+    AclCreationResult, AddOffsetsToTxnRequest, AddOffsetsToTxnResponse,
+    AddPartitionsToTxnPartitionResult, AddPartitionsToTxnRequest, AddPartitionsToTxnResponse,
+    AddPartitionsToTxnTopicResult, ApiVersionsRequest, ApiVersionsResponse, CreateAclsRequest,
+    CreateAclsResponse, DeleteAclsFilterResult, DeleteAclsRequest, DeleteAclsResponse,
+    DescribeAclsRequest, DescribeAclsResponse, EndTxnRequest, EndTxnResponse,
+    FetchPartitionResponse, FetchRequest, FetchResponse, FetchTopicResponse,
+    FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
+    InitProducerIdRequest, InitProducerIdResponse, LeaveGroupRequest, LeaveGroupResponse,
+    ListOffsetsPartitionResponse, ListOffsetsRequest, ListOffsetsResponse,
+    ListOffsetsTopicResponse, MetadataRequest, OffsetCommitPartitionResponse, OffsetCommitRequest,
+    OffsetCommitResponse, OffsetCommitTopicResponse, OffsetFetchPartitionResponse,
+    OffsetFetchRequest, OffsetFetchResponse, OffsetFetchTopicResponse, PartitionProduceResponse,
+    ProduceRequest, ProduceResponse, SaslAuthenticateRequest, SaslAuthenticateResponse,
+    SaslHandshakeRequest, SaslHandshakeResponse, TopicProduceResponse,
 };
-use oxidemq_protocol::{ApiKey, KafkaErrorCode};
+use oxidemq_protocol::{AclOperation, AclResourceType, ApiKey, KafkaErrorCode};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, error, trace};
@@ -35,6 +38,7 @@ pub struct BrokerEngine {
     txn_coordinator: Arc<TransactionCoordinator>,
     schema_registry: Arc<SchemaRegistry>,
     authenticator: Arc<SaslAuthenticator>,
+    authorizer: Arc<AclAuthorizer>,
     chaos: Arc<ChaosEngine>,
     enable_schema_validation: bool,
 }
@@ -47,6 +51,7 @@ impl BrokerEngine {
             txn_coordinator: Arc::new(TransactionCoordinator::new()),
             schema_registry: Arc::new(SchemaRegistry::new()),
             authenticator: Arc::new(SaslAuthenticator::default()),
+            authorizer: Arc::new(AclAuthorizer::default()),
             chaos: Arc::new(ChaosEngine::new()),
             enable_schema_validation: false,
         }
@@ -72,9 +77,18 @@ impl BrokerEngine {
         self
     }
 
+    pub fn with_authorizer(mut self, authorizer: Arc<AclAuthorizer>) -> Self {
+        self.authorizer = authorizer;
+        self
+    }
+
     pub fn with_schema_validation(mut self, enabled: bool) -> Self {
         self.enable_schema_validation = enabled;
         self
+    }
+
+    pub fn authorizer(&self) -> &Arc<AclAuthorizer> {
+        &self.authorizer
     }
 
     pub fn authenticator(&self) -> &Arc<SaslAuthenticator> {
@@ -137,6 +151,9 @@ impl BrokerEngine {
                 header.api_key
             )));
         }
+
+        let principal = session.principal().unwrap_or("ANONYMOUS");
+        let client_host = "*";
 
         match header.api_key {
             ApiKey::ApiVersions => {
@@ -283,7 +300,19 @@ impl BrokerEngine {
             }
             ApiKey::Metadata => {
                 let req = MetadataRequest::decode(body, header.api_version)?;
-                let resp = self.cluster_state.build_metadata(req.topics.as_deref());
+                let mut resp = self.cluster_state.build_metadata(req.topics.as_deref());
+                for topic in &mut resp.topics {
+                    if !self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Topic,
+                        &topic.name,
+                        AclOperation::Describe,
+                    ) {
+                        topic.error_code = KafkaErrorCode::TopicAuthorizationFailed;
+                        topic.partitions.clear();
+                    }
+                }
                 resp.encode(&mut out, header.api_version);
             }
             ApiKey::Produce => {
@@ -292,8 +321,25 @@ impl BrokerEngine {
                 let fault = self.chaos.check_fault(FaultTarget::Produce);
 
                 for t in req.topic_data {
+                    let is_authorized = self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Topic,
+                        &t.topic,
+                        AclOperation::Write,
+                    );
                     let mut part_responses = Vec::with_capacity(t.partitions.len());
                     for p in t.partitions {
+                        if !is_authorized {
+                            part_responses.push(PartitionProduceResponse {
+                                partition: p.partition,
+                                error_code: KafkaErrorCode::TopicAuthorizationFailed,
+                                base_offset: -1,
+                                log_append_time_ms: -1,
+                                log_start_offset: 0,
+                            });
+                            continue;
+                        }
                         let tp = TopicPartition::new(&t.topic, p.partition);
                         let partition = self.cluster_state.get_or_create_partition(&tp);
 
@@ -364,8 +410,26 @@ impl BrokerEngine {
                 let fault = self.chaos.check_fault(FaultTarget::Fetch);
 
                 for t in req.topics {
+                    let is_topic_authorized = self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Topic,
+                        &t.topic,
+                        AclOperation::Read,
+                    );
                     let mut part_responses = Vec::with_capacity(t.partitions.len());
                     for p in t.partitions {
+                        if !is_topic_authorized {
+                            part_responses.push(FetchPartitionResponse {
+                                partition_index: p.partition,
+                                error_code: KafkaErrorCode::TopicAuthorizationFailed,
+                                high_watermark: -1,
+                                last_stable_offset: -1,
+                                records: Bytes::new(),
+                            });
+                            continue;
+                        }
+
                         let tp = TopicPartition::new(&t.topic, p.partition);
                         let partition = self.cluster_state.get_or_create_partition(&tp);
 
@@ -458,14 +522,48 @@ impl BrokerEngine {
                 resp.encode(&mut out, header.api_version);
             }
             ApiKey::FindCoordinator => {
-                let _req = FindCoordinatorRequest::decode(body, header.api_version)?;
+                let req = FindCoordinatorRequest::decode(body, header.api_version)?;
+                let is_authorized = match req.key_type {
+                    0 => self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Group,
+                        &req.key,
+                        AclOperation::Describe,
+                    ),
+                    1 => self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::TransactionalId,
+                        &req.key,
+                        AclOperation::Describe,
+                    ),
+                    _ => true,
+                };
+
+                let (error_code, node_id, host, port) = if !is_authorized {
+                    let err = match req.key_type {
+                        0 => KafkaErrorCode::GroupAuthorizationFailed,
+                        1 => KafkaErrorCode::TransactionalIdAuthorizationFailed,
+                        _ => KafkaErrorCode::ClusterAuthorizationFailed,
+                    };
+                    (err, -1, String::new(), -1)
+                } else {
+                    (
+                        KafkaErrorCode::None,
+                        self.cluster_state.node_id(),
+                        self.cluster_state.host().to_string(),
+                        self.cluster_state.port(),
+                    )
+                };
+
                 let resp = FindCoordinatorResponse {
                     throttle_time_ms: 0,
-                    error_code: KafkaErrorCode::None,
+                    error_code,
                     error_message: None,
-                    node_id: self.cluster_state.node_id(),
-                    host: self.cluster_state.host().to_string(),
-                    port: self.cluster_state.port(),
+                    node_id,
+                    host,
+                    port,
                 };
                 resp.encode(&mut out, header.api_version);
             }
@@ -474,8 +572,26 @@ impl BrokerEngine {
                 let mut topic_responses = Vec::with_capacity(req.topics.len());
 
                 for t in req.topics {
+                    let is_authorized = self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Topic,
+                        &t.topic,
+                        AclOperation::Describe,
+                    );
                     let mut part_responses = Vec::with_capacity(t.partitions.len());
                     for p in t.partitions {
+                        if !is_authorized {
+                            part_responses.push(ListOffsetsPartitionResponse {
+                                partition: p.partition,
+                                error_code: KafkaErrorCode::TopicAuthorizationFailed,
+                                timestamp: -1,
+                                offset: -1,
+                                leader_epoch: 0,
+                            });
+                            continue;
+                        }
+
                         let tp = TopicPartition::new(&t.topic, p.partition);
                         let partition = self.cluster_state.get_or_create_partition(&tp);
                         let offset = if p.timestamp == -2 {
@@ -506,11 +622,26 @@ impl BrokerEngine {
             }
             ApiKey::OffsetCommit => {
                 let req = OffsetCommitRequest::decode(body, header.api_version)?;
+                let is_authorized = self.authorizer.authorize(
+                    principal,
+                    client_host,
+                    AclResourceType::Group,
+                    &req.group_id,
+                    AclOperation::Read,
+                );
                 let mut topic_responses = Vec::with_capacity(req.topics.len());
 
                 for t in req.topics {
                     let mut part_responses = Vec::with_capacity(t.partitions.len());
                     for p in t.partitions {
+                        if !is_authorized {
+                            part_responses.push(OffsetCommitPartitionResponse {
+                                partition: p.partition,
+                                error_code: KafkaErrorCode::GroupAuthorizationFailed,
+                            });
+                            continue;
+                        }
+
                         let tp = TopicPartition::new(&t.topic, p.partition);
                         self.coordinator
                             .commit_offset(&req.group_id, tp, p.committed_offset);
@@ -534,46 +665,73 @@ impl BrokerEngine {
             }
             ApiKey::OffsetFetch => {
                 let req = OffsetFetchRequest::decode(body, header.api_version)?;
-                let mut topic_responses = Vec::new();
+                let is_authorized = self.authorizer.authorize(
+                    principal,
+                    client_host,
+                    AclResourceType::Group,
+                    &req.group_id,
+                    AclOperation::Describe,
+                );
+                if !is_authorized {
+                    let resp = OffsetFetchResponse {
+                        throttle_time_ms: 0,
+                        topics: Vec::new(),
+                        error_code: KafkaErrorCode::GroupAuthorizationFailed,
+                    };
+                    resp.encode(&mut out, header.api_version);
+                } else {
+                    let mut topic_responses = Vec::new();
 
-                if let Some(topics) = req.topics {
-                    for t in topics {
-                        let mut part_responses = Vec::with_capacity(t.partitions.len());
-                        for p in t.partitions {
-                            let tp = TopicPartition::new(&t.topic, p);
-                            let off = self
-                                .coordinator
-                                .fetch_offset(&req.group_id, &tp)
-                                .unwrap_or(-1);
+                    if let Some(topics) = req.topics {
+                        for t in topics {
+                            let mut part_responses = Vec::with_capacity(t.partitions.len());
+                            for p in t.partitions {
+                                let tp = TopicPartition::new(&t.topic, p);
+                                let off = self
+                                    .coordinator
+                                    .fetch_offset(&req.group_id, &tp)
+                                    .unwrap_or(-1);
 
-                            part_responses.push(OffsetFetchPartitionResponse {
-                                partition: p,
-                                offset: off,
-                                metadata: None,
-                                error_code: KafkaErrorCode::None,
+                                part_responses.push(OffsetFetchPartitionResponse {
+                                    partition: p,
+                                    offset: off,
+                                    metadata: None,
+                                    error_code: KafkaErrorCode::None,
+                                });
+                            }
+                            topic_responses.push(OffsetFetchTopicResponse {
+                                topic: t.topic,
+                                partitions: part_responses,
                             });
                         }
-                        topic_responses.push(OffsetFetchTopicResponse {
-                            topic: t.topic,
-                            partitions: part_responses,
-                        });
                     }
-                }
 
-                let resp = OffsetFetchResponse {
-                    throttle_time_ms: 0,
-                    topics: topic_responses,
-                    error_code: KafkaErrorCode::None,
-                };
-                resp.encode(&mut out, header.api_version);
+                    let resp = OffsetFetchResponse {
+                        throttle_time_ms: 0,
+                        topics: topic_responses,
+                        error_code: KafkaErrorCode::None,
+                    };
+                    resp.encode(&mut out, header.api_version);
+                }
             }
             ApiKey::Heartbeat => {
                 let req = HeartbeatRequest::decode(body, header.api_version)?;
-                let err = self.coordinator.handle_heartbeat(
+                let is_authorized = self.authorizer.authorize(
+                    principal,
+                    client_host,
+                    AclResourceType::Group,
                     &req.group_id,
-                    req.generation_id,
-                    &req.member_id,
+                    AclOperation::Read,
                 );
+                let err = if !is_authorized {
+                    KafkaErrorCode::GroupAuthorizationFailed
+                } else {
+                    self.coordinator.handle_heartbeat(
+                        &req.group_id,
+                        req.generation_id,
+                        &req.member_id,
+                    )
+                };
                 let resp = HeartbeatResponse {
                     throttle_time_ms: 0,
                     error_code: err,
@@ -582,9 +740,19 @@ impl BrokerEngine {
             }
             ApiKey::LeaveGroup => {
                 let req = LeaveGroupRequest::decode(body, header.api_version)?;
-                let err = self
-                    .coordinator
-                    .handle_leave_group(&req.group_id, &req.member_id);
+                let is_authorized = self.authorizer.authorize(
+                    principal,
+                    client_host,
+                    AclResourceType::Group,
+                    &req.group_id,
+                    AclOperation::Read,
+                );
+                let err = if !is_authorized {
+                    KafkaErrorCode::GroupAuthorizationFailed
+                } else {
+                    self.coordinator
+                        .handle_leave_group(&req.group_id, &req.member_id)
+                };
                 let resp = LeaveGroupResponse {
                     throttle_time_ms: 0,
                     error_code: err,
@@ -593,12 +761,28 @@ impl BrokerEngine {
             }
             ApiKey::InitProducerId => {
                 let req = InitProducerIdRequest::decode(body, header.api_version)?;
-                let (error_code, producer_id, producer_epoch) = match self
-                    .txn_coordinator
-                    .init_producer_id(req.transactional_id.as_deref(), req.transaction_timeout_ms)
-                {
-                    Ok((pid, ep)) => (KafkaErrorCode::None, pid, ep),
-                    Err(code) => (code, -1, -1),
+                let is_authorized = if let Some(ref txn_id) = req.transactional_id {
+                    self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::TransactionalId,
+                        txn_id,
+                        AclOperation::Write,
+                    )
+                } else {
+                    true
+                };
+
+                let (error_code, producer_id, producer_epoch) = if !is_authorized {
+                    (KafkaErrorCode::TransactionalIdAuthorizationFailed, -1, -1)
+                } else {
+                    match self.txn_coordinator.init_producer_id(
+                        req.transactional_id.as_deref(),
+                        req.transaction_timeout_ms,
+                    ) {
+                        Ok((pid, ep)) => (KafkaErrorCode::None, pid, ep),
+                        Err(code) => (code, -1, -1),
+                    }
                 };
 
                 let resp = InitProducerIdResponse {
@@ -611,21 +795,33 @@ impl BrokerEngine {
             }
             ApiKey::AddPartitionsToTxn => {
                 let req = AddPartitionsToTxnRequest::decode(body, header.api_version)?;
-                let mut all_tps = Vec::new();
-                for t in &req.topics {
-                    for &p in &t.partitions {
-                        all_tps.push(TopicPartition::new(&t.name, p));
-                    }
-                }
-
-                let overall_err = match self.txn_coordinator.add_partitions_to_txn(
+                let is_authorized = self.authorizer.authorize(
+                    principal,
+                    client_host,
+                    AclResourceType::TransactionalId,
                     &req.transactional_id,
-                    req.producer_id,
-                    req.producer_epoch,
-                    all_tps,
-                ) {
-                    Ok(()) => KafkaErrorCode::None,
-                    Err(code) => code,
+                    AclOperation::Write,
+                );
+
+                let overall_err = if !is_authorized {
+                    KafkaErrorCode::TransactionalIdAuthorizationFailed
+                } else {
+                    let mut all_tps = Vec::new();
+                    for t in &req.topics {
+                        for &p in &t.partitions {
+                            all_tps.push(TopicPartition::new(&t.name, p));
+                        }
+                    }
+
+                    match self.txn_coordinator.add_partitions_to_txn(
+                        &req.transactional_id,
+                        req.producer_id,
+                        req.producer_epoch,
+                        all_tps,
+                    ) {
+                        Ok(()) => KafkaErrorCode::None,
+                        Err(code) => code,
+                    }
                 };
 
                 let mut topic_results = Vec::with_capacity(req.topics.len());
@@ -651,14 +847,26 @@ impl BrokerEngine {
             }
             ApiKey::AddOffsetsToTxn => {
                 let req = AddOffsetsToTxnRequest::decode(body, header.api_version)?;
-                let error_code = match self.txn_coordinator.add_offsets_to_txn(
+                let is_authorized = self.authorizer.authorize(
+                    principal,
+                    client_host,
+                    AclResourceType::TransactionalId,
                     &req.transactional_id,
-                    req.producer_id,
-                    req.producer_epoch,
-                    &req.group_id,
-                ) {
-                    Ok(()) => KafkaErrorCode::None,
-                    Err(code) => code,
+                    AclOperation::Write,
+                );
+
+                let error_code = if !is_authorized {
+                    KafkaErrorCode::TransactionalIdAuthorizationFailed
+                } else {
+                    match self.txn_coordinator.add_offsets_to_txn(
+                        &req.transactional_id,
+                        req.producer_id,
+                        req.producer_epoch,
+                        &req.group_id,
+                    ) {
+                        Ok(()) => KafkaErrorCode::None,
+                        Err(code) => code,
+                    }
                 };
                 let resp = AddOffsetsToTxnResponse {
                     throttle_time_ms: 0,
@@ -668,19 +876,111 @@ impl BrokerEngine {
             }
             ApiKey::EndTxn => {
                 let req = EndTxnRequest::decode(body, header.api_version)?;
-                let error_code = match self.txn_coordinator.end_txn(
+                let is_authorized = self.authorizer.authorize(
+                    principal,
+                    client_host,
+                    AclResourceType::TransactionalId,
                     &req.transactional_id,
-                    req.producer_id,
-                    req.producer_epoch,
-                    req.committed,
-                    &self.cluster_state,
-                ) {
-                    Ok(()) => KafkaErrorCode::None,
-                    Err(code) => code,
+                    AclOperation::Write,
+                );
+
+                let error_code = if !is_authorized {
+                    KafkaErrorCode::TransactionalIdAuthorizationFailed
+                } else {
+                    match self.txn_coordinator.end_txn(
+                        &req.transactional_id,
+                        req.producer_id,
+                        req.producer_epoch,
+                        req.committed,
+                        &self.cluster_state,
+                    ) {
+                        Ok(()) => KafkaErrorCode::None,
+                        Err(code) => code,
+                    }
                 };
                 let resp = EndTxnResponse {
                     throttle_time_ms: 0,
                     error_code,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::DescribeAcls => {
+                let req = DescribeAclsRequest::decode(body, header.api_version)?;
+                let is_authorized = self.authorizer.authorize(
+                    principal,
+                    client_host,
+                    AclResourceType::Cluster,
+                    "kafka-cluster",
+                    AclOperation::Describe,
+                );
+                let (error_code, error_message, resources) = if !is_authorized {
+                    (
+                        KafkaErrorCode::ClusterAuthorizationFailed,
+                        Some("Cluster authorization failed: Describe required on Cluster:kafka-cluster".into()),
+                        Vec::new(),
+                    )
+                } else {
+                    let res = self.authorizer.describe_acls(&req);
+                    (KafkaErrorCode::None, None, res)
+                };
+                let resp = DescribeAclsResponse {
+                    throttle_time_ms: 0,
+                    error_code,
+                    error_message,
+                    resources,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::CreateAcls => {
+                let req = CreateAclsRequest::decode(body, header.api_version)?;
+                let is_authorized = self.authorizer.authorize(
+                    principal,
+                    client_host,
+                    AclResourceType::Cluster,
+                    "kafka-cluster",
+                    AclOperation::Alter,
+                );
+                let results = if !is_authorized {
+                    req.creations
+                        .iter()
+                        .map(|_| AclCreationResult {
+                            error_code: KafkaErrorCode::ClusterAuthorizationFailed,
+                            error_message: Some("Cluster authorization failed: Alter required on Cluster:kafka-cluster".into()),
+                        })
+                        .collect()
+                } else {
+                    self.authorizer.create_acls(&req.creations)
+                };
+                let resp = CreateAclsResponse {
+                    throttle_time_ms: 0,
+                    results,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::DeleteAcls => {
+                let req = DeleteAclsRequest::decode(body, header.api_version)?;
+                let is_authorized = self.authorizer.authorize(
+                    principal,
+                    client_host,
+                    AclResourceType::Cluster,
+                    "kafka-cluster",
+                    AclOperation::Alter,
+                );
+                let filter_results = if !is_authorized {
+                    req.filters
+                        .iter()
+                        .map(|_| DeleteAclsFilterResult {
+                            error_code: KafkaErrorCode::ClusterAuthorizationFailed,
+                            error_message: Some("Cluster authorization failed: Alter required on Cluster:kafka-cluster".into()),
+                            matching_acls: Vec::new(),
+                        })
+                        .collect()
+                } else {
+                    self.authorizer.delete_acls(&req.filters)
+                };
+                let resp = DeleteAclsResponse {
+                    throttle_time_ms: 0,
+                    filter_results,
                 };
                 resp.encode(&mut out, header.api_version);
             }
@@ -1657,5 +1957,198 @@ mod tests {
         assert_eq!(session.principal(), Some("scram-user"));
         let server_final_str = std::str::from_utf8(&auth_resp2.auth_bytes).unwrap();
         assert!(server_final_str.starts_with("v="));
+    }
+
+    #[test]
+    fn test_engine_acl_authorization_flow() {
+        let mut super_users = std::collections::HashSet::new();
+        super_users.insert("User:admin".to_string());
+        let authorizer = Arc::new(AclAuthorizer::new(true, super_users, false));
+
+        let engine = create_test_engine().with_authorizer(authorizer);
+
+        let mut alice_session = ConnectionAuthState::Authenticated {
+            principal: "alice".to_string(),
+        };
+        let mut admin_session = ConnectionAuthState::Authenticated {
+            principal: "admin".to_string(),
+        };
+        let mut bob_session = ConnectionAuthState::Authenticated {
+            principal: "bob".to_string(),
+        };
+
+        // 1. Alice attempts to produce to "secure-topic" -> rejected (TopicAuthorizationFailed)
+        let produce_req = ProduceRequest {
+            acks: 1,
+            timeout_ms: 1000,
+            topic_data: vec![oxidemq_protocol::TopicProduceData {
+                topic: "secure-topic".to_string(),
+                partitions: vec![oxidemq_protocol::PartitionProduceData {
+                    partition: 0,
+                    records: Bytes::from_static(b"secret payload"),
+                }],
+            }],
+        };
+        let produce_hdr = RequestHeader::new(ApiKey::Produce, 0, 10, Some("alice"));
+        let mut p_buf = BytesMut::new();
+        produce_req.encode(&mut p_buf, 0);
+        let mut p_resp = engine
+            .handle_connection_request(&mut alice_session, &produce_hdr, &mut p_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut p_resp).unwrap();
+        let produce_resp = ProduceResponse::decode(&mut p_resp, 0).unwrap();
+        assert_eq!(
+            produce_resp.responses[0].partitions[0].error_code,
+            KafkaErrorCode::TopicAuthorizationFailed
+        );
+
+        // 2. Bob attempts to call CreateAcls -> rejected (ClusterAuthorizationFailed)
+        let create_acls_req = CreateAclsRequest {
+            creations: vec![oxidemq_protocol::AclCreation {
+                resource_type: AclResourceType::Topic as i8,
+                resource_name: "secure-topic".to_string(),
+                resource_pattern_type: oxidemq_protocol::AclResourcePatternType::Literal as i8,
+                principal: "User:alice".to_string(),
+                host: "*".to_string(),
+                operation: AclOperation::Write as i8,
+                permission_type: oxidemq_protocol::AclPermissionType::Allow as i8,
+            }],
+        };
+        let create_hdr = RequestHeader::new(ApiKey::CreateAcls, 0, 11, Some("bob"));
+        let mut c_buf = BytesMut::new();
+        create_acls_req.encode(&mut c_buf, 0);
+        let mut c_resp = engine
+            .handle_connection_request(&mut bob_session, &create_hdr, &mut c_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut c_resp).unwrap();
+        let create_resp = CreateAclsResponse::decode(&mut c_resp, 0).unwrap();
+        assert_eq!(
+            create_resp.results[0].error_code,
+            KafkaErrorCode::ClusterAuthorizationFailed
+        );
+
+        // 3. Admin calls CreateAcls granting Write to Alice on "secure-topic" -> succeeds
+        let mut c_buf_admin = BytesMut::new();
+        create_acls_req.encode(&mut c_buf_admin, 0);
+        let mut c_resp_admin = engine
+            .handle_connection_request(&mut admin_session, &create_hdr, &mut c_buf_admin.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut c_resp_admin).unwrap();
+        let create_resp_admin = CreateAclsResponse::decode(&mut c_resp_admin, 0).unwrap();
+        assert_eq!(
+            create_resp_admin.results[0].error_code,
+            KafkaErrorCode::None
+        );
+
+        // 4. Alice produces again -> succeeds!
+        let mut p_buf2 = BytesMut::new();
+        produce_req.encode(&mut p_buf2, 0);
+        let mut p_resp2 = engine
+            .handle_connection_request(&mut alice_session, &produce_hdr, &mut p_buf2.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut p_resp2).unwrap();
+        let produce_resp2 = ProduceResponse::decode(&mut p_resp2, 0).unwrap();
+        assert_eq!(
+            produce_resp2.responses[0].partitions[0].error_code,
+            KafkaErrorCode::None
+        );
+
+        // 5. Alice attempts to Fetch -> fails with TopicAuthorizationFailed (she has Write, not Read)
+        let fetch_req = FetchRequest {
+            max_wait_ms: 100,
+            min_bytes: 1,
+            max_bytes: 1024,
+            isolation_level: 0,
+            topics: vec![oxidemq_protocol::FetchTopic {
+                topic: "secure-topic".to_string(),
+                partitions: vec![oxidemq_protocol::FetchPartition {
+                    partition: 0,
+                    fetch_offset: 0,
+                    partition_max_bytes: 1024,
+                }],
+            }],
+        };
+        let fetch_hdr = RequestHeader::new(ApiKey::Fetch, 0, 12, Some("alice"));
+        let mut f_buf = BytesMut::new();
+        fetch_req.encode(&mut f_buf, 0);
+        let mut f_resp = engine
+            .handle_connection_request(&mut alice_session, &fetch_hdr, &mut f_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut f_resp).unwrap();
+        let fetch_resp = FetchResponse::decode(&mut f_resp, 0).unwrap();
+        assert_eq!(
+            fetch_resp.responses[0].partitions[0].error_code,
+            KafkaErrorCode::TopicAuthorizationFailed
+        );
+
+        // 6. Admin calls DescribeAcls -> returns Alice's ACL
+        let describe_req = DescribeAclsRequest {
+            resource_type_filter: 1, // Any
+            resource_name_filter: None,
+            resource_pattern_type_filter: 1, // Any
+            principal_filter: None,
+            host_filter: None,
+            operation: 1,       // Any
+            permission_type: 1, // Any
+        };
+        let desc_hdr = RequestHeader::new(ApiKey::DescribeAcls, 0, 13, Some("admin"));
+        let mut d_buf = BytesMut::new();
+        describe_req.encode(&mut d_buf, 0);
+        let mut d_resp = engine
+            .handle_connection_request(&mut admin_session, &desc_hdr, &mut d_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut d_resp).unwrap();
+        let desc_resp = DescribeAclsResponse::decode(&mut d_resp, 0).unwrap();
+        assert_eq!(desc_resp.error_code, KafkaErrorCode::None);
+        assert_eq!(desc_resp.resources.len(), 1);
+        assert_eq!(desc_resp.resources[0].resource_name, "secure-topic");
+
+        // 7. Admin calls DeleteAcls -> deletes Alice's ACL
+        let delete_req = DeleteAclsRequest {
+            filters: vec![oxidemq_protocol::DeleteAclsFilter {
+                resource_type_filter: 1,
+                resource_name_filter: Some("secure-topic".to_string()),
+                resource_pattern_type_filter: 1,
+                principal_filter: None,
+                host_filter: None,
+                operation: 1,
+                permission_type: 1,
+            }],
+        };
+        let del_hdr = RequestHeader::new(ApiKey::DeleteAcls, 0, 14, Some("admin"));
+        let mut del_buf = BytesMut::new();
+        delete_req.encode(&mut del_buf, 0);
+        let mut del_resp = engine
+            .handle_connection_request(&mut admin_session, &del_hdr, &mut del_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut del_resp).unwrap();
+        let del_resp_decoded = DeleteAclsResponse::decode(&mut del_resp, 0).unwrap();
+        assert_eq!(del_resp_decoded.filter_results.len(), 1);
+        assert_eq!(
+            del_resp_decoded.filter_results[0].error_code,
+            KafkaErrorCode::None
+        );
+        assert_eq!(del_resp_decoded.filter_results[0].matching_acls.len(), 1);
+
+        // 8. Alice produces again -> fails (ACL was deleted)
+        let mut p_buf3 = BytesMut::new();
+        produce_req.encode(&mut p_buf3, 0);
+        let mut p_resp3 = engine
+            .handle_connection_request(&mut alice_session, &produce_hdr, &mut p_buf3.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut p_resp3).unwrap();
+        let produce_resp3 = ProduceResponse::decode(&mut p_resp3, 0).unwrap();
+        assert_eq!(
+            produce_resp3.responses[0].partitions[0].error_code,
+            KafkaErrorCode::TopicAuthorizationFailed
+        );
     }
 }

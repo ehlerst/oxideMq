@@ -5,18 +5,26 @@
 #[cfg(test)]
 mod tests {
     use bytes::{BufMut, Bytes, BytesMut};
+    use oxidemq_broker::acl::AclAuthorizer;
+    use oxidemq_broker::sasl::{SaslAuthenticator, SaslMechanism};
     use oxidemq_broker::{BrokerEngine, ClusterState, GroupCoordinator};
     use oxidemq_core::prelude::*;
     use oxidemq_protocol::header::{RequestHeader, ResponseHeader};
     use oxidemq_protocol::messages::{
-        ApiVersionsRequest, ApiVersionsResponse, FetchPartition, FetchRequest, FetchResponse,
+        AclCreation, ApiVersionsRequest, ApiVersionsResponse, CreateAclsRequest,
+        CreateAclsResponse, DeleteAclsFilter, DeleteAclsRequest, DeleteAclsResponse,
+        DescribeAclsRequest, DescribeAclsResponse, FetchPartition, FetchRequest, FetchResponse,
         FetchTopic, FindCoordinatorRequest, FindCoordinatorResponse, ListOffsetsPartition,
         ListOffsetsRequest, ListOffsetsResponse, ListOffsetsTopic, MetadataRequest,
         MetadataResponse, OffsetCommitPartition, OffsetCommitRequest, OffsetCommitResponse,
         OffsetCommitTopic, OffsetFetchRequest, OffsetFetchResponse, OffsetFetchTopic,
-        PartitionProduceData, ProduceRequest, ProduceResponse, TopicProduceData,
+        PartitionProduceData, ProduceRequest, ProduceResponse, SaslAuthenticateRequest,
+        SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse, TopicProduceData,
     };
-    use oxidemq_protocol::{ApiKey, KafkaErrorCode};
+    use oxidemq_protocol::{
+        AclOperation, AclPermissionType, AclResourcePatternType, AclResourceType, ApiKey,
+        KafkaErrorCode,
+    };
     use oxidemq_s3stream::block_cache::BlockCache;
     use oxidemq_s3stream::client::MemoryObjectStorage;
     use oxidemq_s3stream::log_cache::LogCache;
@@ -633,5 +641,371 @@ mod tests {
                 KafkaErrorCode::None
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_e2e_kafka_acls_and_rbac_over_tcp() {
+        let wal = Arc::new(MemoryWal::new());
+        let storage = Arc::new(MemoryObjectStorage::new());
+        let log_cache = Arc::new(LogCache::new(10 * 1024 * 1024));
+        let block_cache = Arc::new(BlockCache::new(10 * 1024 * 1024));
+        let state = Arc::new(ClusterState::new(
+            1,
+            "127.0.0.1",
+            9092,
+            "compat-cluster-acl",
+            wal,
+            storage,
+            log_cache,
+            block_cache,
+        ));
+        let coord = Arc::new(GroupCoordinator::new());
+
+        let auth = Arc::new(SaslAuthenticator::new(
+            vec![SaslMechanism::Plain],
+            true, // require SASL
+        ));
+        auth.add_user("admin", "admin-secret");
+        auth.add_user("alice", "alice-secret");
+
+        let mut super_users = std::collections::HashSet::new();
+        super_users.insert("User:admin".to_string());
+        let authorizer = Arc::new(AclAuthorizer::new(
+            true, // enable_acls
+            super_users,
+            false, // deny if no ACL found
+        ));
+
+        let engine = Arc::new(
+            BrokerEngine::new(state, coord)
+                .with_authenticator(auth)
+                .with_authorizer(authorizer),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let engine_clone = Arc::clone(&engine);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let eng = Arc::clone(&engine_clone);
+                    tokio::spawn(async move {
+                        let _ = eng.process_connection(stream).await;
+                    });
+                }
+            }
+        });
+
+        // Helper async function to authenticate with SASL PLAIN over a TcpStream
+        async fn authenticate_plain(stream: &mut TcpStream, user: &str, pass: &str) {
+            // 1. SaslHandshake
+            let hs_hdr = RequestHeader::new(ApiKey::SaslHandshake, 0, 1, Some(user));
+            let mut hs_buf = BytesMut::new();
+            hs_hdr.encode(&mut hs_buf);
+            let hs_req = SaslHandshakeRequest {
+                mechanism: "PLAIN".into(),
+            };
+            hs_req.encode(&mut hs_buf, 0);
+            let mut hs_frame = BytesMut::new();
+            hs_frame.put_i32(hs_buf.len() as i32);
+            hs_frame.put_slice(&hs_buf);
+            stream.write_all(&hs_frame).await.unwrap();
+            stream.flush().await.unwrap();
+
+            let hs_len = stream.read_i32().await.unwrap() as usize;
+            let mut hs_resp_buf = vec![0u8; hs_len];
+            stream.read_exact(&mut hs_resp_buf).await.unwrap();
+            let mut hs_bytes = Bytes::from(hs_resp_buf);
+            let _ = ResponseHeader::decode(&mut hs_bytes).unwrap();
+            let hs_resp = SaslHandshakeResponse::decode(&mut hs_bytes, 0).unwrap();
+            assert_eq!(hs_resp.error_code, KafkaErrorCode::None);
+
+            // 2. SaslAuthenticate
+            let auth_payload = format!("\0{}\0{}", user, pass);
+            let auth_hdr = RequestHeader::new(ApiKey::SaslAuthenticate, 0, 2, Some(user));
+            let mut auth_buf = BytesMut::new();
+            auth_hdr.encode(&mut auth_buf);
+            let auth_req = SaslAuthenticateRequest {
+                auth_bytes: Bytes::from(auth_payload),
+            };
+            auth_req.encode(&mut auth_buf, 0);
+            let mut auth_frame = BytesMut::new();
+            auth_frame.put_i32(auth_buf.len() as i32);
+            auth_frame.put_slice(&auth_buf);
+            stream.write_all(&auth_frame).await.unwrap();
+            stream.flush().await.unwrap();
+
+            let auth_len = stream.read_i32().await.unwrap() as usize;
+            let mut auth_resp_buf = vec![0u8; auth_len];
+            stream.read_exact(&mut auth_resp_buf).await.unwrap();
+            let mut auth_bytes = Bytes::from(auth_resp_buf);
+            let _ = ResponseHeader::decode(&mut auth_bytes).unwrap();
+            let auth_resp = SaslAuthenticateResponse::decode(&mut auth_bytes, 0).unwrap();
+            assert_eq!(auth_resp.error_code, KafkaErrorCode::None);
+        }
+
+        // 1. Connect Alice over TCP & authenticate
+        let mut alice_stream = TcpStream::connect(addr).await.unwrap();
+        authenticate_plain(&mut alice_stream, "alice", "alice-secret").await;
+
+        // Alice attempts to produce to "orders" -> fails with TopicAuthorizationFailed
+        let prod_hdr = RequestHeader::new(ApiKey::Produce, 0, 10, Some("alice"));
+        let mut prod_buf = BytesMut::new();
+        prod_hdr.encode(&mut prod_buf);
+        let prod_req = ProduceRequest {
+            acks: 1,
+            timeout_ms: 1000,
+            topic_data: vec![TopicProduceData {
+                topic: "orders".to_string(),
+                partitions: vec![PartitionProduceData {
+                    partition: 0,
+                    records: Bytes::from_static(b"order-data-1"),
+                }],
+            }],
+        };
+        prod_req.encode(&mut prod_buf, 0);
+        let mut prod_frame = BytesMut::new();
+        prod_frame.put_i32(prod_buf.len() as i32);
+        prod_frame.put_slice(&prod_buf);
+        alice_stream.write_all(&prod_frame).await.unwrap();
+        alice_stream.flush().await.unwrap();
+
+        let p_len = alice_stream.read_i32().await.unwrap() as usize;
+        let mut p_buf = vec![0u8; p_len];
+        alice_stream.read_exact(&mut p_buf).await.unwrap();
+        let mut p_bytes = Bytes::from(p_buf);
+        let _ = ResponseHeader::decode(&mut p_bytes).unwrap();
+        let p_resp = ProduceResponse::decode(&mut p_bytes, 0).unwrap();
+        assert_eq!(
+            p_resp.responses[0].partitions[0].error_code,
+            KafkaErrorCode::TopicAuthorizationFailed
+        );
+
+        // 2. Connect Admin over TCP & authenticate
+        let mut admin_stream = TcpStream::connect(addr).await.unwrap();
+        authenticate_plain(&mut admin_stream, "admin", "admin-secret").await;
+
+        // Admin creates ACL granting Alice Write on topic "orders"
+        let create_acls_hdr = RequestHeader::new(ApiKey::CreateAcls, 0, 20, Some("admin"));
+        let mut create_buf = BytesMut::new();
+        create_acls_hdr.encode(&mut create_buf);
+        let create_req = CreateAclsRequest {
+            creations: vec![AclCreation {
+                resource_type: AclResourceType::Topic as i8,
+                resource_name: "orders".to_string(),
+                resource_pattern_type: AclResourcePatternType::Literal as i8,
+                principal: "User:alice".to_string(),
+                host: "*".to_string(),
+                operation: AclOperation::Write as i8,
+                permission_type: AclPermissionType::Allow as i8,
+            }],
+        };
+        create_req.encode(&mut create_buf, 0);
+        let mut create_frame = BytesMut::new();
+        create_frame.put_i32(create_buf.len() as i32);
+        create_frame.put_slice(&create_buf);
+        admin_stream.write_all(&create_frame).await.unwrap();
+        admin_stream.flush().await.unwrap();
+
+        let c_len = admin_stream.read_i32().await.unwrap() as usize;
+        let mut c_buf = vec![0u8; c_len];
+        admin_stream.read_exact(&mut c_buf).await.unwrap();
+        let mut c_bytes = Bytes::from(c_buf);
+        let _ = ResponseHeader::decode(&mut c_bytes).unwrap();
+        let create_resp = CreateAclsResponse::decode(&mut c_bytes, 0).unwrap();
+        assert_eq!(create_resp.results[0].error_code, KafkaErrorCode::None);
+
+        // 3. Alice retries Produce over her existing TCP connection -> succeeds!
+        let mut prod2_buf = BytesMut::new();
+        prod_hdr.encode(&mut prod2_buf);
+        prod_req.encode(&mut prod2_buf, 0);
+        let mut prod2_frame = BytesMut::new();
+        prod2_frame.put_i32(prod2_buf.len() as i32);
+        prod2_frame.put_slice(&prod2_buf);
+        alice_stream.write_all(&prod2_frame).await.unwrap();
+        alice_stream.flush().await.unwrap();
+
+        let p2_len = alice_stream.read_i32().await.unwrap() as usize;
+        let mut p2_buf = vec![0u8; p2_len];
+        alice_stream.read_exact(&mut p2_buf).await.unwrap();
+        let mut p2_bytes = Bytes::from(p2_buf);
+        let _ = ResponseHeader::decode(&mut p2_bytes).unwrap();
+        let p2_resp = ProduceResponse::decode(&mut p2_bytes, 0).unwrap();
+        assert_eq!(
+            p2_resp.responses[0].partitions[0].error_code,
+            KafkaErrorCode::None
+        );
+        assert_eq!(p2_resp.responses[0].partitions[0].base_offset, 0);
+
+        // 4. Alice attempts Fetch from "orders" -> fails with TopicAuthorizationFailed (she has Write, not Read)
+        let fetch_hdr = RequestHeader::new(ApiKey::Fetch, 0, 30, Some("alice"));
+        let mut fetch_buf = BytesMut::new();
+        fetch_hdr.encode(&mut fetch_buf);
+        let fetch_req = FetchRequest {
+            max_wait_ms: 1000,
+            min_bytes: 1,
+            max_bytes: 1024,
+            isolation_level: 0,
+            topics: vec![FetchTopic {
+                topic: "orders".to_string(),
+                partitions: vec![FetchPartition {
+                    partition: 0,
+                    fetch_offset: 0,
+                    partition_max_bytes: 1024,
+                }],
+            }],
+        };
+        fetch_req.encode(&mut fetch_buf, 0);
+        let mut fetch_frame = BytesMut::new();
+        fetch_frame.put_i32(fetch_buf.len() as i32);
+        fetch_frame.put_slice(&fetch_buf);
+        alice_stream.write_all(&fetch_frame).await.unwrap();
+        alice_stream.flush().await.unwrap();
+
+        let f_len = alice_stream.read_i32().await.unwrap() as usize;
+        let mut f_buf = vec![0u8; f_len];
+        alice_stream.read_exact(&mut f_buf).await.unwrap();
+        let mut f_bytes = Bytes::from(f_buf);
+        let _ = ResponseHeader::decode(&mut f_bytes).unwrap();
+        let f_resp = FetchResponse::decode(&mut f_bytes, 0).unwrap();
+        assert_eq!(
+            f_resp.responses[0].partitions[0].error_code,
+            KafkaErrorCode::TopicAuthorizationFailed
+        );
+
+        // 5. Admin creates ACL granting Alice Read on topic "orders"
+        let create_read_hdr = RequestHeader::new(ApiKey::CreateAcls, 0, 31, Some("admin"));
+        let mut cr_buf = BytesMut::new();
+        create_read_hdr.encode(&mut cr_buf);
+        let create_read_req = CreateAclsRequest {
+            creations: vec![AclCreation {
+                resource_type: AclResourceType::Topic as i8,
+                resource_name: "orders".to_string(),
+                resource_pattern_type: AclResourcePatternType::Literal as i8,
+                principal: "User:alice".to_string(),
+                host: "*".to_string(),
+                operation: AclOperation::Read as i8,
+                permission_type: AclPermissionType::Allow as i8,
+            }],
+        };
+        create_read_req.encode(&mut cr_buf, 0);
+        let mut cr_frame = BytesMut::new();
+        cr_frame.put_i32(cr_buf.len() as i32);
+        cr_frame.put_slice(&cr_buf);
+        admin_stream.write_all(&cr_frame).await.unwrap();
+        admin_stream.flush().await.unwrap();
+
+        let cr_len = admin_stream.read_i32().await.unwrap() as usize;
+        let mut cr_buf_resp = vec![0u8; cr_len];
+        admin_stream.read_exact(&mut cr_buf_resp).await.unwrap();
+        let mut cr_bytes = Bytes::from(cr_buf_resp);
+        let _ = ResponseHeader::decode(&mut cr_bytes).unwrap();
+        let cr_resp = CreateAclsResponse::decode(&mut cr_bytes, 0).unwrap();
+        assert_eq!(cr_resp.results[0].error_code, KafkaErrorCode::None);
+
+        // 6. Alice retries Fetch over her connection -> succeeds and receives records!
+        let mut fetch2_buf = BytesMut::new();
+        fetch_hdr.encode(&mut fetch2_buf);
+        fetch_req.encode(&mut fetch2_buf, 0);
+        let mut fetch2_frame = BytesMut::new();
+        fetch2_frame.put_i32(fetch2_buf.len() as i32);
+        fetch2_frame.put_slice(&fetch2_buf);
+        alice_stream.write_all(&fetch2_frame).await.unwrap();
+        alice_stream.flush().await.unwrap();
+
+        let f2_len = alice_stream.read_i32().await.unwrap() as usize;
+        let mut f2_buf = vec![0u8; f2_len];
+        alice_stream.read_exact(&mut f2_buf).await.unwrap();
+        let mut f2_bytes = Bytes::from(f2_buf);
+        let _ = ResponseHeader::decode(&mut f2_bytes).unwrap();
+        let f2_resp = FetchResponse::decode(&mut f2_bytes, 0).unwrap();
+        assert_eq!(
+            f2_resp.responses[0].partitions[0].error_code,
+            KafkaErrorCode::None
+        );
+        assert!(!f2_resp.responses[0].partitions[0].records.is_empty());
+
+        // 7. Admin calls DescribeAcls -> returns Alice's 2 ACLs
+        let desc_hdr = RequestHeader::new(ApiKey::DescribeAcls, 0, 40, Some("admin"));
+        let mut desc_buf = BytesMut::new();
+        desc_hdr.encode(&mut desc_buf);
+        let desc_req = DescribeAclsRequest {
+            resource_type_filter: 1, // Any
+            resource_name_filter: Some("orders".to_string()),
+            resource_pattern_type_filter: 1,
+            principal_filter: None,
+            host_filter: None,
+            operation: 1,
+            permission_type: 1,
+        };
+        desc_req.encode(&mut desc_buf, 0);
+        let mut desc_frame = BytesMut::new();
+        desc_frame.put_i32(desc_buf.len() as i32);
+        desc_frame.put_slice(&desc_buf);
+        admin_stream.write_all(&desc_frame).await.unwrap();
+        admin_stream.flush().await.unwrap();
+
+        let d_len = admin_stream.read_i32().await.unwrap() as usize;
+        let mut d_buf = vec![0u8; d_len];
+        admin_stream.read_exact(&mut d_buf).await.unwrap();
+        let mut d_bytes = Bytes::from(d_buf);
+        let _ = ResponseHeader::decode(&mut d_bytes).unwrap();
+        let desc_resp = DescribeAclsResponse::decode(&mut d_bytes, 0).unwrap();
+        assert_eq!(desc_resp.error_code, KafkaErrorCode::None);
+        assert_eq!(desc_resp.resources.len(), 1);
+        assert_eq!(desc_resp.resources[0].acls.len(), 2);
+
+        // 8. Admin calls DeleteAcls -> removes both ACLs
+        let del_hdr = RequestHeader::new(ApiKey::DeleteAcls, 0, 50, Some("admin"));
+        let mut del_buf = BytesMut::new();
+        del_hdr.encode(&mut del_buf);
+        let del_req = DeleteAclsRequest {
+            filters: vec![DeleteAclsFilter {
+                resource_type_filter: 1,
+                resource_name_filter: Some("orders".to_string()),
+                resource_pattern_type_filter: 1,
+                principal_filter: None,
+                host_filter: None,
+                operation: 1,
+                permission_type: 1,
+            }],
+        };
+        del_req.encode(&mut del_buf, 0);
+        let mut del_frame = BytesMut::new();
+        del_frame.put_i32(del_buf.len() as i32);
+        del_frame.put_slice(&del_buf);
+        admin_stream.write_all(&del_frame).await.unwrap();
+        admin_stream.flush().await.unwrap();
+
+        let del_len = admin_stream.read_i32().await.unwrap() as usize;
+        let mut del_buf_resp = vec![0u8; del_len];
+        admin_stream.read_exact(&mut del_buf_resp).await.unwrap();
+        let mut del_bytes = Bytes::from(del_buf_resp);
+        let _ = ResponseHeader::decode(&mut del_bytes).unwrap();
+        let del_resp = DeleteAclsResponse::decode(&mut del_bytes, 0).unwrap();
+        assert_eq!(del_resp.filter_results[0].error_code, KafkaErrorCode::None);
+        assert_eq!(del_resp.filter_results[0].matching_acls.len(), 2);
+
+        // 9. Alice produces again -> rejected with TopicAuthorizationFailed
+        let mut prod3_buf = BytesMut::new();
+        prod_hdr.encode(&mut prod3_buf);
+        prod_req.encode(&mut prod3_buf, 0);
+        let mut prod3_frame = BytesMut::new();
+        prod3_frame.put_i32(prod3_buf.len() as i32);
+        prod3_frame.put_slice(&prod3_buf);
+        alice_stream.write_all(&prod3_frame).await.unwrap();
+        alice_stream.flush().await.unwrap();
+
+        let p3_len = alice_stream.read_i32().await.unwrap() as usize;
+        let mut p3_buf = vec![0u8; p3_len];
+        alice_stream.read_exact(&mut p3_buf).await.unwrap();
+        let mut p3_bytes = Bytes::from(p3_buf);
+        let _ = ResponseHeader::decode(&mut p3_bytes).unwrap();
+        let p3_resp = ProduceResponse::decode(&mut p3_bytes, 0).unwrap();
+        assert_eq!(
+            p3_resp.responses[0].partitions[0].error_code,
+            KafkaErrorCode::TopicAuthorizationFailed
+        );
     }
 }

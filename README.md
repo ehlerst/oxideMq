@@ -259,6 +259,50 @@ oxidemq start \
 
 ---
 
+## 🛡️ Kafka ACLs & Principal Authorization (RBAC)
+
+oxideMq provides standard Kafka wire-protocol Access Control Lists (ACLs) and Role-Based Access Control (RBAC) executing directly in pure Rust:
+- **Wire APIs Supported**:
+  - `DescribeAcls` (ApiKey 29, v0–v2)
+  - `CreateAcls` (ApiKey 30, v0–v2)
+  - `DeleteAcls` (ApiKey 31, v0–v2)
+- **Standard Kafka CLI Compatibility**: Fully compatible with official `kafka-acls.sh` and Kafka `AdminClient` APIs.
+- **Resource Types Supported**: `Topic`, `Group`, `Cluster`, `TransactionalId`.
+- **Pattern Matching**:
+  - `Literal` (exact name match or wildcard `*`)
+  - `Prefixed` (prefix pattern matching, e.g. `orders-` matches `orders-us-east`, `orders-eu-west`)
+- **Strict Security Semantics**:
+  - **Deny Precedence**: Any explicit `Deny` matching rule immediately overrides any `Allow` rule.
+  - **Super-User Bypass**: Configured super-users (`--super-users "User:admin"`) bypass authorization checks.
+  - **Enforcement Across Wire Protocol**:
+    - `Produce`: requires `Write` on `Topic` (returns `TopicAuthorizationFailed` on denial).
+    - `Fetch`: requires `Read` on `Topic` (returns `TopicAuthorizationFailed` on denial).
+    - `Metadata` & `ListOffsets`: requires `Describe` on `Topic`.
+    - Consumer groups (`OffsetCommit`, `OffsetFetch`, `Heartbeat`, `LeaveGroup`): requires `Read`/`Describe` on `Group` (returns `GroupAuthorizationFailed` on denial).
+    - Transactions (`InitProducerId`, `AddPartitionsToTxn`, `AddOffsetsToTxn`, `EndTxn`): requires `Write` on `TransactionalId` (returns `TransactionalIdAuthorizationFailed` on denial).
+    - ACL management: requires `Alter`/`Describe` on `Cluster:kafka-cluster` (returns `ClusterAuthorizationFailed` on denial).
+
+```bash
+# Start broker with SASL and Kafka ACL enforcement enabled
+oxidemq start \
+  --enable-sasl \
+  --require-sasl \
+  --sasl-users "admin=admin-secret,alice=alice-secret" \
+  --enable-acls \
+  --super-users "User:admin" \
+  --allow-everyone-if-no-acl-found false
+
+# Example using standard kafka-acls.sh CLI tool:
+# Grant User:alice Read and Write access to topic 'orders'
+kafka-acls.sh --bootstrap-server localhost:9092 \
+  --command-config admin.properties \
+  --add --allow-principal User:alice \
+  --operation Read --operation Write \
+  --topic orders
+```
+
+---
+
 ## 🚀 Line-Rate 2.5GbE Network Benchmark (`oxidemq-bench`)
 
 oxideMq includes a dedicated, multi-threaded stress-test tool capable of saturating 2.5GbE network links across hundreds of partitions:

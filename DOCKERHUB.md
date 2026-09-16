@@ -20,6 +20,7 @@
 - **📋 Embedded Confluent Schema Registry**: Native v1 HTTP Schema Registry on port `8081` with Avro, Protobuf, JSON Schema catalog, and magic byte wire validation.
 - **🔒 Wire-Protocol TLS/SSL Encryption**: Hardware-accelerated zero-overhead TLS termination on port `9093` using pure-Rust `tokio-rustls`.
 - **🔐 SASL Wire Authentication**: Standard Kafka SASL support (**PLAIN**, **SCRAM-SHA-256**, **SCRAM-SHA-512**) with strict enforcement over plaintext and TLS.
+- **🛡️ Kafka ACLs & RBAC Authorization**: Wire-level access control (`CreateAcls`, `DescribeAcls`, `DeleteAcls`) supporting Literal & Prefixed patterns, super-user bypass, and Deny precedence.
 - **🚀 Line-Rate 2.5GbE Benchmarking**: Over 1,190,000+ msg/s sustained throughput with sub-millisecond p99 latency across 100 partitions.
 - **🌐 Embedded Dark-Mode Web Console**: Single-binary dashboard served directly at `http://localhost:8082/` with partition visualizer, consumer group monitor, and live chaos injection.
 - **🧪 Testcontainers Native**: Purpose-built for blazing-fast integration testing with Java, Rust, Go, or Python testcontainers.
@@ -139,6 +140,9 @@ services:
 | `OXIDEMQ_REQUIRE_SASL` | `false` | Enforce mandatory authentication; reject unauthenticated clients |
 | `OXIDEMQ_SASL_MECHANISMS` | `PLAIN,SCRAM-SHA-256` | Allowed SASL mechanisms (`PLAIN`, `SCRAM-SHA-256`, `SCRAM-SHA-512`) |
 | `OXIDEMQ_SASL_USERS` | `admin=admin-secret,user=user-secret` | Comma-separated user credentials in `username=password` format |
+| `OXIDEMQ_ENABLE_ACLS` | `false` | Enable Kafka wire protocol ACL principal authorization (RBAC) |
+| `OXIDEMQ_SUPER_USERS` | `User:admin` | Comma-separated super-users bypassing ACL authorization checks |
+| `OXIDEMQ_ALLOW_EVERYONE_IF_NO_ACL_FOUND` | `false` | Default allow behavior when no ACL rules are bound to a resource |
 | `ADMIN_PORT` | `8082` | Port for Admin Web Console & REST API (HTTP) |
 | `OXIDEMQ_STORAGE_ENGINE` | `memory` | Backend engine: `memory`, `file` (WAL), or `s3` (S3Stream) |
 | `OXIDEMQ_WAL_DIR` | `./data/wal` | Local disk directory for Write-Ahead Log segments |

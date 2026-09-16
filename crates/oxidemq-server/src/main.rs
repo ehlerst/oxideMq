@@ -5,6 +5,7 @@ use oxidemq_broker::handler::BrokerEngine;
 use oxidemq_broker::router::ClusterState;
 use oxidemq_broker::sasl::{SaslAuthenticator, SaslMechanism};
 use oxidemq_broker::schema_registry::SchemaRegistry;
+use oxidemq_broker::AclAuthorizer;
 use oxidemq_core::config::OxideConfig;
 use oxidemq_s3stream::block_cache::BlockCache;
 use oxidemq_s3stream::client::{MemoryObjectStorage, ObjectStorage, S3ClientStorage};
@@ -81,6 +82,15 @@ struct Cli {
     )]
     sasl_users: String,
 
+    #[arg(long, default_value_t = false, env = "OXIDEMQ_ENABLE_ACLS", action = clap::ArgAction::Set)]
+    enable_acls: bool,
+
+    #[arg(long, default_value = "User:admin", env = "OXIDEMQ_SUPER_USERS")]
+    super_users: String,
+
+    #[arg(long, default_value_t = false, env = "OXIDEMQ_ALLOW_EVERYONE_IF_NO_ACL_FOUND", action = clap::ArgAction::Set)]
+    allow_everyone_if_no_acl_found: bool,
+
     #[arg(long, default_value = "0.0.0.0")]
     host: String,
 }
@@ -123,6 +133,12 @@ enum Commands {
             env = "OXIDEMQ_SASL_USERS"
         )]
         sasl_users: String,
+        #[arg(long, default_value_t = false, env = "OXIDEMQ_ENABLE_ACLS", action = clap::ArgAction::Set)]
+        enable_acls: bool,
+        #[arg(long, default_value = "User:admin", env = "OXIDEMQ_SUPER_USERS")]
+        super_users: String,
+        #[arg(long, default_value_t = false, env = "OXIDEMQ_ALLOW_EVERYONE_IF_NO_ACL_FOUND", action = clap::ArgAction::Set)]
+        allow_everyone_if_no_acl_found: bool,
         #[arg(long, default_value = "0.0.0.0")]
         host: String,
     },
@@ -172,6 +188,9 @@ struct ServerOptions {
     require_sasl: bool,
     sasl_mechanisms: String,
     sasl_users: String,
+    enable_acls: bool,
+    super_users: String,
+    allow_everyone_if_no_acl_found: bool,
 }
 
 impl From<&Cli> for ServerOptions {
@@ -191,6 +210,9 @@ impl From<&Cli> for ServerOptions {
             require_sasl: cli.require_sasl,
             sasl_mechanisms: cli.sasl_mechanisms.clone(),
             sasl_users: cli.sasl_users.clone(),
+            enable_acls: cli.enable_acls,
+            super_users: cli.super_users.clone(),
+            allow_everyone_if_no_acl_found: cli.allow_everyone_if_no_acl_found,
         }
     }
 }
@@ -253,6 +275,9 @@ async fn run_cli_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             require_sasl,
             sasl_mechanisms,
             sasl_users,
+            enable_acls,
+            super_users,
+            allow_everyone_if_no_acl_found,
             host,
         }) => {
             let opts = ServerOptions {
@@ -270,6 +295,9 @@ async fn run_cli_command(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 require_sasl,
                 sasl_mechanisms,
                 sasl_users,
+                enable_acls,
+                super_users,
+                allow_everyone_if_no_acl_found,
             };
             run_server(opts).await?;
         }
@@ -298,6 +326,9 @@ async fn run_server(opts: ServerOptions) -> Result<(), Box<dyn std::error::Error
         require_sasl,
         sasl_mechanisms,
         sasl_users,
+        enable_acls,
+        super_users,
+        allow_everyone_if_no_acl_found,
     } = opts;
 
     let config = OxideConfig::default();
@@ -382,11 +413,35 @@ async fn run_server(opts: ServerOptions) -> Result<(), Box<dyn std::error::Error
         );
     }
 
+    let mut super_user_set = std::collections::HashSet::new();
+    for u in super_users.split(',') {
+        let trimmed = u.trim();
+        if !trimmed.is_empty() {
+            super_user_set.insert(trimmed.to_string());
+        }
+    }
+    if super_user_set.is_empty() {
+        super_user_set.insert("User:admin".to_string());
+    }
+
+    let authorizer = Arc::new(AclAuthorizer::new(
+        enable_acls,
+        super_user_set,
+        allow_everyone_if_no_acl_found,
+    ));
+    if enable_acls {
+        info!(
+            "Kafka ACL Authorization active: super_users={:?}, allow_everyone_if_no_acl_found={}",
+            super_users, allow_everyone_if_no_acl_found
+        );
+    }
+
     let broker_engine = Arc::new(
         BrokerEngine::new(Arc::clone(&cluster_state), Arc::clone(&coordinator))
             .with_chaos(Arc::clone(&chaos))
             .with_schema_registry(Arc::clone(&schema_registry))
             .with_authenticator(authenticator)
+            .with_authorizer(authorizer)
             .with_schema_validation(enable_schema_validation),
     );
 
@@ -745,6 +800,9 @@ mod tests {
             require_sasl: false,
             sasl_mechanisms: "PLAIN,SCRAM-SHA-256".into(),
             sasl_users: "admin=admin-secret".into(),
+            enable_acls: false,
+            super_users: "User:admin".into(),
+            allow_everyone_if_no_acl_found: false,
             host: "127.0.0.1".into(),
         };
         assert!(run_cli_command(cli_status).await.is_ok());
@@ -766,6 +824,9 @@ mod tests {
             require_sasl: false,
             sasl_mechanisms: "PLAIN,SCRAM-SHA-256".into(),
             sasl_users: "admin=admin-secret".into(),
+            enable_acls: false,
+            super_users: "User:admin".into(),
+            allow_everyone_if_no_acl_found: false,
             host: "127.0.0.1".into(),
         };
         assert!(run_cli_command(cli_dump).await.is_ok());
@@ -791,6 +852,9 @@ mod tests {
                 require_sasl: false,
                 sasl_mechanisms: "PLAIN,SCRAM-SHA-256".into(),
                 sasl_users: "admin=admin-secret".into(),
+                enable_acls: false,
+                super_users: "User:admin".into(),
+                allow_everyone_if_no_acl_found: false,
                 host: "127.0.0.1".into(),
             };
             assert!(run_cli_command(cli_chaos).await.is_ok());

@@ -13,22 +13,24 @@ pub use error_code::KafkaErrorCode;
 pub use header::{RequestHeader, ResponseHeader};
 pub use messages::{
     compress_record_batch, decompress_record_batch, encode_control_batch, encode_record_batch_v2,
-    parse_record_batch_records, AddOffsetsToTxnRequest, AddOffsetsToTxnResponse,
-    AddPartitionsToTxnPartitionResult, AddPartitionsToTxnRequest, AddPartitionsToTxnResponse,
-    AddPartitionsToTxnTopic, AddPartitionsToTxnTopicResult, ApiVersionKey, ApiVersionsRequest,
-    ApiVersionsResponse, BrokerMetadata, EndTxnRequest, EndTxnResponse, FetchPartition,
-    FetchPartitionResponse, FetchRequest, FetchResponse, FetchTopic, FetchTopicResponse,
-    FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
-    InitProducerIdRequest, InitProducerIdResponse, LeaveGroupRequest, LeaveGroupResponse,
-    ListOffsetsPartition, ListOffsetsPartitionResponse, ListOffsetsRequest, ListOffsetsResponse,
-    ListOffsetsTopic, ListOffsetsTopicResponse, MetadataRequest, MetadataResponse,
-    OffsetCommitPartition, OffsetCommitPartitionResponse, OffsetCommitRequest,
-    OffsetCommitResponse, OffsetCommitTopic, OffsetCommitTopicResponse,
-    OffsetFetchPartitionResponse, OffsetFetchRequest, OffsetFetchResponse, OffsetFetchTopic,
-    OffsetFetchTopicResponse, PartitionMetadata, PartitionProduceData, PartitionProduceResponse,
-    ProduceRequest, ProduceResponse, SaslAuthenticateRequest, SaslAuthenticateResponse,
-    SaslHandshakeRequest, SaslHandshakeResponse, TopicMetadata, TopicProduceData,
-    TopicProduceResponse,
+    parse_record_batch_records, AclCreation, AclCreationResult, AclDescription, AclOperation,
+    AclPermissionType, AclResourcePatternType, AclResourceType, AddOffsetsToTxnRequest,
+    AddOffsetsToTxnResponse, AddPartitionsToTxnPartitionResult, AddPartitionsToTxnRequest,
+    AddPartitionsToTxnResponse, AddPartitionsToTxnTopic, AddPartitionsToTxnTopicResult,
+    ApiVersionKey, ApiVersionsRequest, ApiVersionsResponse, BrokerMetadata, CreateAclsRequest,
+    CreateAclsResponse, DeleteAclsFilter, DeleteAclsFilterResult, DeleteAclsMatchingAcl,
+    DeleteAclsRequest, DeleteAclsResponse, DescribeAclsRequest, DescribeAclsResource,
+    DescribeAclsResponse, EndTxnRequest, EndTxnResponse, FetchPartition, FetchPartitionResponse,
+    FetchRequest, FetchResponse, FetchTopic, FetchTopicResponse, FindCoordinatorRequest,
+    FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse, InitProducerIdRequest,
+    InitProducerIdResponse, LeaveGroupRequest, LeaveGroupResponse, ListOffsetsPartition,
+    ListOffsetsPartitionResponse, ListOffsetsRequest, ListOffsetsResponse, ListOffsetsTopic,
+    ListOffsetsTopicResponse, MetadataRequest, MetadataResponse, OffsetCommitPartition,
+    OffsetCommitPartitionResponse, OffsetCommitRequest, OffsetCommitResponse, OffsetCommitTopic,
+    OffsetCommitTopicResponse, OffsetFetchPartitionResponse, OffsetFetchRequest,
+    OffsetFetchResponse, OffsetFetchTopic, OffsetFetchTopicResponse, PartitionMetadata,
+    PartitionProduceData, PartitionProduceResponse, ProduceRequest, ProduceResponse,
+    SaslAuthenticateRequest, SaslAuthenticateResponse, TopicProduceData, TopicProduceResponse,
 };
 
 pub use parser::{KafkaDecoder, KafkaEncoder};
@@ -56,6 +58,9 @@ pub enum ApiKey {
     AddPartitionsToTxn = 24,
     AddOffsetsToTxn = 25,
     EndTxn = 26,
+    DescribeAcls = 29,
+    CreateAcls = 30,
+    DeleteAcls = 31,
     SaslAuthenticate = 36,
 }
 
@@ -81,6 +86,9 @@ impl ApiKey {
             24 => Some(Self::AddPartitionsToTxn),
             25 => Some(Self::AddOffsetsToTxn),
             26 => Some(Self::EndTxn),
+            29 => Some(Self::DescribeAcls),
+            30 => Some(Self::CreateAcls),
+            31 => Some(Self::DeleteAcls),
             36 => Some(Self::SaslAuthenticate),
             _ => None,
         }
@@ -112,6 +120,9 @@ mod tests {
         assert_eq!(ApiKey::from_i16(24), Some(ApiKey::AddPartitionsToTxn));
         assert_eq!(ApiKey::from_i16(25), Some(ApiKey::AddOffsetsToTxn));
         assert_eq!(ApiKey::from_i16(26), Some(ApiKey::EndTxn));
+        assert_eq!(ApiKey::from_i16(29), Some(ApiKey::DescribeAcls));
+        assert_eq!(ApiKey::from_i16(30), Some(ApiKey::CreateAcls));
+        assert_eq!(ApiKey::from_i16(31), Some(ApiKey::DeleteAcls));
         assert_eq!(ApiKey::from_i16(36), Some(ApiKey::SaslAuthenticate));
         assert_eq!(ApiKey::from_i16(99), None);
     }

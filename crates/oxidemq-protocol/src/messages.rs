@@ -155,6 +155,21 @@ impl ApiVersionsResponse {
                 max_version: 3,
             }, // EndTxn
             ApiVersionKey {
+                api_key: 29,
+                min_version: 0,
+                max_version: 2,
+            }, // DescribeAcls
+            ApiVersionKey {
+                api_key: 30,
+                min_version: 0,
+                max_version: 2,
+            }, // CreateAcls
+            ApiVersionKey {
+                api_key: 31,
+                min_version: 0,
+                max_version: 2,
+            }, // DeleteAcls
+            ApiVersionKey {
                 api_key: 36,
                 min_version: 0,
                 max_version: 2,
@@ -2303,6 +2318,967 @@ impl SaslAuthenticateResponse {
     }
 }
 
+// ============================================================================
+// ACL Definitions & Codecs (ApiKeys 29 DescribeAcls, 30 CreateAcls, 31 DeleteAcls)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(i8)]
+pub enum AclResourceType {
+    #[default]
+    Unknown = 0,
+    Any = 1,
+    Topic = 2,
+    Group = 3,
+    Cluster = 4,
+    TransactionalId = 5,
+    DelegationToken = 6,
+    User = 7,
+}
+
+impl AclResourceType {
+    pub fn from_i8(val: i8) -> Self {
+        match val {
+            1 => Self::Any,
+            2 => Self::Topic,
+            3 => Self::Group,
+            4 => Self::Cluster,
+            5 => Self::TransactionalId,
+            6 => Self::DelegationToken,
+            7 => Self::User,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(i8)]
+pub enum AclResourcePatternType {
+    #[default]
+    Unknown = 0,
+    Any = 1,
+    Match = 2,
+    Literal = 3,
+    Prefixed = 4,
+}
+
+impl AclResourcePatternType {
+    pub fn from_i8(val: i8) -> Self {
+        match val {
+            1 => Self::Any,
+            2 => Self::Match,
+            3 => Self::Literal,
+            4 => Self::Prefixed,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(i8)]
+pub enum AclOperation {
+    #[default]
+    Unknown = 0,
+    Any = 1,
+    All = 2,
+    Read = 3,
+    Write = 4,
+    Create = 5,
+    Delete = 6,
+    Alter = 7,
+    Describe = 8,
+    ClusterAction = 9,
+    DescribeConfigs = 10,
+    AlterConfigs = 11,
+    IdempotentWrite = 12,
+}
+
+impl AclOperation {
+    pub fn from_i8(val: i8) -> Self {
+        match val {
+            1 => Self::Any,
+            2 => Self::All,
+            3 => Self::Read,
+            4 => Self::Write,
+            5 => Self::Create,
+            6 => Self::Delete,
+            7 => Self::Alter,
+            8 => Self::Describe,
+            9 => Self::ClusterAction,
+            10 => Self::DescribeConfigs,
+            11 => Self::AlterConfigs,
+            12 => Self::IdempotentWrite,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(i8)]
+pub enum AclPermissionType {
+    #[default]
+    Unknown = 0,
+    Any = 1,
+    Deny = 2,
+    Allow = 3,
+}
+
+impl AclPermissionType {
+    pub fn from_i8(val: i8) -> Self {
+        match val {
+            1 => Self::Any,
+            2 => Self::Deny,
+            3 => Self::Allow,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclCreation {
+    pub resource_type: i8,
+    pub resource_name: String,
+    pub resource_pattern_type: i8,
+    pub principal: String,
+    pub host: String,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclCreationResult {
+    pub error_code: KafkaErrorCode,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateAclsRequest {
+    pub creations: Vec<AclCreation>,
+}
+
+impl CreateAclsRequest {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let count = if version >= 2 {
+            (KafkaDecoder::read_unsigned_varint(src)? as usize).saturating_sub(1)
+        } else {
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol(
+                    "Truncated CreateAclsRequest count".into(),
+                ));
+            }
+            src.get_i32() as usize
+        };
+
+        let mut creations = Vec::with_capacity(count);
+        for _ in 0..count {
+            if src.is_empty() {
+                return Err(OxideMqError::Protocol(
+                    "Truncated AclCreation resource_type".into(),
+                ));
+            }
+            let resource_type = src.get_i8();
+            let resource_name = if version >= 2 {
+                KafkaDecoder::read_compact_string(src)?.unwrap_or_default()
+            } else {
+                KafkaDecoder::read_string(src)?.unwrap_or_default()
+            };
+            let resource_pattern_type = if version >= 1 {
+                if src.is_empty() {
+                    return Err(OxideMqError::Protocol(
+                        "Truncated resource_pattern_type".into(),
+                    ));
+                }
+                src.get_i8()
+            } else {
+                3 // Literal
+            };
+            let principal = if version >= 2 {
+                KafkaDecoder::read_compact_string(src)?.unwrap_or_default()
+            } else {
+                KafkaDecoder::read_string(src)?.unwrap_or_default()
+            };
+            let host = if version >= 2 {
+                KafkaDecoder::read_compact_string(src)?.unwrap_or_default()
+            } else {
+                KafkaDecoder::read_string(src)?.unwrap_or_default()
+            };
+            if src.len() < 2 {
+                return Err(OxideMqError::Protocol(
+                    "Truncated operation / permission_type".into(),
+                ));
+            }
+            let operation = src.get_i8();
+            let permission_type = src.get_i8();
+
+            if version >= 2 && src.has_remaining() {
+                let _tagged = KafkaDecoder::read_unsigned_varint(src)?;
+            }
+
+            creations.push(AclCreation {
+                resource_type,
+                resource_name,
+                resource_pattern_type,
+                principal,
+                host,
+                operation,
+                permission_type,
+            });
+        }
+
+        if version >= 2 && src.has_remaining() {
+            let _tagged = KafkaDecoder::read_unsigned_varint(src)?;
+        }
+
+        Ok(Self { creations })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        if version >= 2 {
+            KafkaEncoder::write_unsigned_varint(dst, (self.creations.len() + 1) as u64);
+        } else {
+            dst.put_i32(self.creations.len() as i32);
+        }
+
+        for c in &self.creations {
+            dst.put_i8(c.resource_type);
+            if version >= 2 {
+                KafkaEncoder::write_compact_string(dst, Some(&c.resource_name));
+            } else {
+                KafkaEncoder::write_string(dst, Some(&c.resource_name));
+            }
+            if version >= 1 {
+                dst.put_i8(c.resource_pattern_type);
+            }
+            if version >= 2 {
+                KafkaEncoder::write_compact_string(dst, Some(&c.principal));
+                KafkaEncoder::write_compact_string(dst, Some(&c.host));
+            } else {
+                KafkaEncoder::write_string(dst, Some(&c.principal));
+                KafkaEncoder::write_string(dst, Some(&c.host));
+            }
+            dst.put_i8(c.operation);
+            dst.put_i8(c.permission_type);
+            if version >= 2 {
+                KafkaEncoder::write_unsigned_varint(dst, 0); // tagged fields
+            }
+        }
+
+        if version >= 2 {
+            KafkaEncoder::write_unsigned_varint(dst, 0); // tagged fields
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateAclsResponse {
+    pub throttle_time_ms: i32,
+    pub results: Vec<AclCreationResult>,
+}
+
+impl CreateAclsResponse {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let throttle_time_ms = if version >= 1 {
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol("Truncated throttle_time_ms".into()));
+            }
+            src.get_i32()
+        } else {
+            0
+        };
+
+        let count = if version >= 2 {
+            (KafkaDecoder::read_unsigned_varint(src)? as usize).saturating_sub(1)
+        } else {
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol("Truncated results count".into()));
+            }
+            src.get_i32() as usize
+        };
+
+        let mut results = Vec::with_capacity(count);
+        for _ in 0..count {
+            if src.len() < 2 {
+                return Err(OxideMqError::Protocol("Truncated error_code".into()));
+            }
+            let error_code = KafkaErrorCode::from_i16(src.get_i16());
+            let error_message = if version >= 2 {
+                KafkaDecoder::read_compact_string(src)?
+            } else {
+                KafkaDecoder::read_string(src)?
+            };
+            if version >= 2 && src.has_remaining() {
+                let _tagged = KafkaDecoder::read_unsigned_varint(src)?;
+            }
+            results.push(AclCreationResult {
+                error_code,
+                error_message,
+            });
+        }
+
+        if version >= 2 && src.has_remaining() {
+            let _tagged = KafkaDecoder::read_unsigned_varint(src)?;
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            results,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        if version >= 1 {
+            dst.put_i32(self.throttle_time_ms);
+        }
+
+        if version >= 2 {
+            KafkaEncoder::write_unsigned_varint(dst, (self.results.len() + 1) as u64);
+        } else {
+            dst.put_i32(self.results.len() as i32);
+        }
+
+        for r in &self.results {
+            dst.put_i16(r.error_code.code());
+            if version >= 2 {
+                KafkaEncoder::write_compact_string(dst, r.error_message.as_deref());
+                KafkaEncoder::write_unsigned_varint(dst, 0);
+            } else {
+                KafkaEncoder::write_string(dst, r.error_message.as_deref());
+            }
+        }
+
+        if version >= 2 {
+            KafkaEncoder::write_unsigned_varint(dst, 0);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribeAclsRequest {
+    pub resource_type_filter: i8,
+    pub resource_name_filter: Option<String>,
+    pub resource_pattern_type_filter: i8,
+    pub principal_filter: Option<String>,
+    pub host_filter: Option<String>,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+impl DescribeAclsRequest {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        if src.is_empty() {
+            return Err(OxideMqError::Protocol(
+                "Truncated DescribeAclsRequest resource_type".into(),
+            ));
+        }
+        let resource_type_filter = src.get_i8();
+        let resource_name_filter = if version >= 2 {
+            KafkaDecoder::read_compact_string(src)?
+        } else {
+            KafkaDecoder::read_string(src)?
+        };
+        let resource_pattern_type_filter = if version >= 1 {
+            if src.is_empty() {
+                return Err(OxideMqError::Protocol(
+                    "Truncated resource_pattern_type_filter".into(),
+                ));
+            }
+            src.get_i8()
+        } else {
+            1 // Any
+        };
+        let principal_filter = if version >= 2 {
+            KafkaDecoder::read_compact_string(src)?
+        } else {
+            KafkaDecoder::read_string(src)?
+        };
+        let host_filter = if version >= 2 {
+            KafkaDecoder::read_compact_string(src)?
+        } else {
+            KafkaDecoder::read_string(src)?
+        };
+        if src.len() < 2 {
+            return Err(OxideMqError::Protocol(
+                "Truncated operation / permission_type".into(),
+            ));
+        }
+        let operation = src.get_i8();
+        let permission_type = src.get_i8();
+
+        if version >= 2 && src.has_remaining() {
+            let _tagged = KafkaDecoder::read_unsigned_varint(src)?;
+        }
+
+        Ok(Self {
+            resource_type_filter,
+            resource_name_filter,
+            resource_pattern_type_filter,
+            principal_filter,
+            host_filter,
+            operation,
+            permission_type,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        dst.put_i8(self.resource_type_filter);
+        if version >= 2 {
+            KafkaEncoder::write_compact_string(dst, self.resource_name_filter.as_deref());
+        } else {
+            KafkaEncoder::write_string(dst, self.resource_name_filter.as_deref());
+        }
+        if version >= 1 {
+            dst.put_i8(self.resource_pattern_type_filter);
+        }
+        if version >= 2 {
+            KafkaEncoder::write_compact_string(dst, self.principal_filter.as_deref());
+            KafkaEncoder::write_compact_string(dst, self.host_filter.as_deref());
+        } else {
+            KafkaEncoder::write_string(dst, self.principal_filter.as_deref());
+            KafkaEncoder::write_string(dst, self.host_filter.as_deref());
+        }
+        dst.put_i8(self.operation);
+        dst.put_i8(self.permission_type);
+        if version >= 2 {
+            KafkaEncoder::write_unsigned_varint(dst, 0); // tagged fields
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AclDescription {
+    pub principal: String,
+    pub host: String,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribeAclsResource {
+    pub resource_type: i8,
+    pub resource_name: String,
+    pub resource_pattern_type: i8,
+    pub acls: Vec<AclDescription>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribeAclsResponse {
+    pub throttle_time_ms: i32,
+    pub error_code: KafkaErrorCode,
+    pub error_message: Option<String>,
+    pub resources: Vec<DescribeAclsResource>,
+}
+
+impl DescribeAclsResponse {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        if src.len() < 6 {
+            return Err(OxideMqError::Protocol(
+                "Truncated DescribeAclsResponse header".into(),
+            ));
+        }
+        let throttle_time_ms = src.get_i32();
+        let error_code = KafkaErrorCode::from_i16(src.get_i16());
+        let error_message = if version >= 2 {
+            KafkaDecoder::read_compact_string(src)?
+        } else {
+            KafkaDecoder::read_string(src)?
+        };
+
+        let res_count = if version >= 2 {
+            (KafkaDecoder::read_unsigned_varint(src)? as usize).saturating_sub(1)
+        } else {
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol("Truncated resources count".into()));
+            }
+            src.get_i32() as usize
+        };
+
+        let mut resources = Vec::with_capacity(res_count);
+        for _ in 0..res_count {
+            if src.is_empty() {
+                return Err(OxideMqError::Protocol("Truncated resource_type".into()));
+            }
+            let resource_type = src.get_i8();
+            let resource_name = if version >= 2 {
+                KafkaDecoder::read_compact_string(src)?.unwrap_or_default()
+            } else {
+                KafkaDecoder::read_string(src)?.unwrap_or_default()
+            };
+            let resource_pattern_type = if version >= 1 {
+                if src.is_empty() {
+                    return Err(OxideMqError::Protocol("Truncated pattern_type".into()));
+                }
+                src.get_i8()
+            } else {
+                3 // Literal
+            };
+
+            let acl_count = if version >= 2 {
+                (KafkaDecoder::read_unsigned_varint(src)? as usize).saturating_sub(1)
+            } else {
+                if src.len() < 4 {
+                    return Err(OxideMqError::Protocol("Truncated acls count".into()));
+                }
+                src.get_i32() as usize
+            };
+
+            let mut acls = Vec::with_capacity(acl_count);
+            for _ in 0..acl_count {
+                let principal = if version >= 2 {
+                    KafkaDecoder::read_compact_string(src)?.unwrap_or_default()
+                } else {
+                    KafkaDecoder::read_string(src)?.unwrap_or_default()
+                };
+                let host = if version >= 2 {
+                    KafkaDecoder::read_compact_string(src)?.unwrap_or_default()
+                } else {
+                    KafkaDecoder::read_string(src)?.unwrap_or_default()
+                };
+                if src.len() < 2 {
+                    return Err(OxideMqError::Protocol(
+                        "Truncated acl operation/permission".into(),
+                    ));
+                }
+                let operation = src.get_i8();
+                let permission_type = src.get_i8();
+
+                if version >= 2 && src.has_remaining() {
+                    let _tagged = KafkaDecoder::read_unsigned_varint(src)?;
+                }
+
+                acls.push(AclDescription {
+                    principal,
+                    host,
+                    operation,
+                    permission_type,
+                });
+            }
+
+            if version >= 2 && src.has_remaining() {
+                let _tagged = KafkaDecoder::read_unsigned_varint(src)?;
+            }
+
+            resources.push(DescribeAclsResource {
+                resource_type,
+                resource_name,
+                resource_pattern_type,
+                acls,
+            });
+        }
+
+        if version >= 2 && src.has_remaining() {
+            let _tagged = KafkaDecoder::read_unsigned_varint(src)?;
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            error_message,
+            resources,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        dst.put_i32(self.throttle_time_ms);
+        dst.put_i16(self.error_code.code());
+        if version >= 2 {
+            KafkaEncoder::write_compact_string(dst, self.error_message.as_deref());
+            KafkaEncoder::write_unsigned_varint(dst, (self.resources.len() + 1) as u64);
+        } else {
+            KafkaEncoder::write_string(dst, self.error_message.as_deref());
+            dst.put_i32(self.resources.len() as i32);
+        }
+
+        for res in &self.resources {
+            dst.put_i8(res.resource_type);
+            if version >= 2 {
+                KafkaEncoder::write_compact_string(dst, Some(&res.resource_name));
+            } else {
+                KafkaEncoder::write_string(dst, Some(&res.resource_name));
+            }
+            if version >= 1 {
+                dst.put_i8(res.resource_pattern_type);
+            }
+
+            if version >= 2 {
+                KafkaEncoder::write_unsigned_varint(dst, (res.acls.len() + 1) as u64);
+            } else {
+                dst.put_i32(res.acls.len() as i32);
+            }
+
+            for acl in &res.acls {
+                if version >= 2 {
+                    KafkaEncoder::write_compact_string(dst, Some(&acl.principal));
+                    KafkaEncoder::write_compact_string(dst, Some(&acl.host));
+                } else {
+                    KafkaEncoder::write_string(dst, Some(&acl.principal));
+                    KafkaEncoder::write_string(dst, Some(&acl.host));
+                }
+                dst.put_i8(acl.operation);
+                dst.put_i8(acl.permission_type);
+                if version >= 2 {
+                    KafkaEncoder::write_unsigned_varint(dst, 0); // tagged
+                }
+            }
+
+            if version >= 2 {
+                KafkaEncoder::write_unsigned_varint(dst, 0); // tagged
+            }
+        }
+
+        if version >= 2 {
+            KafkaEncoder::write_unsigned_varint(dst, 0); // tagged
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteAclsFilter {
+    pub resource_type_filter: i8,
+    pub resource_name_filter: Option<String>,
+    pub resource_pattern_type_filter: i8,
+    pub principal_filter: Option<String>,
+    pub host_filter: Option<String>,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteAclsMatchingAcl {
+    pub error_code: KafkaErrorCode,
+    pub error_message: Option<String>,
+    pub resource_type: i8,
+    pub resource_name: String,
+    pub resource_pattern_type: i8,
+    pub principal: String,
+    pub host: String,
+    pub operation: i8,
+    pub permission_type: i8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteAclsFilterResult {
+    pub error_code: KafkaErrorCode,
+    pub error_message: Option<String>,
+    pub matching_acls: Vec<DeleteAclsMatchingAcl>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteAclsRequest {
+    pub filters: Vec<DeleteAclsFilter>,
+}
+
+impl DeleteAclsRequest {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let count = if version >= 2 {
+            (KafkaDecoder::read_unsigned_varint(src)? as usize).saturating_sub(1)
+        } else {
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol(
+                    "Truncated DeleteAclsRequest filters count".into(),
+                ));
+            }
+            src.get_i32() as usize
+        };
+
+        let mut filters = Vec::with_capacity(count);
+        for _ in 0..count {
+            if src.is_empty() {
+                return Err(OxideMqError::Protocol(
+                    "Truncated filter resource_type".into(),
+                ));
+            }
+            let resource_type_filter = src.get_i8();
+            let resource_name_filter = if version >= 2 {
+                KafkaDecoder::read_compact_string(src)?
+            } else {
+                KafkaDecoder::read_string(src)?
+            };
+            let resource_pattern_type_filter = if version >= 1 {
+                if src.is_empty() {
+                    return Err(OxideMqError::Protocol(
+                        "Truncated resource_pattern_type_filter".into(),
+                    ));
+                }
+                src.get_i8()
+            } else {
+                1 // Any
+            };
+            let principal_filter = if version >= 2 {
+                KafkaDecoder::read_compact_string(src)?
+            } else {
+                KafkaDecoder::read_string(src)?
+            };
+            let host_filter = if version >= 2 {
+                KafkaDecoder::read_compact_string(src)?
+            } else {
+                KafkaDecoder::read_string(src)?
+            };
+            if src.len() < 2 {
+                return Err(OxideMqError::Protocol(
+                    "Truncated filter operation/permission".into(),
+                ));
+            }
+            let operation = src.get_i8();
+            let permission_type = src.get_i8();
+
+            if version >= 2 && src.has_remaining() {
+                let _tagged = KafkaDecoder::read_unsigned_varint(src)?;
+            }
+
+            filters.push(DeleteAclsFilter {
+                resource_type_filter,
+                resource_name_filter,
+                resource_pattern_type_filter,
+                principal_filter,
+                host_filter,
+                operation,
+                permission_type,
+            });
+        }
+
+        if version >= 2 && src.has_remaining() {
+            let _tagged = KafkaDecoder::read_unsigned_varint(src)?;
+        }
+
+        Ok(Self { filters })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        if version >= 2 {
+            KafkaEncoder::write_unsigned_varint(dst, (self.filters.len() + 1) as u64);
+        } else {
+            dst.put_i32(self.filters.len() as i32);
+        }
+
+        for f in &self.filters {
+            dst.put_i8(f.resource_type_filter);
+            if version >= 2 {
+                KafkaEncoder::write_compact_string(dst, f.resource_name_filter.as_deref());
+            } else {
+                KafkaEncoder::write_string(dst, f.resource_name_filter.as_deref());
+            }
+            if version >= 1 {
+                dst.put_i8(f.resource_pattern_type_filter);
+            }
+            if version >= 2 {
+                KafkaEncoder::write_compact_string(dst, f.principal_filter.as_deref());
+                KafkaEncoder::write_compact_string(dst, f.host_filter.as_deref());
+            } else {
+                KafkaEncoder::write_string(dst, f.principal_filter.as_deref());
+                KafkaEncoder::write_string(dst, f.host_filter.as_deref());
+            }
+            dst.put_i8(f.operation);
+            dst.put_i8(f.permission_type);
+            if version >= 2 {
+                KafkaEncoder::write_unsigned_varint(dst, 0); // tagged
+            }
+        }
+
+        if version >= 2 {
+            KafkaEncoder::write_unsigned_varint(dst, 0); // tagged
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteAclsResponse {
+    pub throttle_time_ms: i32,
+    pub filter_results: Vec<DeleteAclsFilterResult>,
+}
+
+impl DeleteAclsResponse {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol(
+                "Truncated DeleteAclsResponse throttle_time_ms".into(),
+            ));
+        }
+        let throttle_time_ms = src.get_i32();
+
+        let count = if version >= 2 {
+            (KafkaDecoder::read_unsigned_varint(src)? as usize).saturating_sub(1)
+        } else {
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol(
+                    "Truncated filter_results count".into(),
+                ));
+            }
+            src.get_i32() as usize
+        };
+
+        let mut filter_results = Vec::with_capacity(count);
+        for _ in 0..count {
+            if src.len() < 2 {
+                return Err(OxideMqError::Protocol(
+                    "Truncated filter_result error_code".into(),
+                ));
+            }
+            let error_code = KafkaErrorCode::from_i16(src.get_i16());
+            let error_message = if version >= 2 {
+                KafkaDecoder::read_compact_string(src)?
+            } else {
+                KafkaDecoder::read_string(src)?
+            };
+
+            let match_count = if version >= 2 {
+                (KafkaDecoder::read_unsigned_varint(src)? as usize).saturating_sub(1)
+            } else {
+                if src.len() < 4 {
+                    return Err(OxideMqError::Protocol(
+                        "Truncated matching_acls count".into(),
+                    ));
+                }
+                src.get_i32() as usize
+            };
+
+            let mut matching_acls = Vec::with_capacity(match_count);
+            for _ in 0..match_count {
+                if src.len() < 2 {
+                    return Err(OxideMqError::Protocol(
+                        "Truncated matching_acl error_code".into(),
+                    ));
+                }
+                let m_error_code = KafkaErrorCode::from_i16(src.get_i16());
+                let m_error_message = if version >= 2 {
+                    KafkaDecoder::read_compact_string(src)?
+                } else {
+                    KafkaDecoder::read_string(src)?
+                };
+                if src.is_empty() {
+                    return Err(OxideMqError::Protocol(
+                        "Truncated matching_acl resource_type".into(),
+                    ));
+                }
+                let resource_type = src.get_i8();
+                let resource_name = if version >= 2 {
+                    KafkaDecoder::read_compact_string(src)?.unwrap_or_default()
+                } else {
+                    KafkaDecoder::read_string(src)?.unwrap_or_default()
+                };
+                let resource_pattern_type = if version >= 1 {
+                    if src.is_empty() {
+                        return Err(OxideMqError::Protocol("Truncated pattern_type".into()));
+                    }
+                    src.get_i8()
+                } else {
+                    3 // Literal
+                };
+                let principal = if version >= 2 {
+                    KafkaDecoder::read_compact_string(src)?.unwrap_or_default()
+                } else {
+                    KafkaDecoder::read_string(src)?.unwrap_or_default()
+                };
+                let host = if version >= 2 {
+                    KafkaDecoder::read_compact_string(src)?.unwrap_or_default()
+                } else {
+                    KafkaDecoder::read_string(src)?.unwrap_or_default()
+                };
+                if src.len() < 2 {
+                    return Err(OxideMqError::Protocol(
+                        "Truncated matching_acl operation/permission".into(),
+                    ));
+                }
+                let operation = src.get_i8();
+                let permission_type = src.get_i8();
+
+                if version >= 2 && src.has_remaining() {
+                    let _tagged = KafkaDecoder::read_unsigned_varint(src)?;
+                }
+
+                matching_acls.push(DeleteAclsMatchingAcl {
+                    error_code: m_error_code,
+                    error_message: m_error_message,
+                    resource_type,
+                    resource_name,
+                    resource_pattern_type,
+                    principal,
+                    host,
+                    operation,
+                    permission_type,
+                });
+            }
+
+            if version >= 2 && src.has_remaining() {
+                let _tagged = KafkaDecoder::read_unsigned_varint(src)?;
+            }
+
+            filter_results.push(DeleteAclsFilterResult {
+                error_code,
+                error_message,
+                matching_acls,
+            });
+        }
+
+        if version >= 2 && src.has_remaining() {
+            let _tagged = KafkaDecoder::read_unsigned_varint(src)?;
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            filter_results,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        dst.put_i32(self.throttle_time_ms);
+        if version >= 2 {
+            KafkaEncoder::write_unsigned_varint(dst, (self.filter_results.len() + 1) as u64);
+        } else {
+            dst.put_i32(self.filter_results.len() as i32);
+        }
+
+        for fr in &self.filter_results {
+            dst.put_i16(fr.error_code.code());
+            if version >= 2 {
+                KafkaEncoder::write_compact_string(dst, fr.error_message.as_deref());
+                KafkaEncoder::write_unsigned_varint(dst, (fr.matching_acls.len() + 1) as u64);
+            } else {
+                KafkaEncoder::write_string(dst, fr.error_message.as_deref());
+                dst.put_i32(fr.matching_acls.len() as i32);
+            }
+
+            for ma in &fr.matching_acls {
+                dst.put_i16(ma.error_code.code());
+                if version >= 2 {
+                    KafkaEncoder::write_compact_string(dst, ma.error_message.as_deref());
+                } else {
+                    KafkaEncoder::write_string(dst, ma.error_message.as_deref());
+                }
+                dst.put_i8(ma.resource_type);
+                if version >= 2 {
+                    KafkaEncoder::write_compact_string(dst, Some(&ma.resource_name));
+                } else {
+                    KafkaEncoder::write_string(dst, Some(&ma.resource_name));
+                }
+                if version >= 1 {
+                    dst.put_i8(ma.resource_pattern_type);
+                }
+                if version >= 2 {
+                    KafkaEncoder::write_compact_string(dst, Some(&ma.principal));
+                    KafkaEncoder::write_compact_string(dst, Some(&ma.host));
+                } else {
+                    KafkaEncoder::write_string(dst, Some(&ma.principal));
+                    KafkaEncoder::write_string(dst, Some(&ma.host));
+                }
+                dst.put_i8(ma.operation);
+                dst.put_i8(ma.permission_type);
+
+                if version >= 2 {
+                    KafkaEncoder::write_unsigned_varint(dst, 0); // tagged
+                }
+            }
+
+            if version >= 2 {
+                KafkaEncoder::write_unsigned_varint(dst, 0); // tagged
+            }
+        }
+
+        if version >= 2 {
+            KafkaEncoder::write_unsigned_varint(dst, 0); // tagged
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3059,6 +4035,145 @@ mod tests {
                     auth_resp.session_lifetime_ms
                 );
             }
+        }
+
+        // CreateAclsRequest & Response
+        for version in [0, 1, 2] {
+            let create_req = CreateAclsRequest {
+                creations: vec![AclCreation {
+                    resource_type: AclResourceType::Topic as i8,
+                    resource_name: "orders".into(),
+                    resource_pattern_type: AclResourcePatternType::Literal as i8,
+                    principal: "User:alice".into(),
+                    host: "*".into(),
+                    operation: AclOperation::Write as i8,
+                    permission_type: AclPermissionType::Allow as i8,
+                }],
+            };
+            let mut buf = BytesMut::new();
+            create_req.encode(&mut buf, version);
+            let mut read_buf = buf.freeze();
+            let decoded_create_req = CreateAclsRequest::decode(&mut read_buf, version).unwrap();
+            assert_eq!(decoded_create_req.creations.len(), 1);
+            assert_eq!(decoded_create_req.creations[0].resource_name, "orders");
+            assert_eq!(decoded_create_req.creations[0].principal, "User:alice");
+
+            let create_resp = CreateAclsResponse {
+                throttle_time_ms: 25,
+                results: vec![AclCreationResult {
+                    error_code: KafkaErrorCode::None,
+                    error_message: None,
+                }],
+            };
+            let mut buf = BytesMut::new();
+            create_resp.encode(&mut buf, version);
+            let mut read_buf = buf.freeze();
+            let decoded_create_resp = CreateAclsResponse::decode(&mut read_buf, version).unwrap();
+            assert_eq!(decoded_create_resp.results.len(), 1);
+            assert_eq!(
+                decoded_create_resp.results[0].error_code,
+                KafkaErrorCode::None
+            );
+        }
+
+        // DescribeAclsRequest & Response
+        for version in [0, 1, 2] {
+            let desc_req = DescribeAclsRequest {
+                resource_type_filter: AclResourceType::Topic as i8,
+                resource_name_filter: Some("orders".into()),
+                resource_pattern_type_filter: AclResourcePatternType::Literal as i8,
+                principal_filter: Some("User:alice".into()),
+                host_filter: Some("*".into()),
+                operation: AclOperation::Write as i8,
+                permission_type: AclPermissionType::Allow as i8,
+            };
+            let mut buf = BytesMut::new();
+            desc_req.encode(&mut buf, version);
+            let mut read_buf = buf.freeze();
+            let decoded_desc_req = DescribeAclsRequest::decode(&mut read_buf, version).unwrap();
+            assert_eq!(decoded_desc_req.resource_name_filter, Some("orders".into()));
+            assert_eq!(decoded_desc_req.principal_filter, Some("User:alice".into()));
+
+            let desc_resp = DescribeAclsResponse {
+                throttle_time_ms: 10,
+                error_code: KafkaErrorCode::None,
+                error_message: None,
+                resources: vec![DescribeAclsResource {
+                    resource_type: AclResourceType::Topic as i8,
+                    resource_name: "orders".into(),
+                    resource_pattern_type: AclResourcePatternType::Literal as i8,
+                    acls: vec![AclDescription {
+                        principal: "User:alice".into(),
+                        host: "*".into(),
+                        operation: AclOperation::Write as i8,
+                        permission_type: AclPermissionType::Allow as i8,
+                    }],
+                }],
+            };
+            let mut buf = BytesMut::new();
+            desc_resp.encode(&mut buf, version);
+            let mut read_buf = buf.freeze();
+            let decoded_desc_resp = DescribeAclsResponse::decode(&mut read_buf, version).unwrap();
+            assert_eq!(decoded_desc_resp.resources.len(), 1);
+            assert_eq!(decoded_desc_resp.resources[0].resource_name, "orders");
+            assert_eq!(decoded_desc_resp.resources[0].acls.len(), 1);
+            assert_eq!(
+                decoded_desc_resp.resources[0].acls[0].principal,
+                "User:alice"
+            );
+        }
+
+        // DeleteAclsRequest & Response
+        for version in [0, 1, 2] {
+            let del_req = DeleteAclsRequest {
+                filters: vec![DeleteAclsFilter {
+                    resource_type_filter: AclResourceType::Topic as i8,
+                    resource_name_filter: Some("orders".into()),
+                    resource_pattern_type_filter: AclResourcePatternType::Literal as i8,
+                    principal_filter: Some("User:alice".into()),
+                    host_filter: Some("*".into()),
+                    operation: AclOperation::Write as i8,
+                    permission_type: AclPermissionType::Allow as i8,
+                }],
+            };
+            let mut buf = BytesMut::new();
+            del_req.encode(&mut buf, version);
+            let mut read_buf = buf.freeze();
+            let decoded_del_req = DeleteAclsRequest::decode(&mut read_buf, version).unwrap();
+            assert_eq!(decoded_del_req.filters.len(), 1);
+            assert_eq!(
+                decoded_del_req.filters[0].resource_name_filter,
+                Some("orders".into())
+            );
+
+            let del_resp = DeleteAclsResponse {
+                throttle_time_ms: 15,
+                filter_results: vec![DeleteAclsFilterResult {
+                    error_code: KafkaErrorCode::None,
+                    error_message: None,
+                    matching_acls: vec![DeleteAclsMatchingAcl {
+                        error_code: KafkaErrorCode::None,
+                        error_message: None,
+                        resource_type: AclResourceType::Topic as i8,
+                        resource_name: "orders".into(),
+                        resource_pattern_type: AclResourcePatternType::Literal as i8,
+                        principal: "User:alice".into(),
+                        host: "*".into(),
+                        operation: AclOperation::Write as i8,
+                        permission_type: AclPermissionType::Allow as i8,
+                    }],
+                }],
+            };
+            let mut buf = BytesMut::new();
+            del_resp.encode(&mut buf, version);
+            let mut read_buf = buf.freeze();
+            let decoded_del_resp = DeleteAclsResponse::decode(&mut read_buf, version).unwrap();
+            assert_eq!(decoded_del_resp.filter_results.len(), 1);
+            assert_eq!(decoded_del_resp.filter_results[0].matching_acls.len(), 1);
+            assert_eq!(
+                decoded_del_resp.filter_results[0].matching_acls[0].principal,
+                "User:alice"
+            );
         }
     }
 }
