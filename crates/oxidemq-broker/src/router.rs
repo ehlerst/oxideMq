@@ -1,7 +1,8 @@
 use crate::partition::Partition;
 use oxidemq_core::types::TopicPartition;
 use oxidemq_protocol::messages::{
-    BrokerMetadata, MetadataResponse, PartitionMetadata, TopicMetadata,
+    BrokerMetadata, DescribeConfigsResourceResult, DescribeConfigsSynonym, MetadataResponse,
+    PartitionMetadata, TopicMetadata,
 };
 use oxidemq_protocol::KafkaErrorCode;
 use oxidemq_s3stream::block_cache::BlockCache;
@@ -212,6 +213,258 @@ impl ClusterState {
             set.insert(tp.topic.clone());
         }
         set.into_iter().collect()
+    }
+
+    /// Updates topic configurations in the cluster state.
+    pub fn update_topic_configs(
+        &self,
+        name: &str,
+        configs: &[(String, Option<String>)],
+    ) -> std::result::Result<(), KafkaErrorCode> {
+        if !self.has_topic(name) {
+            return Err(KafkaErrorCode::UnknownTopicOrPartition);
+        }
+        let mut topics_guard = self.topics.write();
+        if let Some(topic) = topics_guard.get_mut(name) {
+            for (k, v) in configs {
+                match v {
+                    Some(val) => {
+                        topic.configs.insert(k.clone(), val.clone());
+                    }
+                    None => {
+                        topic.configs.remove(k);
+                    }
+                }
+            }
+        } else {
+            let mut configs_map = HashMap::new();
+            for (k, v) in configs {
+                if let Some(val) = v {
+                    configs_map.insert(k.clone(), val.clone());
+                }
+            }
+            let parts = self
+                .partitions
+                .read()
+                .keys()
+                .filter(|tp| tp.topic == name)
+                .count() as i32;
+            topics_guard.insert(
+                name.to_string(),
+                TopicRegistration {
+                    name: name.to_string(),
+                    num_partitions: parts.max(1),
+                    replication_factor: 1,
+                    configs: configs_map,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    /// Describes configurations for a specific topic.
+    pub fn describe_topic_configs(
+        &self,
+        name: &str,
+        keys: Option<&[String]>,
+    ) -> std::result::Result<Vec<DescribeConfigsResourceResult>, KafkaErrorCode> {
+        if !self.has_topic(name) {
+            return Err(KafkaErrorCode::UnknownTopicOrPartition);
+        }
+
+        let topic_configs = self
+            .topics
+            .read()
+            .get(name)
+            .map(|t| t.configs.clone())
+            .unwrap_or_default();
+
+        let default_configs: &[(&str, &str, bool, bool)] = &[
+            ("cleanup.policy", "delete", false, false),
+            ("retention.ms", "604800000", false, false),
+            ("retention.bytes", "-1", false, false),
+            ("max.message.bytes", "1048576", false, false),
+            ("min.insync.replicas", "1", false, false),
+            ("segment.bytes", "1073741824", false, false),
+        ];
+
+        let mut results = Vec::new();
+
+        match keys {
+            Some(requested_keys) if !requested_keys.is_empty() => {
+                for key in requested_keys {
+                    if let Some(val) = topic_configs.get(key) {
+                        results.push(DescribeConfigsResourceResult {
+                            name: key.clone(),
+                            value: Some(val.clone()),
+                            read_only: false,
+                            is_default: false,
+                            config_source: 1, // DynamicTopicConfig
+                            is_sensitive: false,
+                            synonyms: vec![DescribeConfigsSynonym {
+                                name: key.clone(),
+                                value: Some(val.clone()),
+                                source: 1,
+                            }],
+                        });
+                    } else if let Some((_, def_val, ro, sens)) = default_configs
+                        .iter()
+                        .find(|(k, _, _, _)| *k == key.as_str())
+                    {
+                        results.push(DescribeConfigsResourceResult {
+                            name: key.clone(),
+                            value: Some((*def_val).to_string()),
+                            read_only: *ro,
+                            is_default: true,
+                            config_source: 5, // DefaultConfig
+                            is_sensitive: *sens,
+                            synonyms: vec![DescribeConfigsSynonym {
+                                name: key.clone(),
+                                value: Some((*def_val).to_string()),
+                                source: 5,
+                            }],
+                        });
+                    } else {
+                        results.push(DescribeConfigsResourceResult {
+                            name: key.clone(),
+                            value: None,
+                            read_only: false,
+                            is_default: true,
+                            config_source: 0,
+                            is_sensitive: false,
+                            synonyms: Vec::new(),
+                        });
+                    }
+                }
+            }
+            _ => {
+                let mut seen = std::collections::HashSet::new();
+                for (key, def_val, ro, sens) in default_configs {
+                    seen.insert(key.to_string());
+                    if let Some(val) = topic_configs.get(*key) {
+                        results.push(DescribeConfigsResourceResult {
+                            name: (*key).to_string(),
+                            value: Some(val.clone()),
+                            read_only: *ro,
+                            is_default: false,
+                            config_source: 1,
+                            is_sensitive: *sens,
+                            synonyms: vec![DescribeConfigsSynonym {
+                                name: (*key).to_string(),
+                                value: Some(val.clone()),
+                                source: 1,
+                            }],
+                        });
+                    } else {
+                        results.push(DescribeConfigsResourceResult {
+                            name: (*key).to_string(),
+                            value: Some((*def_val).to_string()),
+                            read_only: *ro,
+                            is_default: true,
+                            config_source: 5,
+                            is_sensitive: *sens,
+                            synonyms: vec![DescribeConfigsSynonym {
+                                name: (*key).to_string(),
+                                value: Some((*def_val).to_string()),
+                                source: 5,
+                            }],
+                        });
+                    }
+                }
+                for (k, v) in &topic_configs {
+                    if !seen.contains(k) {
+                        results.push(DescribeConfigsResourceResult {
+                            name: k.clone(),
+                            value: Some(v.clone()),
+                            read_only: false,
+                            is_default: false,
+                            config_source: 1,
+                            is_sensitive: false,
+                            synonyms: vec![DescribeConfigsSynonym {
+                                name: k.clone(),
+                                value: Some(v.clone()),
+                                source: 1,
+                            }],
+                        });
+                    }
+                }
+            }
+        }
+
+        Ok(results)
+    }
+
+    /// Describes broker-level configurations.
+    pub fn describe_broker_configs(
+        &self,
+        keys: Option<&[String]>,
+    ) -> Vec<DescribeConfigsResourceResult> {
+        let broker_configs: &[(&str, String, bool, i8)] = &[
+            ("log.retention.ms", "604800000".into(), false, 4),
+            ("auto.create.topics.enable", "true".into(), true, 4),
+            ("num.partitions", "1".into(), false, 4),
+            ("default.replication.factor", "1".into(), false, 4),
+            (
+                "listeners",
+                format!("PLAINTEXT://{}:{}", self.host(), self.port()),
+                true,
+                4,
+            ),
+        ];
+
+        let mut results = Vec::new();
+        match keys {
+            Some(requested_keys) if !requested_keys.is_empty() => {
+                for key in requested_keys {
+                    if let Some((_, val, ro, src)) = broker_configs
+                        .iter()
+                        .find(|(k, _, _, _)| *k == key.as_str())
+                    {
+                        results.push(DescribeConfigsResourceResult {
+                            name: key.clone(),
+                            value: Some(val.clone()),
+                            read_only: *ro,
+                            is_default: false,
+                            config_source: *src,
+                            is_sensitive: false,
+                            synonyms: vec![DescribeConfigsSynonym {
+                                name: key.clone(),
+                                value: Some(val.clone()),
+                                source: *src,
+                            }],
+                        });
+                    } else {
+                        results.push(DescribeConfigsResourceResult {
+                            name: key.clone(),
+                            value: None,
+                            read_only: false,
+                            is_default: true,
+                            config_source: 0,
+                            is_sensitive: false,
+                            synonyms: Vec::new(),
+                        });
+                    }
+                }
+            }
+            _ => {
+                for (key, val, ro, src) in broker_configs {
+                    results.push(DescribeConfigsResourceResult {
+                        name: (*key).to_string(),
+                        value: Some(val.clone()),
+                        read_only: *ro,
+                        is_default: false,
+                        config_source: *src,
+                        is_sensitive: false,
+                        synonyms: vec![DescribeConfigsSynonym {
+                            name: (*key).to_string(),
+                            value: Some(val.clone()),
+                            source: *src,
+                        }],
+                    });
+                }
+            }
+        }
+        results
     }
 
     pub fn node_id(&self) -> i32 {

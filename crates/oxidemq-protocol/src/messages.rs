@@ -115,6 +115,16 @@ impl ApiVersionsResponse {
                 max_version: 3,
             }, // SyncGroup
             ApiVersionKey {
+                api_key: 15,
+                min_version: 0,
+                max_version: 2,
+            }, // DescribeGroups
+            ApiVersionKey {
+                api_key: 16,
+                min_version: 0,
+                max_version: 2,
+            }, // ListGroups
+            ApiVersionKey {
                 api_key: 17,
                 min_version: 0,
                 max_version: 1,
@@ -170,10 +180,25 @@ impl ApiVersionsResponse {
                 max_version: 2,
             }, // DeleteAcls
             ApiVersionKey {
+                api_key: 32,
+                min_version: 0,
+                max_version: 2,
+            }, // DescribeConfigs
+            ApiVersionKey {
+                api_key: 33,
+                min_version: 0,
+                max_version: 1,
+            }, // AlterConfigs
+            ApiVersionKey {
                 api_key: 36,
                 min_version: 0,
                 max_version: 2,
             }, // SaslAuthenticate
+            ApiVersionKey {
+                api_key: 42,
+                min_version: 0,
+                max_version: 2,
+            }, // DeleteGroups
         ];
         Self::new(KafkaErrorCode::None, keys)
     }
@@ -3621,6 +3646,784 @@ impl DeleteTopicsResponse {
     }
 }
 
+// ==========================================
+// DescribeConfigs (Key 32)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribeConfigsResource {
+    pub resource_type: i8,
+    pub resource_name: String,
+    pub configuration_keys: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribeConfigsRequest {
+    pub resources: Vec<DescribeConfigsResource>,
+    pub include_synonyms: bool,
+}
+
+impl DescribeConfigsRequest {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol(
+                "Truncated DescribeConfigsRequest resources count".into(),
+            ));
+        }
+        let count = src.get_i32();
+        if count < 0 {
+            return Err(OxideMqError::Protocol("Negative resources count".into()));
+        }
+        let count = count as usize;
+        let mut resources = Vec::with_capacity(count);
+        for _ in 0..count {
+            if src.is_empty() {
+                return Err(OxideMqError::Protocol("Truncated resource_type".into()));
+            }
+            let resource_type = src.get_i8();
+            let resource_name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol(
+                    "Truncated configuration_keys count".into(),
+                ));
+            }
+            let keys_count = src.get_i32();
+            let configuration_keys = if keys_count < 0 {
+                None
+            } else {
+                let mut keys = Vec::with_capacity(keys_count as usize);
+                for _ in 0..keys_count {
+                    if let Some(k) = KafkaDecoder::read_string(src)? {
+                        keys.push(k);
+                    }
+                }
+                Some(keys)
+            };
+            resources.push(DescribeConfigsResource {
+                resource_type,
+                resource_name,
+                configuration_keys,
+            });
+        }
+        let include_synonyms = if version >= 1 {
+            if src.is_empty() {
+                return Err(OxideMqError::Protocol("Truncated include_synonyms".into()));
+            }
+            src.get_u8() != 0
+        } else {
+            false
+        };
+
+        Ok(Self {
+            resources,
+            include_synonyms,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        dst.put_i32(self.resources.len() as i32);
+        for r in &self.resources {
+            dst.put_i8(r.resource_type);
+            KafkaEncoder::write_string(dst, Some(&r.resource_name));
+            match &r.configuration_keys {
+                Some(keys) => {
+                    dst.put_i32(keys.len() as i32);
+                    for k in keys {
+                        KafkaEncoder::write_string(dst, Some(k));
+                    }
+                }
+                None => {
+                    dst.put_i32(-1);
+                }
+            }
+        }
+        if version >= 1 {
+            dst.put_u8(if self.include_synonyms { 1 } else { 0 });
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribeConfigsSynonym {
+    pub name: String,
+    pub value: Option<String>,
+    pub source: i8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribeConfigsResourceResult {
+    pub name: String,
+    pub value: Option<String>,
+    pub read_only: bool,
+    pub is_default: bool,
+    pub config_source: i8,
+    pub is_sensitive: bool,
+    pub synonyms: Vec<DescribeConfigsSynonym>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribeConfigsResult {
+    pub error_code: KafkaErrorCode,
+    pub error_message: Option<String>,
+    pub resource_type: i8,
+    pub resource_name: String,
+    pub configs: Vec<DescribeConfigsResourceResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribeConfigsResponse {
+    pub throttle_time_ms: i32,
+    pub results: Vec<DescribeConfigsResult>,
+}
+
+impl DescribeConfigsResponse {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol("Truncated throttle_time_ms".into()));
+        }
+        let throttle_time_ms = src.get_i32();
+
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol("Truncated results count".into()));
+        }
+        let count = src.get_i32();
+        if count < 0 {
+            return Err(OxideMqError::Protocol("Negative results count".into()));
+        }
+        let count = count as usize;
+        let mut results = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            if src.len() < 2 {
+                return Err(OxideMqError::Protocol("Truncated error_code".into()));
+            }
+            let error_code = KafkaErrorCode::from_i16(src.get_i16());
+            let error_message = KafkaDecoder::read_string(src)?;
+            if src.is_empty() {
+                return Err(OxideMqError::Protocol("Truncated resource_type".into()));
+            }
+            let resource_type = src.get_i8();
+            let resource_name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol("Truncated configs count".into()));
+            }
+            let configs_count = src.get_i32();
+            if configs_count < 0 {
+                return Err(OxideMqError::Protocol("Negative configs count".into()));
+            }
+            let configs_count = configs_count as usize;
+            let mut configs = Vec::with_capacity(configs_count);
+
+            for _ in 0..configs_count {
+                let name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+                let value = KafkaDecoder::read_string(src)?;
+                if src.is_empty() {
+                    return Err(OxideMqError::Protocol("Truncated read_only".into()));
+                }
+                let read_only = src.get_u8() != 0;
+
+                let (is_default, config_source) = if version == 0 {
+                    if src.is_empty() {
+                        return Err(OxideMqError::Protocol("Truncated is_default".into()));
+                    }
+                    (src.get_u8() != 0, -1i8)
+                } else {
+                    if src.is_empty() {
+                        return Err(OxideMqError::Protocol("Truncated config_source".into()));
+                    }
+                    (false, src.get_i8())
+                };
+
+                if src.is_empty() {
+                    return Err(OxideMqError::Protocol("Truncated is_sensitive".into()));
+                }
+                let is_sensitive = src.get_u8() != 0;
+
+                let synonyms = if version >= 1 {
+                    if src.len() < 4 {
+                        return Err(OxideMqError::Protocol("Truncated synonyms count".into()));
+                    }
+                    let syn_count = src.get_i32();
+                    if syn_count < 0 {
+                        Vec::new()
+                    } else {
+                        let mut syns = Vec::with_capacity(syn_count as usize);
+                        for _ in 0..syn_count {
+                            let syn_name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+                            let syn_value = KafkaDecoder::read_string(src)?;
+                            if src.is_empty() {
+                                return Err(OxideMqError::Protocol(
+                                    "Truncated synonym source".into(),
+                                ));
+                            }
+                            let source = src.get_i8();
+                            syns.push(DescribeConfigsSynonym {
+                                name: syn_name,
+                                value: syn_value,
+                                source,
+                            });
+                        }
+                        syns
+                    }
+                } else {
+                    Vec::new()
+                };
+
+                configs.push(DescribeConfigsResourceResult {
+                    name,
+                    value,
+                    read_only,
+                    is_default,
+                    config_source,
+                    is_sensitive,
+                    synonyms,
+                });
+            }
+
+            results.push(DescribeConfigsResult {
+                error_code,
+                error_message,
+                resource_type,
+                resource_name,
+                configs,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            results,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        dst.put_i32(self.throttle_time_ms);
+        dst.put_i32(self.results.len() as i32);
+        for res in &self.results {
+            dst.put_i16(res.error_code.code());
+            KafkaEncoder::write_string(dst, res.error_message.as_deref());
+            dst.put_i8(res.resource_type);
+            KafkaEncoder::write_string(dst, Some(&res.resource_name));
+
+            dst.put_i32(res.configs.len() as i32);
+            for c in &res.configs {
+                KafkaEncoder::write_string(dst, Some(&c.name));
+                KafkaEncoder::write_string(dst, c.value.as_deref());
+                dst.put_u8(if c.read_only { 1 } else { 0 });
+                if version == 0 {
+                    dst.put_u8(if c.is_default { 1 } else { 0 });
+                } else {
+                    dst.put_i8(c.config_source);
+                }
+                dst.put_u8(if c.is_sensitive { 1 } else { 0 });
+                if version >= 1 {
+                    dst.put_i32(c.synonyms.len() as i32);
+                    for s in &c.synonyms {
+                        KafkaEncoder::write_string(dst, Some(&s.name));
+                        KafkaEncoder::write_string(dst, s.value.as_deref());
+                        dst.put_i8(s.source);
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ==========================================
+// AlterConfigs (Key 33)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterableConfig {
+    pub name: String,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterConfigsResource {
+    pub resource_type: i8,
+    pub resource_name: String,
+    pub configs: Vec<AlterableConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterConfigsRequest {
+    pub resources: Vec<AlterConfigsResource>,
+    pub validate_only: bool,
+}
+
+impl AlterConfigsRequest {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol(
+                "Truncated AlterConfigsRequest resources count".into(),
+            ));
+        }
+        let count = src.get_i32();
+        if count < 0 {
+            return Err(OxideMqError::Protocol("Negative resources count".into()));
+        }
+        let count = count as usize;
+        let mut resources = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            if src.is_empty() {
+                return Err(OxideMqError::Protocol("Truncated resource_type".into()));
+            }
+            let resource_type = src.get_i8();
+            let resource_name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol("Truncated configs count".into()));
+            }
+            let configs_count = src.get_i32();
+            if configs_count < 0 {
+                return Err(OxideMqError::Protocol("Negative configs count".into()));
+            }
+            let configs_count = configs_count as usize;
+            let mut configs = Vec::with_capacity(configs_count);
+            for _ in 0..configs_count {
+                let name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+                let value = KafkaDecoder::read_string(src)?;
+                configs.push(AlterableConfig { name, value });
+            }
+            resources.push(AlterConfigsResource {
+                resource_type,
+                resource_name,
+                configs,
+            });
+        }
+
+        if src.is_empty() {
+            return Err(OxideMqError::Protocol("Truncated validate_only".into()));
+        }
+        let validate_only = src.get_u8() != 0;
+
+        Ok(Self {
+            resources,
+            validate_only,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.resources.len() as i32);
+        for r in &self.resources {
+            dst.put_i8(r.resource_type);
+            KafkaEncoder::write_string(dst, Some(&r.resource_name));
+            dst.put_i32(r.configs.len() as i32);
+            for c in &r.configs {
+                KafkaEncoder::write_string(dst, Some(&c.name));
+                KafkaEncoder::write_string(dst, c.value.as_deref());
+            }
+        }
+        dst.put_u8(if self.validate_only { 1 } else { 0 });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterConfigsResourceResponse {
+    pub error_code: KafkaErrorCode,
+    pub error_message: Option<String>,
+    pub resource_type: i8,
+    pub resource_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlterConfigsResponse {
+    pub throttle_time_ms: i32,
+    pub responses: Vec<AlterConfigsResourceResponse>,
+}
+
+impl AlterConfigsResponse {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol("Truncated throttle_time_ms".into()));
+        }
+        let throttle_time_ms = src.get_i32();
+
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol("Truncated responses count".into()));
+        }
+        let count = src.get_i32();
+        if count < 0 {
+            return Err(OxideMqError::Protocol("Negative responses count".into()));
+        }
+        let count = count as usize;
+        let mut responses = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            if src.len() < 2 {
+                return Err(OxideMqError::Protocol("Truncated error_code".into()));
+            }
+            let error_code = KafkaErrorCode::from_i16(src.get_i16());
+            let error_message = KafkaDecoder::read_string(src)?;
+            if src.is_empty() {
+                return Err(OxideMqError::Protocol("Truncated resource_type".into()));
+            }
+            let resource_type = src.get_i8();
+            let resource_name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            responses.push(AlterConfigsResourceResponse {
+                error_code,
+                error_message,
+                resource_type,
+                resource_name,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            responses,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.throttle_time_ms);
+        dst.put_i32(self.responses.len() as i32);
+        for r in &self.responses {
+            dst.put_i16(r.error_code.code());
+            KafkaEncoder::write_string(dst, r.error_message.as_deref());
+            dst.put_i8(r.resource_type);
+            KafkaEncoder::write_string(dst, Some(&r.resource_name));
+        }
+    }
+}
+
+// ==========================================
+// ListGroups (Key 16)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ListGroupsRequest {}
+
+impl ListGroupsRequest {
+    pub fn decode(_src: &mut Bytes, _version: i16) -> Result<Self> {
+        Ok(Self {})
+    }
+
+    pub fn encode(&self, _dst: &mut BytesMut, _version: i16) {}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedGroup {
+    pub group_id: String,
+    pub protocol_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListGroupsResponse {
+    pub throttle_time_ms: i32,
+    pub error_code: KafkaErrorCode,
+    pub groups: Vec<ListedGroup>,
+}
+
+impl ListGroupsResponse {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let throttle_time_ms = if version >= 1 {
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol("Truncated throttle_time_ms".into()));
+            }
+            src.get_i32()
+        } else {
+            0
+        };
+
+        if src.len() < 2 {
+            return Err(OxideMqError::Protocol("Truncated error_code".into()));
+        }
+        let error_code = KafkaErrorCode::from_i16(src.get_i16());
+
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol("Truncated groups count".into()));
+        }
+        let count = src.get_i32();
+        if count < 0 {
+            return Err(OxideMqError::Protocol("Negative groups count".into()));
+        }
+        let count = count as usize;
+        let mut groups = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let group_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            let protocol_type = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            groups.push(ListedGroup {
+                group_id,
+                protocol_type,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            error_code,
+            groups,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        if version >= 1 {
+            dst.put_i32(self.throttle_time_ms);
+        }
+        dst.put_i16(self.error_code.code());
+        dst.put_i32(self.groups.len() as i32);
+        for g in &self.groups {
+            KafkaEncoder::write_string(dst, Some(&g.group_id));
+            KafkaEncoder::write_string(dst, Some(&g.protocol_type));
+        }
+    }
+}
+
+// ==========================================
+// DescribeGroups (Key 15)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribeGroupsRequest {
+    pub groups: Vec<String>,
+}
+
+impl DescribeGroupsRequest {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol(
+                "Truncated DescribeGroupsRequest groups count".into(),
+            ));
+        }
+        let count = src.get_i32();
+        if count < 0 {
+            return Err(OxideMqError::Protocol("Negative groups count".into()));
+        }
+        let count = count as usize;
+        let mut groups = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(g) = KafkaDecoder::read_string(src)? {
+                groups.push(g);
+            }
+        }
+        Ok(Self { groups })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.groups.len() as i32);
+        for g in &self.groups {
+            KafkaEncoder::write_string(dst, Some(g));
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribedGroupMember {
+    pub member_id: String,
+    pub client_id: String,
+    pub client_host: String,
+    pub member_metadata: Bytes,
+    pub member_assignment: Bytes,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribedGroup {
+    pub error_code: KafkaErrorCode,
+    pub group_id: String,
+    pub group_state: String,
+    pub protocol_type: String,
+    pub protocol_data: String,
+    pub members: Vec<DescribedGroupMember>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DescribeGroupsResponse {
+    pub throttle_time_ms: i32,
+    pub groups: Vec<DescribedGroup>,
+}
+
+impl DescribeGroupsResponse {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let throttle_time_ms = if version >= 1 {
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol("Truncated throttle_time_ms".into()));
+            }
+            src.get_i32()
+        } else {
+            0
+        };
+
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol("Truncated groups count".into()));
+        }
+        let count = src.get_i32();
+        if count < 0 {
+            return Err(OxideMqError::Protocol("Negative groups count".into()));
+        }
+        let count = count as usize;
+        let mut groups = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            if src.len() < 2 {
+                return Err(OxideMqError::Protocol("Truncated error_code".into()));
+            }
+            let error_code = KafkaErrorCode::from_i16(src.get_i16());
+            let group_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            let group_state = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            let protocol_type = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            let protocol_data = KafkaDecoder::read_string(src)?.unwrap_or_default();
+
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol("Truncated members count".into()));
+            }
+            let members_count = src.get_i32();
+            if members_count < 0 {
+                return Err(OxideMqError::Protocol("Negative members count".into()));
+            }
+            let members_count = members_count as usize;
+            let mut members = Vec::with_capacity(members_count);
+
+            for _ in 0..members_count {
+                let member_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+                let client_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+                let client_host = KafkaDecoder::read_string(src)?.unwrap_or_default();
+                let member_metadata = KafkaDecoder::read_bytes(src)?.unwrap_or_default();
+                let member_assignment = KafkaDecoder::read_bytes(src)?.unwrap_or_default();
+                members.push(DescribedGroupMember {
+                    member_id,
+                    client_id,
+                    client_host,
+                    member_metadata,
+                    member_assignment,
+                });
+            }
+
+            groups.push(DescribedGroup {
+                error_code,
+                group_id,
+                group_state,
+                protocol_type,
+                protocol_data,
+                members,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            groups,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        if version >= 1 {
+            dst.put_i32(self.throttle_time_ms);
+        }
+        dst.put_i32(self.groups.len() as i32);
+        for g in &self.groups {
+            dst.put_i16(g.error_code.code());
+            KafkaEncoder::write_string(dst, Some(&g.group_id));
+            KafkaEncoder::write_string(dst, Some(&g.group_state));
+            KafkaEncoder::write_string(dst, Some(&g.protocol_type));
+            KafkaEncoder::write_string(dst, Some(&g.protocol_data));
+
+            dst.put_i32(g.members.len() as i32);
+            for m in &g.members {
+                KafkaEncoder::write_string(dst, Some(&m.member_id));
+                KafkaEncoder::write_string(dst, Some(&m.client_id));
+                KafkaEncoder::write_string(dst, Some(&m.client_host));
+                KafkaEncoder::write_bytes(dst, Some(&m.member_metadata));
+                KafkaEncoder::write_bytes(dst, Some(&m.member_assignment));
+            }
+        }
+    }
+}
+
+// ==========================================
+// DeleteGroups (Key 42)
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteGroupsRequest {
+    pub groups_names: Vec<String>,
+}
+
+impl DeleteGroupsRequest {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol(
+                "Truncated DeleteGroupsRequest groups count".into(),
+            ));
+        }
+        let count = src.get_i32();
+        if count < 0 {
+            return Err(OxideMqError::Protocol("Negative groups count".into()));
+        }
+        let count = count as usize;
+        let mut groups_names = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(g) = KafkaDecoder::read_string(src)? {
+                groups_names.push(g);
+            }
+        }
+        Ok(Self { groups_names })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.groups_names.len() as i32);
+        for g in &self.groups_names {
+            KafkaEncoder::write_string(dst, Some(g));
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletableGroupResult {
+    pub group_id: String,
+    pub error_code: KafkaErrorCode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteGroupsResponse {
+    pub throttle_time_ms: i32,
+    pub results: Vec<DeletableGroupResult>,
+}
+
+impl DeleteGroupsResponse {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol("Truncated throttle_time_ms".into()));
+        }
+        let throttle_time_ms = src.get_i32();
+
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol("Truncated results count".into()));
+        }
+        let count = src.get_i32();
+        if count < 0 {
+            return Err(OxideMqError::Protocol("Negative results count".into()));
+        }
+        let count = count as usize;
+        let mut results = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let group_id = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            if src.len() < 2 {
+                return Err(OxideMqError::Protocol("Truncated error_code".into()));
+            }
+            let error_code = KafkaErrorCode::from_i16(src.get_i16());
+            results.push(DeletableGroupResult {
+                group_id,
+                error_code,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            results,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.throttle_time_ms);
+        dst.put_i32(self.results.len() as i32);
+        for r in &self.results {
+            KafkaEncoder::write_string(dst, Some(&r.group_id));
+            dst.put_i16(r.error_code.code());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4638,6 +5441,291 @@ mod tests {
             assert_eq!(
                 decoded_del_resp.responses[1].error_code,
                 KafkaErrorCode::UnknownTopicOrPartition
+            );
+        }
+    }
+
+    #[test]
+    fn test_describe_and_alter_configs_codec() {
+        // DescribeConfigs
+        let desc_req = DescribeConfigsRequest {
+            resources: vec![
+                DescribeConfigsResource {
+                    resource_type: 2, // Topic
+                    resource_name: "test-topic".into(),
+                    configuration_keys: Some(vec!["cleanup.policy".into(), "retention.ms".into()]),
+                },
+                DescribeConfigsResource {
+                    resource_type: 4, // Broker
+                    resource_name: "1".into(),
+                    configuration_keys: None,
+                },
+            ],
+            include_synonyms: true,
+        };
+
+        for v in [0, 1, 2] {
+            let mut buf = BytesMut::new();
+            desc_req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = DescribeConfigsRequest::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.resources.len(), 2);
+            assert_eq!(decoded.resources[0].resource_type, 2);
+            assert_eq!(decoded.resources[0].resource_name, "test-topic");
+            assert_eq!(
+                decoded.resources[0].configuration_keys,
+                Some(vec!["cleanup.policy".into(), "retention.ms".into()])
+            );
+            assert_eq!(decoded.resources[1].resource_type, 4);
+            assert_eq!(decoded.resources[1].configuration_keys, None);
+            if v >= 1 {
+                assert!(decoded.include_synonyms);
+            } else {
+                assert!(!decoded.include_synonyms);
+            }
+        }
+
+        let desc_resp = DescribeConfigsResponse {
+            throttle_time_ms: 25,
+            results: vec![DescribeConfigsResult {
+                error_code: KafkaErrorCode::None,
+                error_message: None,
+                resource_type: 2,
+                resource_name: "test-topic".into(),
+                configs: vec![DescribeConfigsResourceResult {
+                    name: "cleanup.policy".into(),
+                    value: Some("compact".into()),
+                    read_only: false,
+                    is_default: false,
+                    config_source: 1, // DynamicTopicConfig
+                    is_sensitive: false,
+                    synonyms: vec![DescribeConfigsSynonym {
+                        name: "cleanup.policy".into(),
+                        value: Some("compact".into()),
+                        source: 1,
+                    }],
+                }],
+            }],
+        };
+
+        for v in [0, 1, 2] {
+            let mut buf = BytesMut::new();
+            desc_resp.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = DescribeConfigsResponse::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.throttle_time_ms, 25);
+            assert_eq!(decoded.results.len(), 1);
+            assert_eq!(decoded.results[0].resource_name, "test-topic");
+            let c = &decoded.results[0].configs[0];
+            assert_eq!(c.name, "cleanup.policy");
+            assert_eq!(c.value.as_deref(), Some("compact"));
+            assert!(!c.read_only);
+            if v == 0 {
+                assert!(!c.is_default);
+                assert_eq!(c.synonyms.len(), 0);
+            } else {
+                assert_eq!(c.config_source, 1);
+                assert_eq!(c.synonyms.len(), 1);
+                assert_eq!(c.synonyms[0].name, "cleanup.policy");
+            }
+        }
+
+        // AlterConfigs
+        let alter_req = AlterConfigsRequest {
+            resources: vec![AlterConfigsResource {
+                resource_type: 2,
+                resource_name: "test-topic".into(),
+                configs: vec![AlterableConfig {
+                    name: "retention.ms".into(),
+                    value: Some("86400000".into()),
+                }],
+            }],
+            validate_only: true,
+        };
+
+        for v in [0, 1] {
+            let mut buf = BytesMut::new();
+            alter_req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = AlterConfigsRequest::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.resources.len(), 1);
+            assert_eq!(decoded.resources[0].resource_name, "test-topic");
+            assert_eq!(decoded.resources[0].configs[0].name, "retention.ms");
+            assert_eq!(
+                decoded.resources[0].configs[0].value.as_deref(),
+                Some("86400000")
+            );
+            assert!(decoded.validate_only);
+        }
+
+        let alter_resp = AlterConfigsResponse {
+            throttle_time_ms: 10,
+            responses: vec![AlterConfigsResourceResponse {
+                error_code: KafkaErrorCode::None,
+                error_message: None,
+                resource_type: 2,
+                resource_name: "test-topic".into(),
+            }],
+        };
+
+        for v in [0, 1] {
+            let mut buf = BytesMut::new();
+            alter_resp.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = AlterConfigsResponse::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.throttle_time_ms, 10);
+            assert_eq!(decoded.responses.len(), 1);
+            assert_eq!(decoded.responses[0].resource_name, "test-topic");
+            assert_eq!(decoded.responses[0].error_code, KafkaErrorCode::None);
+        }
+    }
+
+    #[test]
+    fn test_groups_admin_codec() {
+        // ListGroups
+        let list_req = ListGroupsRequest {};
+        for v in [0, 1, 2] {
+            let mut buf = BytesMut::new();
+            list_req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = ListGroupsRequest::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded, ListGroupsRequest {});
+        }
+
+        let list_resp = ListGroupsResponse {
+            throttle_time_ms: 5,
+            error_code: KafkaErrorCode::None,
+            groups: vec![ListedGroup {
+                group_id: "order-consumers".into(),
+                protocol_type: "consumer".into(),
+            }],
+        };
+
+        for v in [0, 1, 2] {
+            let mut buf = BytesMut::new();
+            list_resp.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = ListGroupsResponse::decode(&mut read_buf, v).unwrap();
+            if v >= 1 {
+                assert_eq!(decoded.throttle_time_ms, 5);
+            } else {
+                assert_eq!(decoded.throttle_time_ms, 0);
+            }
+            assert_eq!(decoded.error_code, KafkaErrorCode::None);
+            assert_eq!(decoded.groups.len(), 1);
+            assert_eq!(decoded.groups[0].group_id, "order-consumers");
+            assert_eq!(decoded.groups[0].protocol_type, "consumer");
+        }
+
+        // DescribeGroups
+        let desc_groups_req = DescribeGroupsRequest {
+            groups: vec!["order-consumers".into(), "ghost-group".into()],
+        };
+
+        for v in [0, 1, 2] {
+            let mut buf = BytesMut::new();
+            desc_groups_req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = DescribeGroupsRequest::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.groups, vec!["order-consumers", "ghost-group"]);
+        }
+
+        let desc_groups_resp = DescribeGroupsResponse {
+            throttle_time_ms: 12,
+            groups: vec![
+                DescribedGroup {
+                    error_code: KafkaErrorCode::None,
+                    group_id: "order-consumers".into(),
+                    group_state: "Stable".into(),
+                    protocol_type: "consumer".into(),
+                    protocol_data: "range".into(),
+                    members: vec![DescribedGroupMember {
+                        member_id: "consumer-1".into(),
+                        client_id: "client-app".into(),
+                        client_host: "127.0.0.1".into(),
+                        member_metadata: Bytes::from_static(b"meta"),
+                        member_assignment: Bytes::from_static(b"assign"),
+                    }],
+                },
+                DescribedGroup {
+                    error_code: KafkaErrorCode::None,
+                    group_id: "ghost-group".into(),
+                    group_state: "Dead".into(),
+                    protocol_type: "".into(),
+                    protocol_data: "".into(),
+                    members: Vec::new(),
+                },
+            ],
+        };
+
+        for v in [0, 1, 2] {
+            let mut buf = BytesMut::new();
+            desc_groups_resp.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = DescribeGroupsResponse::decode(&mut read_buf, v).unwrap();
+            if v >= 1 {
+                assert_eq!(decoded.throttle_time_ms, 12);
+            } else {
+                assert_eq!(decoded.throttle_time_ms, 0);
+            }
+            assert_eq!(decoded.groups.len(), 2);
+            assert_eq!(decoded.groups[0].group_id, "order-consumers");
+            assert_eq!(decoded.groups[0].group_state, "Stable");
+            assert_eq!(decoded.groups[0].members.len(), 1);
+            assert_eq!(decoded.groups[0].members[0].member_id, "consumer-1");
+            assert_eq!(
+                decoded.groups[0].members[0].member_metadata,
+                Bytes::from_static(b"meta")
+            );
+            assert_eq!(
+                decoded.groups[0].members[0].member_assignment,
+                Bytes::from_static(b"assign")
+            );
+            assert_eq!(decoded.groups[1].group_id, "ghost-group");
+            assert_eq!(decoded.groups[1].group_state, "Dead");
+            assert_eq!(decoded.groups[1].members.len(), 0);
+        }
+
+        // DeleteGroups
+        let del_req = DeleteGroupsRequest {
+            groups_names: vec!["order-consumers".into(), "nonexistent".into()],
+        };
+
+        for v in [0, 1, 2] {
+            let mut buf = BytesMut::new();
+            del_req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = DeleteGroupsRequest::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.groups_names, vec!["order-consumers", "nonexistent"]);
+        }
+
+        let del_resp = DeleteGroupsResponse {
+            throttle_time_ms: 7,
+            results: vec![
+                DeletableGroupResult {
+                    group_id: "order-consumers".into(),
+                    error_code: KafkaErrorCode::None,
+                },
+                DeletableGroupResult {
+                    group_id: "nonexistent".into(),
+                    error_code: KafkaErrorCode::GroupIdNotFound,
+                },
+            ],
+        };
+
+        for v in [0, 1, 2] {
+            let mut buf = BytesMut::new();
+            del_resp.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = DeleteGroupsResponse::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.throttle_time_ms, 7);
+            assert_eq!(decoded.results.len(), 2);
+            assert_eq!(decoded.results[0].group_id, "order-consumers");
+            assert_eq!(decoded.results[0].error_code, KafkaErrorCode::None);
+            assert_eq!(decoded.results[1].group_id, "nonexistent");
+            assert_eq!(
+                decoded.results[1].error_code,
+                KafkaErrorCode::GroupIdNotFound
             );
         }
     }

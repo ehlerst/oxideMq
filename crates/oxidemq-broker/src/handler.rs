@@ -12,19 +12,23 @@ use oxidemq_protocol::header::{RequestHeader, ResponseHeader};
 use oxidemq_protocol::messages::{
     AclCreationResult, AddOffsetsToTxnRequest, AddOffsetsToTxnResponse,
     AddPartitionsToTxnPartitionResult, AddPartitionsToTxnRequest, AddPartitionsToTxnResponse,
-    AddPartitionsToTxnTopicResult, ApiVersionsRequest, ApiVersionsResponse, CreatableTopicResult,
+    AddPartitionsToTxnTopicResult, AlterConfigsRequest, AlterConfigsResourceResponse,
+    AlterConfigsResponse, ApiVersionsRequest, ApiVersionsResponse, CreatableTopicResult,
     CreateAclsRequest, CreateAclsResponse, CreateTopicsRequest, CreateTopicsResponse,
-    DeletableTopicResult, DeleteAclsFilterResult, DeleteAclsRequest, DeleteAclsResponse,
-    DeleteTopicsRequest, DeleteTopicsResponse, DescribeAclsRequest, DescribeAclsResponse,
+    DeletableGroupResult, DeletableTopicResult, DeleteAclsFilterResult, DeleteAclsRequest,
+    DeleteAclsResponse, DeleteGroupsRequest, DeleteGroupsResponse, DeleteTopicsRequest,
+    DeleteTopicsResponse, DescribeAclsRequest, DescribeAclsResponse, DescribeConfigsRequest,
+    DescribeConfigsResponse, DescribeConfigsResult, DescribeGroupsRequest, DescribeGroupsResponse,
     EndTxnRequest, EndTxnResponse, FetchPartitionResponse, FetchRequest, FetchResponse,
     FetchTopicResponse, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest,
     HeartbeatResponse, InitProducerIdRequest, InitProducerIdResponse, LeaveGroupRequest,
-    LeaveGroupResponse, ListOffsetsPartitionResponse, ListOffsetsRequest, ListOffsetsResponse,
-    ListOffsetsTopicResponse, MetadataRequest, OffsetCommitPartitionResponse, OffsetCommitRequest,
-    OffsetCommitResponse, OffsetCommitTopicResponse, OffsetFetchPartitionResponse,
-    OffsetFetchRequest, OffsetFetchResponse, OffsetFetchTopicResponse, PartitionProduceResponse,
-    ProduceRequest, ProduceResponse, SaslAuthenticateRequest, SaslAuthenticateResponse,
-    SaslHandshakeRequest, SaslHandshakeResponse, TopicProduceResponse,
+    LeaveGroupResponse, ListGroupsRequest, ListGroupsResponse, ListOffsetsPartitionResponse,
+    ListOffsetsRequest, ListOffsetsResponse, ListOffsetsTopicResponse, MetadataRequest,
+    OffsetCommitPartitionResponse, OffsetCommitRequest, OffsetCommitResponse,
+    OffsetCommitTopicResponse, OffsetFetchPartitionResponse, OffsetFetchRequest,
+    OffsetFetchResponse, OffsetFetchTopicResponse, PartitionProduceResponse, ProduceRequest,
+    ProduceResponse, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
+    SaslHandshakeResponse, TopicProduceResponse,
 };
 use oxidemq_protocol::{AclOperation, AclResourceType, ApiKey, KafkaErrorCode};
 use std::collections::HashMap;
@@ -1160,6 +1164,346 @@ impl BrokerEngine {
                 };
                 resp.encode(&mut out, header.api_version);
             }
+            ApiKey::DescribeConfigs => {
+                let req = DescribeConfigsRequest::decode(body, header.api_version)?;
+                let mut results = Vec::with_capacity(req.resources.len());
+
+                for res in req.resources {
+                    let (is_auth, err_code) = match res.resource_type {
+                        2 => {
+                            let auth = self.authorizer.authorize(
+                                principal,
+                                client_host,
+                                AclResourceType::Topic,
+                                &res.resource_name,
+                                AclOperation::DescribeConfigs,
+                            ) || self.authorizer.authorize(
+                                principal,
+                                client_host,
+                                AclResourceType::Cluster,
+                                "kafka-cluster",
+                                AclOperation::DescribeConfigs,
+                            );
+                            (auth, KafkaErrorCode::TopicAuthorizationFailed)
+                        }
+                        4 => {
+                            let auth = self.authorizer.authorize(
+                                principal,
+                                client_host,
+                                AclResourceType::Cluster,
+                                "kafka-cluster",
+                                AclOperation::DescribeConfigs,
+                            );
+                            (auth, KafkaErrorCode::ClusterAuthorizationFailed)
+                        }
+                        _ => (true, KafkaErrorCode::None),
+                    };
+
+                    if !is_auth {
+                        results.push(DescribeConfigsResult {
+                            error_code: err_code,
+                            error_message: Some("Authorization failed for DescribeConfigs".into()),
+                            resource_type: res.resource_type,
+                            resource_name: res.resource_name,
+                            configs: Vec::new(),
+                        });
+                        continue;
+                    }
+
+                    match res.resource_type {
+                        2 => {
+                            let keys_ref = res.configuration_keys.as_deref();
+                            match self
+                                .cluster_state
+                                .describe_topic_configs(&res.resource_name, keys_ref)
+                            {
+                                Ok(configs) => {
+                                    results.push(DescribeConfigsResult {
+                                        error_code: KafkaErrorCode::None,
+                                        error_message: None,
+                                        resource_type: res.resource_type,
+                                        resource_name: res.resource_name,
+                                        configs,
+                                    });
+                                }
+                                Err(err) => {
+                                    results.push(DescribeConfigsResult {
+                                        error_code: err,
+                                        error_message: Some("Topic does not exist".into()),
+                                        resource_type: res.resource_type,
+                                        resource_name: res.resource_name,
+                                        configs: Vec::new(),
+                                    });
+                                }
+                            }
+                        }
+                        4 => {
+                            let keys_ref = res.configuration_keys.as_deref();
+                            let configs = self.cluster_state.describe_broker_configs(keys_ref);
+                            results.push(DescribeConfigsResult {
+                                error_code: KafkaErrorCode::None,
+                                error_message: None,
+                                resource_type: res.resource_type,
+                                resource_name: res.resource_name,
+                                configs,
+                            });
+                        }
+                        _ => {
+                            results.push(DescribeConfigsResult {
+                                error_code: KafkaErrorCode::InvalidRequest,
+                                error_message: Some(format!(
+                                    "Unsupported resource type {}",
+                                    res.resource_type
+                                )),
+                                resource_type: res.resource_type,
+                                resource_name: res.resource_name,
+                                configs: Vec::new(),
+                            });
+                        }
+                    }
+                }
+
+                let resp = DescribeConfigsResponse {
+                    throttle_time_ms: 0,
+                    results,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::AlterConfigs => {
+                let req = AlterConfigsRequest::decode(body, header.api_version)?;
+                let mut responses = Vec::with_capacity(req.resources.len());
+
+                for res in req.resources {
+                    let (is_auth, err_code) = match res.resource_type {
+                        2 => {
+                            let auth = self.authorizer.authorize(
+                                principal,
+                                client_host,
+                                AclResourceType::Topic,
+                                &res.resource_name,
+                                AclOperation::AlterConfigs,
+                            ) || self.authorizer.authorize(
+                                principal,
+                                client_host,
+                                AclResourceType::Cluster,
+                                "kafka-cluster",
+                                AclOperation::AlterConfigs,
+                            );
+                            (auth, KafkaErrorCode::TopicAuthorizationFailed)
+                        }
+                        4 => {
+                            let auth = self.authorizer.authorize(
+                                principal,
+                                client_host,
+                                AclResourceType::Cluster,
+                                "kafka-cluster",
+                                AclOperation::AlterConfigs,
+                            );
+                            (auth, KafkaErrorCode::ClusterAuthorizationFailed)
+                        }
+                        _ => (true, KafkaErrorCode::None),
+                    };
+
+                    if !is_auth {
+                        responses.push(AlterConfigsResourceResponse {
+                            error_code: err_code,
+                            error_message: Some("Authorization failed for AlterConfigs".into()),
+                            resource_type: res.resource_type,
+                            resource_name: res.resource_name,
+                        });
+                        continue;
+                    }
+
+                    match res.resource_type {
+                        2 => {
+                            if !self.cluster_state.has_topic(&res.resource_name) {
+                                responses.push(AlterConfigsResourceResponse {
+                                    error_code: KafkaErrorCode::UnknownTopicOrPartition,
+                                    error_message: Some("Topic does not exist".into()),
+                                    resource_type: res.resource_type,
+                                    resource_name: res.resource_name,
+                                });
+                            } else if req.validate_only {
+                                responses.push(AlterConfigsResourceResponse {
+                                    error_code: KafkaErrorCode::None,
+                                    error_message: None,
+                                    resource_type: res.resource_type,
+                                    resource_name: res.resource_name,
+                                });
+                            } else {
+                                let configs_to_update: Vec<(String, Option<String>)> =
+                                    res.configs.into_iter().map(|c| (c.name, c.value)).collect();
+                                match self
+                                    .cluster_state
+                                    .update_topic_configs(&res.resource_name, &configs_to_update)
+                                {
+                                    Ok(()) => {
+                                        responses.push(AlterConfigsResourceResponse {
+                                            error_code: KafkaErrorCode::None,
+                                            error_message: None,
+                                            resource_type: res.resource_type,
+                                            resource_name: res.resource_name,
+                                        });
+                                    }
+                                    Err(code) => {
+                                        responses.push(AlterConfigsResourceResponse {
+                                            error_code: code,
+                                            error_message: Some(
+                                                "Failed to update topic configs".into(),
+                                            ),
+                                            resource_type: res.resource_type,
+                                            resource_name: res.resource_name,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        4 => {
+                            responses.push(AlterConfigsResourceResponse {
+                                error_code: KafkaErrorCode::None,
+                                error_message: None,
+                                resource_type: res.resource_type,
+                                resource_name: res.resource_name,
+                            });
+                        }
+                        _ => {
+                            responses.push(AlterConfigsResourceResponse {
+                                error_code: KafkaErrorCode::InvalidRequest,
+                                error_message: Some(format!(
+                                    "Unsupported resource type {}",
+                                    res.resource_type
+                                )),
+                                resource_type: res.resource_type,
+                                resource_name: res.resource_name,
+                            });
+                        }
+                    }
+                }
+
+                let resp = AlterConfigsResponse {
+                    throttle_time_ms: 0,
+                    responses,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::ListGroups => {
+                let _req = ListGroupsRequest::decode(body, header.api_version)?;
+                let is_authorized = self.authorizer.authorize(
+                    principal,
+                    client_host,
+                    AclResourceType::Cluster,
+                    "kafka-cluster",
+                    AclOperation::Describe,
+                );
+
+                let (error_code, groups) = if !is_authorized {
+                    (KafkaErrorCode::ClusterAuthorizationFailed, Vec::new())
+                } else {
+                    let raw_groups = self.coordinator.list_groups();
+                    let groups = raw_groups
+                        .into_iter()
+                        .map(|(group_id, protocol_type)| oxidemq_protocol::ListedGroup {
+                            group_id,
+                            protocol_type,
+                        })
+                        .collect();
+                    (KafkaErrorCode::None, groups)
+                };
+
+                let resp = ListGroupsResponse {
+                    throttle_time_ms: 0,
+                    error_code,
+                    groups,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::DescribeGroups => {
+                let req = DescribeGroupsRequest::decode(body, header.api_version)?;
+                let mut groups_to_query = Vec::new();
+                let mut results = Vec::new();
+
+                for gid in req.groups {
+                    let is_authorized = self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Group,
+                        &gid,
+                        AclOperation::Describe,
+                    ) || self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Cluster,
+                        "kafka-cluster",
+                        AclOperation::Describe,
+                    );
+
+                    if is_authorized {
+                        groups_to_query.push(gid);
+                    } else {
+                        results.push(oxidemq_protocol::DescribedGroup {
+                            error_code: KafkaErrorCode::GroupAuthorizationFailed,
+                            group_id: gid,
+                            group_state: String::new(),
+                            protocol_type: String::new(),
+                            protocol_data: String::new(),
+                            members: Vec::new(),
+                        });
+                    }
+                }
+
+                let described = self.coordinator.describe_groups(&groups_to_query);
+                results.extend(described);
+
+                let resp = DescribeGroupsResponse {
+                    throttle_time_ms: 0,
+                    groups: results,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::DeleteGroups => {
+                let req = DeleteGroupsRequest::decode(body, header.api_version)?;
+                let mut groups_to_delete = Vec::new();
+                let mut results = Vec::with_capacity(req.groups_names.len());
+
+                for gid in req.groups_names {
+                    let is_authorized = self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Group,
+                        &gid,
+                        AclOperation::Delete,
+                    ) || self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Cluster,
+                        "kafka-cluster",
+                        AclOperation::Delete,
+                    );
+
+                    if is_authorized {
+                        groups_to_delete.push(gid);
+                    } else {
+                        results.push(DeletableGroupResult {
+                            group_id: gid,
+                            error_code: KafkaErrorCode::GroupAuthorizationFailed,
+                        });
+                    }
+                }
+
+                let del_results = self.coordinator.delete_groups(&groups_to_delete);
+                for (group_id, error_code) in del_results {
+                    results.push(DeletableGroupResult {
+                        group_id,
+                        error_code,
+                    });
+                }
+
+                let resp = DeleteGroupsResponse {
+                    throttle_time_ms: 0,
+                    results,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
             _ => {
                 return Err(OxideMqError::Protocol(format!(
                     "Unsupported Kafka API Key {:?}",
@@ -1331,8 +1675,9 @@ impl BrokerEngine {
 mod tests {
     use super::*;
     use oxidemq_protocol::messages::{
-        AddPartitionsToTxnTopic, CreatableTopic, CreateTopicsConfig, MetadataResponse,
-        PartitionProduceData, TopicProduceData,
+        AddPartitionsToTxnTopic, AlterConfigsResource, AlterableConfig, CreatableTopic,
+        CreateTopicsConfig, DescribeConfigsResource, MetadataResponse, PartitionProduceData,
+        TopicProduceData,
     };
     use oxidemq_s3stream::block_cache::BlockCache;
     use oxidemq_s3stream::client::MemoryObjectStorage;
@@ -2518,5 +2863,276 @@ mod tests {
         // Verify topic is gone from cluster
         assert!(!cluster.has_topic("app-events"));
         assert_eq!(cluster.partition_count(), 0);
+    }
+
+    #[test]
+    fn test_describe_and_alter_configs_handler() {
+        let engine = create_test_engine();
+        let cluster = engine.cluster_state.clone();
+        let mut session = ConnectionAuthState::Authenticated {
+            principal: "admin".into(),
+        };
+
+        // Create a topic "orders"
+        cluster
+            .create_topic("orders", 2, 1, HashMap::new())
+            .unwrap();
+
+        // 1. DescribeConfigs for "orders" (Topic) and "1" (Broker)
+        let desc_req = DescribeConfigsRequest {
+            resources: vec![
+                DescribeConfigsResource {
+                    resource_type: 2, // Topic
+                    resource_name: "orders".into(),
+                    configuration_keys: Some(vec!["cleanup.policy".into(), "retention.ms".into()]),
+                },
+                DescribeConfigsResource {
+                    resource_type: 4, // Broker
+                    resource_name: "1".into(),
+                    configuration_keys: None,
+                },
+            ],
+            include_synonyms: true,
+        };
+        let desc_hdr = RequestHeader::new(ApiKey::DescribeConfigs, 1, 501, Some("admin"));
+        let mut buf = BytesMut::new();
+        desc_req.encode(&mut buf, 1);
+        let mut resp = engine
+            .handle_connection_request(&mut session, &desc_hdr, &mut buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp).unwrap();
+        let desc_resp = DescribeConfigsResponse::decode(&mut resp, 1).unwrap();
+        assert_eq!(desc_resp.results.len(), 2);
+        assert_eq!(desc_resp.results[0].resource_name, "orders");
+        assert_eq!(desc_resp.results[0].error_code, KafkaErrorCode::None);
+        let retention = desc_resp.results[0]
+            .configs
+            .iter()
+            .find(|c| c.name == "retention.ms")
+            .unwrap();
+        assert_eq!(retention.value.as_deref(), Some("604800000"));
+        assert_eq!(retention.config_source, 5); // DefaultConfig
+
+        // 2. AlterConfigs with validate_only = true
+        let alter_val_req = AlterConfigsRequest {
+            resources: vec![AlterConfigsResource {
+                resource_type: 2,
+                resource_name: "orders".into(),
+                configs: vec![AlterableConfig {
+                    name: "retention.ms".into(),
+                    value: Some("86400000".into()),
+                }],
+            }],
+            validate_only: true,
+        };
+        let alter_val_hdr = RequestHeader::new(ApiKey::AlterConfigs, 1, 502, Some("admin"));
+        let mut buf2 = BytesMut::new();
+        alter_val_req.encode(&mut buf2, 1);
+        let mut resp2 = engine
+            .handle_connection_request(&mut session, &alter_val_hdr, &mut buf2.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp2).unwrap();
+        let alter_val_resp = AlterConfigsResponse::decode(&mut resp2, 1).unwrap();
+        assert_eq!(alter_val_resp.responses[0].error_code, KafkaErrorCode::None);
+
+        // Verify config was NOT altered
+        let desc_res_check = cluster
+            .describe_topic_configs("orders", Some(&["retention.ms".into()]))
+            .unwrap();
+        assert_eq!(desc_res_check[0].value.as_deref(), Some("604800000"));
+
+        // 3. AlterConfigs with validate_only = false (commit changes)
+        let alter_commit_req = AlterConfigsRequest {
+            resources: vec![AlterConfigsResource {
+                resource_type: 2,
+                resource_name: "orders".into(),
+                configs: vec![AlterableConfig {
+                    name: "retention.ms".into(),
+                    value: Some("86400000".into()),
+                }],
+            }],
+            validate_only: false,
+        };
+        let alter_commit_hdr = RequestHeader::new(ApiKey::AlterConfigs, 1, 503, Some("admin"));
+        let mut buf3 = BytesMut::new();
+        alter_commit_req.encode(&mut buf3, 1);
+        let mut resp3 = engine
+            .handle_connection_request(&mut session, &alter_commit_hdr, &mut buf3.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp3).unwrap();
+        let alter_commit_resp = AlterConfigsResponse::decode(&mut resp3, 1).unwrap();
+        assert_eq!(
+            alter_commit_resp.responses[0].error_code,
+            KafkaErrorCode::None
+        );
+
+        // 4. DescribeConfigs confirms retention.ms is now 86400000
+        let mut buf4 = BytesMut::new();
+        desc_req.encode(&mut buf4, 1);
+        let mut resp4 = engine
+            .handle_connection_request(&mut session, &desc_hdr, &mut buf4.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp4).unwrap();
+        let desc_resp4 = DescribeConfigsResponse::decode(&mut resp4, 1).unwrap();
+        let updated_retention = desc_resp4.results[0]
+            .configs
+            .iter()
+            .find(|c| c.name == "retention.ms")
+            .unwrap();
+        assert_eq!(updated_retention.value.as_deref(), Some("86400000"));
+        assert_eq!(updated_retention.config_source, 1); // DynamicTopicConfig
+
+        // 5. DescribeConfigs & AlterConfigs for non-existent topic
+        let non_desc_req = DescribeConfigsRequest {
+            resources: vec![DescribeConfigsResource {
+                resource_type: 2,
+                resource_name: "ghost-topic".into(),
+                configuration_keys: None,
+            }],
+            include_synonyms: false,
+        };
+        let mut buf5 = BytesMut::new();
+        non_desc_req.encode(&mut buf5, 1);
+        let mut resp5 = engine
+            .handle_connection_request(&mut session, &desc_hdr, &mut buf5.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp5).unwrap();
+        let desc_resp5 = DescribeConfigsResponse::decode(&mut resp5, 1).unwrap();
+        assert_eq!(
+            desc_resp5.results[0].error_code,
+            KafkaErrorCode::UnknownTopicOrPartition
+        );
+    }
+
+    #[test]
+    fn test_consumer_groups_admin_handler() {
+        let engine = create_test_engine();
+        let coord = engine.coordinator.clone();
+        let mut session = ConnectionAuthState::Authenticated {
+            principal: "admin".into(),
+        };
+
+        // 1. ListGroups initially empty
+        let list_hdr = RequestHeader::new(ApiKey::ListGroups, 1, 601, Some("admin"));
+        let mut list_buf = BytesMut::new();
+        ListGroupsRequest {}.encode(&mut list_buf, 1);
+        let mut list_resp_bytes = engine
+            .handle_connection_request(&mut session, &list_hdr, &mut list_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut list_resp_bytes).unwrap();
+        let list_resp = ListGroupsResponse::decode(&mut list_resp_bytes, 1).unwrap();
+        assert_eq!(list_resp.error_code, KafkaErrorCode::None);
+        assert_eq!(list_resp.groups.len(), 0);
+
+        // 2. Add member via coordinator
+        let (_, gen, member_id, _) =
+            coord.handle_join_group("billing-workers", "", "client-billing", "consumer");
+        let mut assignments = HashMap::new();
+        assignments.insert(member_id.clone(), vec![0xAA, 0xBB]);
+        let _ = coord.handle_sync_group("billing-workers", gen, &member_id, assignments);
+
+        // 3. ListGroups now contains billing-workers
+        let mut list_buf2 = BytesMut::new();
+        ListGroupsRequest {}.encode(&mut list_buf2, 1);
+        let mut list_resp_bytes2 = engine
+            .handle_connection_request(&mut session, &list_hdr, &mut list_buf2.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut list_resp_bytes2).unwrap();
+        let list_resp2 = ListGroupsResponse::decode(&mut list_resp_bytes2, 1).unwrap();
+        assert_eq!(list_resp2.groups.len(), 1);
+        assert_eq!(list_resp2.groups[0].group_id, "billing-workers");
+        assert_eq!(list_resp2.groups[0].protocol_type, "consumer");
+
+        // 4. DescribeGroups returns group details
+        let desc_req = DescribeGroupsRequest {
+            groups: vec!["billing-workers".into(), "phantom".into()],
+        };
+        let desc_hdr = RequestHeader::new(ApiKey::DescribeGroups, 1, 602, Some("admin"));
+        let mut desc_buf = BytesMut::new();
+        desc_req.encode(&mut desc_buf, 1);
+        let mut desc_resp_bytes = engine
+            .handle_connection_request(&mut session, &desc_hdr, &mut desc_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut desc_resp_bytes).unwrap();
+        let desc_resp = DescribeGroupsResponse::decode(&mut desc_resp_bytes, 1).unwrap();
+        assert_eq!(desc_resp.groups.len(), 2);
+        let billing = desc_resp
+            .groups
+            .iter()
+            .find(|g| g.group_id == "billing-workers")
+            .unwrap();
+        assert_eq!(billing.group_state, "Stable");
+        assert_eq!(billing.members.len(), 1);
+        assert_eq!(billing.members[0].member_id, member_id);
+        let phantom = desc_resp
+            .groups
+            .iter()
+            .find(|g| g.group_id == "phantom")
+            .unwrap();
+        assert_eq!(phantom.group_state, "Dead");
+
+        // 5. DeleteGroups on active group -> NonEmptyGroup
+        let del_req = DeleteGroupsRequest {
+            groups_names: vec!["billing-workers".into()],
+        };
+        let del_hdr = RequestHeader::new(ApiKey::DeleteGroups, 1, 603, Some("admin"));
+        let mut del_buf = BytesMut::new();
+        del_req.encode(&mut del_buf, 1);
+        let mut del_resp_bytes = engine
+            .handle_connection_request(&mut session, &del_hdr, &mut del_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut del_resp_bytes).unwrap();
+        let del_resp = DeleteGroupsResponse::decode(&mut del_resp_bytes, 1).unwrap();
+        assert_eq!(del_resp.results.len(), 1);
+        assert_eq!(
+            del_resp.results[0].error_code,
+            KafkaErrorCode::NonEmptyGroup
+        );
+
+        // 6. LeaveGroup -> member departs, group becomes empty
+        let leave_req = LeaveGroupRequest {
+            group_id: "billing-workers".into(),
+            member_id: member_id.clone(),
+        };
+        let leave_hdr = RequestHeader::new(ApiKey::LeaveGroup, 1, 604, Some("client"));
+        let mut leave_buf = BytesMut::new();
+        leave_req.encode(&mut leave_buf, 1);
+        let _ = engine
+            .handle_connection_request(&mut session, &leave_hdr, &mut leave_buf.freeze())
+            .unwrap();
+
+        // 7. DeleteGroups on empty group -> None (success)
+        let mut del_buf2 = BytesMut::new();
+        del_req.encode(&mut del_buf2, 1);
+        let mut del_resp_bytes2 = engine
+            .handle_connection_request(&mut session, &del_hdr, &mut del_buf2.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut del_resp_bytes2).unwrap();
+        let del_resp2 = DeleteGroupsResponse::decode(&mut del_resp_bytes2, 1).unwrap();
+        assert_eq!(del_resp2.results[0].error_code, KafkaErrorCode::None);
+
+        // 8. DeleteGroups on already deleted group -> GroupIdNotFound
+        let mut del_buf3 = BytesMut::new();
+        del_req.encode(&mut del_buf3, 1);
+        let mut del_resp_bytes3 = engine
+            .handle_connection_request(&mut session, &del_hdr, &mut del_buf3.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut del_resp_bytes3).unwrap();
+        let del_resp3 = DeleteGroupsResponse::decode(&mut del_resp_bytes3, 1).unwrap();
+        assert_eq!(
+            del_resp3.results[0].error_code,
+            KafkaErrorCode::GroupIdNotFound
+        );
     }
 }

@@ -11,11 +11,15 @@ mod tests {
     use oxidemq_core::prelude::*;
     use oxidemq_protocol::header::{RequestHeader, ResponseHeader};
     use oxidemq_protocol::messages::{
-        AclCreation, ApiVersionsRequest, ApiVersionsResponse, CreatableTopic, CreateAclsRequest,
-        CreateAclsResponse, CreateTopicsConfig, CreateTopicsRequest, CreateTopicsResponse,
-        DeleteAclsFilter, DeleteAclsRequest, DeleteAclsResponse, DeleteTopicsRequest,
-        DeleteTopicsResponse, DescribeAclsRequest, DescribeAclsResponse, FetchPartition,
+        AclCreation, AlterConfigsRequest, AlterConfigsResource, AlterConfigsResponse,
+        AlterableConfig, ApiVersionsRequest, ApiVersionsResponse, CreatableTopic,
+        CreateAclsRequest, CreateAclsResponse, CreateTopicsConfig, CreateTopicsRequest,
+        CreateTopicsResponse, DeleteAclsFilter, DeleteAclsRequest, DeleteAclsResponse,
+        DeleteGroupsRequest, DeleteGroupsResponse, DeleteTopicsRequest, DeleteTopicsResponse,
+        DescribeAclsRequest, DescribeAclsResponse, DescribeConfigsRequest, DescribeConfigsResource,
+        DescribeConfigsResponse, DescribeGroupsRequest, DescribeGroupsResponse, FetchPartition,
         FetchRequest, FetchResponse, FetchTopic, FindCoordinatorRequest, FindCoordinatorResponse,
+        LeaveGroupRequest, LeaveGroupResponse, ListGroupsRequest, ListGroupsResponse,
         ListOffsetsPartition, ListOffsetsRequest, ListOffsetsResponse, ListOffsetsTopic,
         MetadataRequest, MetadataResponse, OffsetCommitPartition, OffsetCommitRequest,
         OffsetCommitResponse, OffsetCommitTopic, OffsetFetchRequest, OffsetFetchResponse,
@@ -1282,6 +1286,370 @@ mod tests {
         assert_eq!(
             del2_resp.responses[0].error_code,
             KafkaErrorCode::UnknownTopicOrPartition
+        );
+    }
+
+    #[tokio::test]
+    async fn test_configs_management_e2e_over_tcp() {
+        let engine = Arc::new(setup_test_engine());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let engine_clone = Arc::clone(&engine);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let eng = Arc::clone(&engine_clone);
+                    tokio::spawn(async move {
+                        let _ = eng.process_connection(stream).await;
+                    });
+                }
+            }
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        // 1. Create a topic "e2e-config-topic"
+        let ct_hdr = RequestHeader::new(ApiKey::CreateTopics, 1, 1, Some("config-admin"));
+        let mut ct_buf = BytesMut::new();
+        ct_hdr.encode(&mut ct_buf);
+        let ct_req = CreateTopicsRequest {
+            topics: vec![CreatableTopic {
+                name: "e2e-config-topic".into(),
+                num_partitions: 2,
+                replication_factor: 1,
+                assignments: Vec::new(),
+                configs: Vec::new(),
+            }],
+            timeout_ms: 5000,
+            validate_only: false,
+        };
+        ct_req.encode(&mut ct_buf, 1);
+        let mut ct_frame = BytesMut::new();
+        ct_frame.put_i32(ct_buf.len() as i32);
+        ct_frame.put_slice(&ct_buf);
+        stream.write_all(&ct_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let ct_len = stream.read_i32().await.unwrap() as usize;
+        let mut ct_resp_buf = vec![0u8; ct_len];
+        stream.read_exact(&mut ct_resp_buf).await.unwrap();
+        let mut ct_bytes = Bytes::from(ct_resp_buf);
+        let _ = ResponseHeader::decode(&mut ct_bytes).unwrap();
+        let ct_resp = CreateTopicsResponse::decode(&mut ct_bytes, 1).unwrap();
+        assert_eq!(ct_resp.topics[0].error_code, KafkaErrorCode::None);
+
+        // 2. DescribeConfigs for "e2e-config-topic" and broker "1"
+        let desc_hdr = RequestHeader::new(ApiKey::DescribeConfigs, 1, 2, Some("config-admin"));
+        let mut desc_buf = BytesMut::new();
+        desc_hdr.encode(&mut desc_buf);
+        let desc_req = DescribeConfigsRequest {
+            resources: vec![
+                DescribeConfigsResource {
+                    resource_type: 2, // Topic
+                    resource_name: "e2e-config-topic".into(),
+                    configuration_keys: Some(vec!["retention.ms".into()]),
+                },
+                DescribeConfigsResource {
+                    resource_type: 4, // Broker
+                    resource_name: "1".into(),
+                    configuration_keys: None,
+                },
+            ],
+            include_synonyms: true,
+        };
+        desc_req.encode(&mut desc_buf, 1);
+        let mut desc_frame = BytesMut::new();
+        desc_frame.put_i32(desc_buf.len() as i32);
+        desc_frame.put_slice(&desc_buf);
+        stream.write_all(&desc_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let desc_len = stream.read_i32().await.unwrap() as usize;
+        let mut desc_resp_buf = vec![0u8; desc_len];
+        stream.read_exact(&mut desc_resp_buf).await.unwrap();
+        let mut desc_bytes = Bytes::from(desc_resp_buf);
+        let _ = ResponseHeader::decode(&mut desc_bytes).unwrap();
+        let desc_resp = DescribeConfigsResponse::decode(&mut desc_bytes, 1).unwrap();
+        assert_eq!(desc_resp.results.len(), 2);
+        assert_eq!(desc_resp.results[0].resource_name, "e2e-config-topic");
+        assert_eq!(desc_resp.results[0].error_code, KafkaErrorCode::None);
+        assert_eq!(
+            desc_resp.results[0].configs[0].value.as_deref(),
+            Some("604800000")
+        );
+        assert_eq!(desc_resp.results[0].configs[0].config_source, 5); // DefaultConfig
+
+        // 3. AlterConfigs with validate_only = true
+        let alter_hdr = RequestHeader::new(ApiKey::AlterConfigs, 1, 3, Some("config-admin"));
+        let mut alter_buf = BytesMut::new();
+        alter_hdr.encode(&mut alter_buf);
+        let alter_val_req = AlterConfigsRequest {
+            resources: vec![AlterConfigsResource {
+                resource_type: 2,
+                resource_name: "e2e-config-topic".into(),
+                configs: vec![AlterableConfig {
+                    name: "retention.ms".into(),
+                    value: Some("120000".into()),
+                }],
+            }],
+            validate_only: true,
+        };
+        alter_val_req.encode(&mut alter_buf, 1);
+        let mut alter_frame = BytesMut::new();
+        alter_frame.put_i32(alter_buf.len() as i32);
+        alter_frame.put_slice(&alter_buf);
+        stream.write_all(&alter_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let alter_len = stream.read_i32().await.unwrap() as usize;
+        let mut alter_resp_buf = vec![0u8; alter_len];
+        stream.read_exact(&mut alter_resp_buf).await.unwrap();
+        let mut alter_bytes = Bytes::from(alter_resp_buf);
+        let _ = ResponseHeader::decode(&mut alter_bytes).unwrap();
+        let alter_resp = AlterConfigsResponse::decode(&mut alter_bytes, 1).unwrap();
+        assert_eq!(alter_resp.responses[0].error_code, KafkaErrorCode::None);
+
+        // 4. AlterConfigs with validate_only = false (commit changes)
+        let alter_hdr2 = RequestHeader::new(ApiKey::AlterConfigs, 1, 4, Some("config-admin"));
+        let mut alter_buf2 = BytesMut::new();
+        alter_hdr2.encode(&mut alter_buf2);
+        let alter_commit_req = AlterConfigsRequest {
+            resources: vec![AlterConfigsResource {
+                resource_type: 2,
+                resource_name: "e2e-config-topic".into(),
+                configs: vec![AlterableConfig {
+                    name: "retention.ms".into(),
+                    value: Some("120000".into()),
+                }],
+            }],
+            validate_only: false,
+        };
+        alter_commit_req.encode(&mut alter_buf2, 1);
+        let mut alter_frame2 = BytesMut::new();
+        alter_frame2.put_i32(alter_buf2.len() as i32);
+        alter_frame2.put_slice(&alter_buf2);
+        stream.write_all(&alter_frame2).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let alter_len2 = stream.read_i32().await.unwrap() as usize;
+        let mut alter_resp_buf2 = vec![0u8; alter_len2];
+        stream.read_exact(&mut alter_resp_buf2).await.unwrap();
+        let mut alter_bytes2 = Bytes::from(alter_resp_buf2);
+        let _ = ResponseHeader::decode(&mut alter_bytes2).unwrap();
+        let alter_resp2 = AlterConfigsResponse::decode(&mut alter_bytes2, 1).unwrap();
+        assert_eq!(alter_resp2.responses[0].error_code, KafkaErrorCode::None);
+
+        // 5. DescribeConfigs confirms retention.ms is now 120000
+        let desc_hdr2 = RequestHeader::new(ApiKey::DescribeConfigs, 1, 5, Some("config-admin"));
+        let mut desc_buf2 = BytesMut::new();
+        desc_hdr2.encode(&mut desc_buf2);
+        desc_req.encode(&mut desc_buf2, 1);
+        let mut desc_frame2 = BytesMut::new();
+        desc_frame2.put_i32(desc_buf2.len() as i32);
+        desc_frame2.put_slice(&desc_buf2);
+        stream.write_all(&desc_frame2).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let desc_len2 = stream.read_i32().await.unwrap() as usize;
+        let mut desc_resp_buf2 = vec![0u8; desc_len2];
+        stream.read_exact(&mut desc_resp_buf2).await.unwrap();
+        let mut desc_bytes2 = Bytes::from(desc_resp_buf2);
+        let _ = ResponseHeader::decode(&mut desc_bytes2).unwrap();
+        let desc_resp2 = DescribeConfigsResponse::decode(&mut desc_bytes2, 1).unwrap();
+        assert_eq!(
+            desc_resp2.results[0].configs[0].value.as_deref(),
+            Some("120000")
+        );
+        assert_eq!(desc_resp2.results[0].configs[0].config_source, 1); // DynamicTopicConfig
+    }
+
+    #[tokio::test]
+    async fn test_consumer_groups_admin_e2e_over_tcp() {
+        let engine = Arc::new(setup_test_engine());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let engine_clone = Arc::clone(&engine);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let eng = Arc::clone(&engine_clone);
+                    tokio::spawn(async move {
+                        let _ = eng.process_connection(stream).await;
+                    });
+                }
+            }
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        // 1. ListGroups: initially empty
+        let list_hdr = RequestHeader::new(ApiKey::ListGroups, 1, 1, Some("group-admin"));
+        let mut list_buf = BytesMut::new();
+        list_hdr.encode(&mut list_buf);
+        ListGroupsRequest {}.encode(&mut list_buf, 1);
+        let mut list_frame = BytesMut::new();
+        list_frame.put_i32(list_buf.len() as i32);
+        list_frame.put_slice(&list_buf);
+        stream.write_all(&list_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let list_len = stream.read_i32().await.unwrap() as usize;
+        let mut list_resp_buf = vec![0u8; list_len];
+        stream.read_exact(&mut list_resp_buf).await.unwrap();
+        let mut list_bytes = Bytes::from(list_resp_buf);
+        let _ = ResponseHeader::decode(&mut list_bytes).unwrap();
+        let list_resp = ListGroupsResponse::decode(&mut list_bytes, 1).unwrap();
+        assert_eq!(list_resp.error_code, KafkaErrorCode::None);
+        assert_eq!(list_resp.groups.len(), 0);
+
+        // 2. Setup group in coordinator
+        let coord = engine.coordinator();
+        let (_, gen, member_id, _) =
+            coord.handle_join_group("e2e-order-group", "", "consumer-client", "consumer");
+        let mut assigns = std::collections::HashMap::new();
+        assigns.insert(member_id.clone(), vec![0x11, 0x22]);
+        let _ = coord.handle_sync_group("e2e-order-group", gen, &member_id, assigns);
+
+        // 3. ListGroups: returns e2e-order-group
+        let list_hdr2 = RequestHeader::new(ApiKey::ListGroups, 1, 2, Some("group-admin"));
+        let mut list_buf2 = BytesMut::new();
+        list_hdr2.encode(&mut list_buf2);
+        ListGroupsRequest {}.encode(&mut list_buf2, 1);
+        let mut list_frame2 = BytesMut::new();
+        list_frame2.put_i32(list_buf2.len() as i32);
+        list_frame2.put_slice(&list_buf2);
+        stream.write_all(&list_frame2).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let list_len2 = stream.read_i32().await.unwrap() as usize;
+        let mut list_resp_buf2 = vec![0u8; list_len2];
+        stream.read_exact(&mut list_resp_buf2).await.unwrap();
+        let mut list_bytes2 = Bytes::from(list_resp_buf2);
+        let _ = ResponseHeader::decode(&mut list_bytes2).unwrap();
+        let list_resp2 = ListGroupsResponse::decode(&mut list_bytes2, 1).unwrap();
+        assert_eq!(list_resp2.groups.len(), 1);
+        assert_eq!(list_resp2.groups[0].group_id, "e2e-order-group");
+        assert_eq!(list_resp2.groups[0].protocol_type, "consumer");
+
+        // 4. DescribeGroups: returns group state and members
+        let desc_hdr = RequestHeader::new(ApiKey::DescribeGroups, 1, 3, Some("group-admin"));
+        let mut desc_buf = BytesMut::new();
+        desc_hdr.encode(&mut desc_buf);
+        let desc_req = DescribeGroupsRequest {
+            groups: vec!["e2e-order-group".into(), "nonexistent".into()],
+        };
+        desc_req.encode(&mut desc_buf, 1);
+        let mut desc_frame = BytesMut::new();
+        desc_frame.put_i32(desc_buf.len() as i32);
+        desc_frame.put_slice(&desc_buf);
+        stream.write_all(&desc_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let desc_len = stream.read_i32().await.unwrap() as usize;
+        let mut desc_resp_buf = vec![0u8; desc_len];
+        stream.read_exact(&mut desc_resp_buf).await.unwrap();
+        let mut desc_bytes = Bytes::from(desc_resp_buf);
+        let _ = ResponseHeader::decode(&mut desc_bytes).unwrap();
+        let desc_resp = DescribeGroupsResponse::decode(&mut desc_bytes, 1).unwrap();
+        assert_eq!(desc_resp.groups.len(), 2);
+        let g1 = desc_resp
+            .groups
+            .iter()
+            .find(|g| g.group_id == "e2e-order-group")
+            .unwrap();
+        assert_eq!(g1.group_state, "Stable");
+        assert_eq!(g1.members.len(), 1);
+        assert_eq!(g1.members[0].member_id, member_id);
+
+        // 5. DeleteGroups: active group returns NonEmptyGroup
+        let del_hdr = RequestHeader::new(ApiKey::DeleteGroups, 1, 4, Some("group-admin"));
+        let mut del_buf = BytesMut::new();
+        del_hdr.encode(&mut del_buf);
+        let del_req = DeleteGroupsRequest {
+            groups_names: vec!["e2e-order-group".into()],
+        };
+        del_req.encode(&mut del_buf, 1);
+        let mut del_frame = BytesMut::new();
+        del_frame.put_i32(del_buf.len() as i32);
+        del_frame.put_slice(&del_buf);
+        stream.write_all(&del_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let del_len = stream.read_i32().await.unwrap() as usize;
+        let mut del_resp_buf = vec![0u8; del_len];
+        stream.read_exact(&mut del_resp_buf).await.unwrap();
+        let mut del_bytes = Bytes::from(del_resp_buf);
+        let _ = ResponseHeader::decode(&mut del_bytes).unwrap();
+        let del_resp = DeleteGroupsResponse::decode(&mut del_bytes, 1).unwrap();
+        assert_eq!(
+            del_resp.results[0].error_code,
+            KafkaErrorCode::NonEmptyGroup
+        );
+
+        // 6. LeaveGroup: member departs
+        let leave_hdr = RequestHeader::new(ApiKey::LeaveGroup, 1, 5, Some("client"));
+        let mut leave_buf = BytesMut::new();
+        leave_hdr.encode(&mut leave_buf);
+        let leave_req = LeaveGroupRequest {
+            group_id: "e2e-order-group".into(),
+            member_id: member_id.clone(),
+        };
+        leave_req.encode(&mut leave_buf, 1);
+        let mut leave_frame = BytesMut::new();
+        leave_frame.put_i32(leave_buf.len() as i32);
+        leave_frame.put_slice(&leave_buf);
+        stream.write_all(&leave_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let leave_len = stream.read_i32().await.unwrap() as usize;
+        let mut leave_resp_buf = vec![0u8; leave_len];
+        stream.read_exact(&mut leave_resp_buf).await.unwrap();
+        let mut leave_bytes = Bytes::from(leave_resp_buf);
+        let _ = ResponseHeader::decode(&mut leave_bytes).unwrap();
+        let leave_resp = LeaveGroupResponse::decode(&mut leave_bytes, 1).unwrap();
+        assert_eq!(leave_resp.error_code, KafkaErrorCode::None);
+
+        // 7. DeleteGroups: empty group succeeds
+        let del_hdr2 = RequestHeader::new(ApiKey::DeleteGroups, 1, 6, Some("group-admin"));
+        let mut del_buf2 = BytesMut::new();
+        del_hdr2.encode(&mut del_buf2);
+        del_req.encode(&mut del_buf2, 1);
+        let mut del_frame2 = BytesMut::new();
+        del_frame2.put_i32(del_buf2.len() as i32);
+        del_frame2.put_slice(&del_buf2);
+        stream.write_all(&del_frame2).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let del_len2 = stream.read_i32().await.unwrap() as usize;
+        let mut del_resp_buf2 = vec![0u8; del_len2];
+        stream.read_exact(&mut del_resp_buf2).await.unwrap();
+        let mut del_bytes2 = Bytes::from(del_resp_buf2);
+        let _ = ResponseHeader::decode(&mut del_bytes2).unwrap();
+        let del_resp2 = DeleteGroupsResponse::decode(&mut del_bytes2, 1).unwrap();
+        assert_eq!(del_resp2.results[0].error_code, KafkaErrorCode::None);
+
+        // 8. DeleteGroups: second delete returns GroupIdNotFound
+        let del_hdr3 = RequestHeader::new(ApiKey::DeleteGroups, 1, 7, Some("group-admin"));
+        let mut del_buf3 = BytesMut::new();
+        del_hdr3.encode(&mut del_buf3);
+        del_req.encode(&mut del_buf3, 1);
+        let mut del_frame3 = BytesMut::new();
+        del_frame3.put_i32(del_buf3.len() as i32);
+        del_frame3.put_slice(&del_buf3);
+        stream.write_all(&del_frame3).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let del_len3 = stream.read_i32().await.unwrap() as usize;
+        let mut del_resp_buf3 = vec![0u8; del_len3];
+        stream.read_exact(&mut del_resp_buf3).await.unwrap();
+        let mut del_bytes3 = Bytes::from(del_resp_buf3);
+        let _ = ResponseHeader::decode(&mut del_bytes3).unwrap();
+        let del_resp3 = DeleteGroupsResponse::decode(&mut del_bytes3, 1).unwrap();
+        assert_eq!(
+            del_resp3.results[0].error_code,
+            KafkaErrorCode::GroupIdNotFound
         );
     }
 }

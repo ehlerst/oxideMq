@@ -17,18 +17,23 @@ pub use messages::{
     AclPermissionType, AclResourcePatternType, AclResourceType, AddOffsetsToTxnRequest,
     AddOffsetsToTxnResponse, AddPartitionsToTxnPartitionResult, AddPartitionsToTxnRequest,
     AddPartitionsToTxnResponse, AddPartitionsToTxnTopic, AddPartitionsToTxnTopicResult,
-    ApiVersionKey, ApiVersionsRequest, ApiVersionsResponse, BrokerMetadata, CreatableTopic,
-    CreatableTopicResult, CreateAclsRequest, CreateAclsResponse, CreateTopicsConfig,
-    CreateTopicsReplicaAssignment, CreateTopicsRequest, CreateTopicsResponse, DeletableTopicResult,
-    DeleteAclsFilter, DeleteAclsFilterResult, DeleteAclsMatchingAcl, DeleteAclsRequest,
-    DeleteAclsResponse, DeleteTopicsRequest, DeleteTopicsResponse, DescribeAclsRequest,
-    DescribeAclsResource, DescribeAclsResponse, EndTxnRequest, EndTxnResponse, FetchPartition,
-    FetchPartitionResponse, FetchRequest, FetchResponse, FetchTopic, FetchTopicResponse,
-    FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
-    InitProducerIdRequest, InitProducerIdResponse, LeaveGroupRequest, LeaveGroupResponse,
-    ListOffsetsPartition, ListOffsetsPartitionResponse, ListOffsetsRequest, ListOffsetsResponse,
-    ListOffsetsTopic, ListOffsetsTopicResponse, MetadataRequest, MetadataResponse,
-    OffsetCommitPartition, OffsetCommitPartitionResponse, OffsetCommitRequest,
+    AlterConfigsRequest, AlterConfigsResource, AlterConfigsResourceResponse, AlterConfigsResponse,
+    AlterableConfig, ApiVersionKey, ApiVersionsRequest, ApiVersionsResponse, BrokerMetadata,
+    CreatableTopic, CreatableTopicResult, CreateAclsRequest, CreateAclsResponse,
+    CreateTopicsConfig, CreateTopicsReplicaAssignment, CreateTopicsRequest, CreateTopicsResponse,
+    DeletableGroupResult, DeletableTopicResult, DeleteAclsFilter, DeleteAclsFilterResult,
+    DeleteAclsMatchingAcl, DeleteAclsRequest, DeleteAclsResponse, DeleteGroupsRequest,
+    DeleteGroupsResponse, DeleteTopicsRequest, DeleteTopicsResponse, DescribeAclsRequest,
+    DescribeAclsResource, DescribeAclsResponse, DescribeConfigsRequest, DescribeConfigsResource,
+    DescribeConfigsResourceResult, DescribeConfigsResponse, DescribeConfigsResult,
+    DescribeConfigsSynonym, DescribeGroupsRequest, DescribeGroupsResponse, DescribedGroup,
+    DescribedGroupMember, EndTxnRequest, EndTxnResponse, FetchPartition, FetchPartitionResponse,
+    FetchRequest, FetchResponse, FetchTopic, FetchTopicResponse, FindCoordinatorRequest,
+    FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse, InitProducerIdRequest,
+    InitProducerIdResponse, LeaveGroupRequest, LeaveGroupResponse, ListGroupsRequest,
+    ListGroupsResponse, ListOffsetsPartition, ListOffsetsPartitionResponse, ListOffsetsRequest,
+    ListOffsetsResponse, ListOffsetsTopic, ListOffsetsTopicResponse, ListedGroup, MetadataRequest,
+    MetadataResponse, OffsetCommitPartition, OffsetCommitPartitionResponse, OffsetCommitRequest,
     OffsetCommitResponse, OffsetCommitTopic, OffsetCommitTopicResponse,
     OffsetFetchPartitionResponse, OffsetFetchRequest, OffsetFetchResponse, OffsetFetchTopic,
     OffsetFetchTopicResponse, PartitionMetadata, PartitionProduceData, PartitionProduceResponse,
@@ -53,6 +58,8 @@ pub enum ApiKey {
     Heartbeat = 12,
     LeaveGroup = 13,
     SyncGroup = 14,
+    DescribeGroups = 15,
+    ListGroups = 16,
     SaslHandshake = 17,
     ApiVersions = 18,
     CreateTopics = 19,
@@ -67,6 +74,7 @@ pub enum ApiKey {
     DescribeConfigs = 32,
     AlterConfigs = 33,
     SaslAuthenticate = 36,
+    DeleteGroups = 42,
 }
 
 impl ApiKey {
@@ -83,6 +91,8 @@ impl ApiKey {
             12 => Some(Self::Heartbeat),
             13 => Some(Self::LeaveGroup),
             14 => Some(Self::SyncGroup),
+            15 => Some(Self::DescribeGroups),
+            16 => Some(Self::ListGroups),
             17 => Some(Self::SaslHandshake),
             18 => Some(Self::ApiVersions),
             19 => Some(Self::CreateTopics),
@@ -97,6 +107,7 @@ impl ApiKey {
             32 => Some(Self::DescribeConfigs),
             33 => Some(Self::AlterConfigs),
             36 => Some(Self::SaslAuthenticate),
+            42 => Some(Self::DeleteGroups),
             _ => None,
         }
     }
@@ -119,6 +130,8 @@ mod tests {
         assert_eq!(ApiKey::from_i16(12), Some(ApiKey::Heartbeat));
         assert_eq!(ApiKey::from_i16(13), Some(ApiKey::LeaveGroup));
         assert_eq!(ApiKey::from_i16(14), Some(ApiKey::SyncGroup));
+        assert_eq!(ApiKey::from_i16(15), Some(ApiKey::DescribeGroups));
+        assert_eq!(ApiKey::from_i16(16), Some(ApiKey::ListGroups));
         assert_eq!(ApiKey::from_i16(17), Some(ApiKey::SaslHandshake));
         assert_eq!(ApiKey::from_i16(18), Some(ApiKey::ApiVersions));
         assert_eq!(ApiKey::from_i16(19), Some(ApiKey::CreateTopics));
@@ -133,6 +146,7 @@ mod tests {
         assert_eq!(ApiKey::from_i16(32), Some(ApiKey::DescribeConfigs));
         assert_eq!(ApiKey::from_i16(33), Some(ApiKey::AlterConfigs));
         assert_eq!(ApiKey::from_i16(36), Some(ApiKey::SaslAuthenticate));
+        assert_eq!(ApiKey::from_i16(42), Some(ApiKey::DeleteGroups));
         assert_eq!(ApiKey::from_i16(99), None);
     }
 }

@@ -1,5 +1,6 @@
+use bytes::Bytes;
 use oxidemq_core::types::TopicPartition;
-use oxidemq_protocol::KafkaErrorCode;
+use oxidemq_protocol::{DescribedGroup, DescribedGroupMember, KafkaErrorCode};
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, Ordering};
@@ -231,6 +232,90 @@ impl GroupCoordinator {
         }
         snapshots
     }
+
+    /// Lists all active consumer groups and their protocol types.
+    pub fn list_groups(&self) -> Vec<(String, String)> {
+        let groups = self.groups.read();
+        let mut list = Vec::with_capacity(groups.len());
+        for (gid, g) in groups.iter() {
+            list.push((gid.clone(), g.protocol_type.clone()));
+        }
+        list
+    }
+
+    /// Describes metadata, state, and members for the requested groups.
+    pub fn describe_groups(&self, group_ids: &[String]) -> Vec<DescribedGroup> {
+        let groups = self.groups.read();
+        let mut result = Vec::with_capacity(group_ids.len());
+
+        for gid in group_ids {
+            if let Some(g) = groups.get(gid) {
+                let state_str = match g.state {
+                    GroupState::Empty => "Empty",
+                    GroupState::PreparingRebalance => "PreparingRebalance",
+                    GroupState::CompletingRebalance => "CompletingRebalance",
+                    GroupState::Stable => "Stable",
+                    GroupState::Dead => "Dead",
+                };
+                let members = g
+                    .members
+                    .values()
+                    .map(|m| DescribedGroupMember {
+                        member_id: m.member_id.clone(),
+                        client_id: m.client_id.clone(),
+                        client_host: m.client_host.clone(),
+                        member_metadata: Bytes::copy_from_slice(&m.protocol_metadata),
+                        member_assignment: Bytes::copy_from_slice(&m.assignment),
+                    })
+                    .collect();
+
+                result.push(DescribedGroup {
+                    error_code: KafkaErrorCode::None,
+                    group_id: gid.clone(),
+                    group_state: state_str.to_string(),
+                    protocol_type: g.protocol_type.clone(),
+                    protocol_data: g.protocol_name.clone().unwrap_or_default(),
+                    members,
+                });
+            } else {
+                result.push(DescribedGroup {
+                    error_code: KafkaErrorCode::None,
+                    group_id: gid.clone(),
+                    group_state: "Dead".to_string(),
+                    protocol_type: String::new(),
+                    protocol_data: String::new(),
+                    members: Vec::new(),
+                });
+            }
+        }
+        result
+    }
+
+    /// Deletes consumer groups. Only groups in Empty or Dead state can be deleted.
+    pub fn delete_groups(&self, group_ids: &[String]) -> Vec<(String, KafkaErrorCode)> {
+        let mut groups = self.groups.write();
+        let mut results = Vec::with_capacity(group_ids.len());
+
+        for gid in group_ids {
+            match groups.get(gid) {
+                None => {
+                    results.push((gid.clone(), KafkaErrorCode::GroupIdNotFound));
+                }
+                Some(group) => {
+                    if !group.members.is_empty()
+                        && group.state != GroupState::Empty
+                        && group.state != GroupState::Dead
+                    {
+                        results.push((gid.clone(), KafkaErrorCode::NonEmptyGroup));
+                    } else {
+                        groups.remove(gid);
+                        results.push((gid.clone(), KafkaErrorCode::None));
+                    }
+                }
+            }
+        }
+        results
+    }
 }
 
 #[cfg(test)]
@@ -299,5 +384,62 @@ mod tests {
 
         coord.reset();
         assert_eq!(coord.group_count(), 0);
+    }
+
+    #[test]
+    fn test_groups_admin_coordinator() {
+        let coord = GroupCoordinator::new();
+
+        // Initially no groups
+        assert_eq!(coord.list_groups().len(), 0);
+
+        // Describe non-existent group returns Dead
+        let desc_non = coord.describe_groups(&["ghost-group".to_string()]);
+        assert_eq!(desc_non.len(), 1);
+        assert_eq!(desc_non[0].group_id, "ghost-group");
+        assert_eq!(desc_non[0].group_state, "Dead");
+        assert_eq!(desc_non[0].members.len(), 0);
+
+        // Join group
+        let (_, gen, member_id, _) =
+            coord.handle_join_group("admin-test-group", "", "client-x", "consumer");
+        let mut assignments = HashMap::new();
+        assignments.insert(member_id.clone(), vec![1, 2, 3]);
+        let _ = coord.handle_sync_group("admin-test-group", gen, &member_id, assignments);
+
+        // List groups contains admin-test-group
+        let list = coord.list_groups();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].0, "admin-test-group");
+        assert_eq!(list[0].1, "consumer");
+
+        // Describe groups
+        let desc = coord.describe_groups(&["admin-test-group".to_string()]);
+        assert_eq!(desc.len(), 1);
+        assert_eq!(desc[0].group_id, "admin-test-group");
+        assert_eq!(desc[0].group_state, "Stable");
+        assert_eq!(desc[0].members.len(), 1);
+        assert_eq!(desc[0].members[0].member_id, member_id);
+        assert_eq!(desc[0].members[0].member_assignment, vec![1, 2, 3]);
+
+        // Attempt delete while group has active members -> NonEmptyGroup
+        let del_res = coord.delete_groups(&["admin-test-group".to_string()]);
+        assert_eq!(del_res.len(), 1);
+        assert_eq!(del_res[0].1, KafkaErrorCode::NonEmptyGroup);
+
+        // Member leaves group -> becomes Empty
+        let _ = coord.handle_leave_group("admin-test-group", &member_id);
+        let desc_empty = coord.describe_groups(&["admin-test-group".to_string()]);
+        assert_eq!(desc_empty[0].group_state, "Empty");
+
+        // Delete empty group -> None (success)
+        let del_res2 = coord.delete_groups(&["admin-test-group".to_string()]);
+        assert_eq!(del_res2.len(), 1);
+        assert_eq!(del_res2[0].1, KafkaErrorCode::None);
+
+        // Subsequent delete -> GroupIdNotFound
+        let del_res3 = coord.delete_groups(&["admin-test-group".to_string()]);
+        assert_eq!(del_res3.len(), 1);
+        assert_eq!(del_res3[0].1, KafkaErrorCode::GroupIdNotFound);
     }
 }

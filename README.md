@@ -335,6 +335,75 @@ kafka-topics.sh --bootstrap-server localhost:9092 \
 
 ---
 
+## ⚙️ Dynamic Configuration Management (`DescribeConfigs` & `AlterConfigs`)
+
+oxideMq supports real-time inspection and runtime alteration of topic-level and broker-level configuration parameters over native Kafka wire protocol:
+- **Wire APIs Supported**:
+  - `DescribeConfigs` (ApiKey 32, v0–v2)
+  - `AlterConfigs` (ApiKey 33, v0–v1)
+- **Standard Kafka CLI Compatibility**: Fully compatible with `kafka-configs.sh` (`--describe`, `--alter`, `--add-config`, `--delete-config`) and Kafka Java/Rust `AdminClient` APIs.
+- **Resource Types Supported**:
+  - `Topic`: Inspect and dynamically modify topic properties including `cleanup.policy`, `retention.ms`, `retention.bytes`, `max.message.bytes`, and custom key-value pairs.
+  - `Broker`: Inspect static and dynamic broker settings (node ID, listeners, advertised ports, storage engine, S3 bucket/endpoint).
+- **Validation & Safety Modes**:
+  - Supports `validate_only` dry-run mode in `AlterConfigs` to check validity without applying changes.
+  - Rejects invalid configuration updates with standard `InvalidConfig` (error code 40) or `UnknownTopicOrPartition` (error code 3).
+- **ACL Authorization Enforcement**:
+  - `DescribeConfigs`: Enforces `AclOperation::DescribeConfigs` on the target `Topic` or `Broker` resource.
+  - `AlterConfigs`: Enforces `AclOperation::AlterConfigs` on the target `Topic` or `Broker` resource.
+
+```bash
+# Describe topic configurations using official kafka-configs.sh:
+kafka-configs.sh --bootstrap-server localhost:9092 \
+  --entity-type topics --entity-name orders-stream --describe
+
+# Dynamically alter topic configuration:
+kafka-configs.sh --bootstrap-server localhost:9092 \
+  --entity-type topics --entity-name orders-stream \
+  --alter --add-config retention.ms=86400000,cleanup.policy=delete
+
+# Describe broker configurations:
+kafka-configs.sh --bootstrap-server localhost:9092 \
+  --entity-type brokers --entity-name 0 --describe
+```
+
+---
+
+## 👥 Consumer Group Administration (`ListGroups`, `DescribeGroups`, & `DeleteGroups`)
+
+oxideMq provides comprehensive consumer group lifecycle and state inspection tools compatible with Apache Kafka administrative standards:
+- **Wire APIs Supported**:
+  - `ListGroups` (ApiKey 16, v0–v2)
+  - `DescribeGroups` (ApiKey 15, v0–v2)
+  - `DeleteGroups` (ApiKey 42, v0–v2)
+- **Standard Kafka CLI Compatibility**: 100% compatible with `kafka-consumer-groups.sh` (`--list`, `--describe`, `--delete`) and Kafka `AdminClient` (`listConsumerGroups()`, `describeConsumerGroups()`, `deleteConsumerGroups()`).
+- **Group State Machine Visibility**:
+  - Tracks states: `Stable`, `PreparingRebalance`, `CompletingRebalance`, `Empty`, and `Dead`.
+  - Exposes active members, member IDs, client IDs, client IP addresses, protocol types (`consumer`), and partition assignment byte arrays.
+- **Safe Lifecycle Deletion Protections**:
+  - Active groups with running consumers cannot be deleted accidentally and return standard `NonEmptyGroup` (error code 68).
+  - Deleting non-existent groups returns `GroupIdNotFound` (error code 69).
+  - Empty or dead groups are purged cleanly along with their associated metadata.
+- **ACL Authorization Enforcement**:
+  - `ListGroups`: Enforces `AclOperation::Describe` on `Cluster:kafka-cluster`.
+  - `DescribeGroups`: Enforces `AclOperation::Describe` on the target `Group:<group-id>`.
+  - `DeleteGroups`: Enforces `AclOperation::Delete` on the target `Group:<group-id>`.
+
+```bash
+# List all active and managed consumer groups:
+kafka-consumer-groups.sh --bootstrap-server localhost:9092 --list
+
+# Describe a specific consumer group, its state, members, and partition assignments:
+kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --group order-processors --describe
+
+# Safely delete an inactive consumer group:
+kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
+  --group order-processors --delete
+```
+
+---
+
 ## 🚀 Line-Rate 2.5GbE Network Benchmark (`oxidemq-bench`)
 
 oxideMq includes a dedicated, multi-threaded stress-test tool capable of saturating 2.5GbE network links across hundreds of partitions:
