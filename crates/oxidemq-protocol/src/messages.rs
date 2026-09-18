@@ -3279,6 +3279,348 @@ impl DeleteAclsResponse {
     }
 }
 
+// ============================================================================
+// Topic Management Definitions & Codecs (ApiKeys 19 CreateTopics, 20 DeleteTopics)
+// ============================================================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTopicsReplicaAssignment {
+    pub partition_index: i32,
+    pub broker_ids: Vec<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTopicsConfig {
+    pub name: String,
+    pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatableTopic {
+    pub name: String,
+    pub num_partitions: i32,
+    pub replication_factor: i16,
+    pub assignments: Vec<CreateTopicsReplicaAssignment>,
+    pub configs: Vec<CreateTopicsConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTopicsRequest {
+    pub topics: Vec<CreatableTopic>,
+    pub timeout_ms: i32,
+    pub validate_only: bool,
+}
+
+impl CreateTopicsRequest {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol(
+                "Truncated CreateTopicsRequest topics count".into(),
+            ));
+        }
+        let count = src.get_i32();
+        if count < 0 {
+            return Err(OxideMqError::Protocol("Negative topics count".into()));
+        }
+        let count = count as usize;
+        let mut topics = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            if src.len() < 6 {
+                return Err(OxideMqError::Protocol(
+                    "Truncated CreatableTopic partitions/replication".into(),
+                ));
+            }
+            let num_partitions = src.get_i32();
+            let replication_factor = src.get_i16();
+
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol("Truncated assignments count".into()));
+            }
+            let assign_count = src.get_i32();
+            let assign_count = if assign_count < 0 {
+                0
+            } else {
+                assign_count as usize
+            };
+            let mut assignments = Vec::with_capacity(assign_count);
+            for _ in 0..assign_count {
+                if src.len() < 8 {
+                    return Err(OxideMqError::Protocol("Truncated assignment data".into()));
+                }
+                let partition_index = src.get_i32();
+                let brokers_count = src.get_i32();
+                let brokers_count = if brokers_count < 0 {
+                    0
+                } else {
+                    brokers_count as usize
+                };
+                if src.len() < brokers_count * 4 {
+                    return Err(OxideMqError::Protocol("Truncated broker_ids".into()));
+                }
+                let mut broker_ids = Vec::with_capacity(brokers_count);
+                for _ in 0..brokers_count {
+                    broker_ids.push(src.get_i32());
+                }
+                assignments.push(CreateTopicsReplicaAssignment {
+                    partition_index,
+                    broker_ids,
+                });
+            }
+
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol("Truncated configs count".into()));
+            }
+            let config_count = src.get_i32();
+            let config_count = if config_count < 0 {
+                0
+            } else {
+                config_count as usize
+            };
+            let mut configs = Vec::with_capacity(config_count);
+            for _ in 0..config_count {
+                let c_name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+                let c_val = KafkaDecoder::read_string(src)?;
+                configs.push(CreateTopicsConfig {
+                    name: c_name,
+                    value: c_val,
+                });
+            }
+
+            topics.push(CreatableTopic {
+                name,
+                num_partitions,
+                replication_factor,
+                assignments,
+                configs,
+            });
+        }
+
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol("Truncated timeout_ms".into()));
+        }
+        let timeout_ms = src.get_i32();
+        let validate_only = if version >= 1 && src.has_remaining() {
+            src.get_u8() != 0
+        } else {
+            false
+        };
+
+        Ok(Self {
+            topics,
+            timeout_ms,
+            validate_only,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        dst.put_i32(self.topics.len() as i32);
+        for t in &self.topics {
+            KafkaEncoder::write_string(dst, Some(&t.name));
+            dst.put_i32(t.num_partitions);
+            dst.put_i16(t.replication_factor);
+
+            dst.put_i32(t.assignments.len() as i32);
+            for a in &t.assignments {
+                dst.put_i32(a.partition_index);
+                dst.put_i32(a.broker_ids.len() as i32);
+                for b in &a.broker_ids {
+                    dst.put_i32(*b);
+                }
+            }
+
+            dst.put_i32(t.configs.len() as i32);
+            for c in &t.configs {
+                KafkaEncoder::write_string(dst, Some(&c.name));
+                KafkaEncoder::write_string(dst, c.value.as_deref());
+            }
+        }
+
+        dst.put_i32(self.timeout_ms);
+        if version >= 1 {
+            dst.put_u8(self.validate_only as u8);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatableTopicResult {
+    pub name: String,
+    pub error_code: KafkaErrorCode,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreateTopicsResponse {
+    pub throttle_time_ms: i32,
+    pub topics: Vec<CreatableTopicResult>,
+}
+
+impl CreateTopicsResponse {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let throttle_time_ms = if version >= 2 {
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol("Truncated throttle_time_ms".into()));
+            }
+            src.get_i32()
+        } else {
+            0
+        };
+
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol("Truncated topics count".into()));
+        }
+        let count = src.get_i32();
+        if count < 0 {
+            return Err(OxideMqError::Protocol("Negative topics count".into()));
+        }
+        let count = count as usize;
+        let mut topics = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            if src.len() < 2 {
+                return Err(OxideMqError::Protocol("Truncated error_code".into()));
+            }
+            let error_code = KafkaErrorCode::from_i16(src.get_i16());
+            let error_message = if version >= 1 {
+                KafkaDecoder::read_string(src)?
+            } else {
+                None
+            };
+            topics.push(CreatableTopicResult {
+                name,
+                error_code,
+                error_message,
+            });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            topics,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        if version >= 2 {
+            dst.put_i32(self.throttle_time_ms);
+        }
+        dst.put_i32(self.topics.len() as i32);
+        for t in &self.topics {
+            KafkaEncoder::write_string(dst, Some(&t.name));
+            dst.put_i16(t.error_code.code());
+            if version >= 1 {
+                KafkaEncoder::write_string(dst, t.error_message.as_deref());
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteTopicsRequest {
+    pub topic_names: Vec<String>,
+    pub timeout_ms: i32,
+}
+
+impl DeleteTopicsRequest {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol(
+                "Truncated DeleteTopicsRequest count".into(),
+            ));
+        }
+        let count = src.get_i32();
+        if count < 0 {
+            return Err(OxideMqError::Protocol("Negative count".into()));
+        }
+        let count = count as usize;
+        let mut topic_names = Vec::with_capacity(count);
+        for _ in 0..count {
+            if let Some(name) = KafkaDecoder::read_string(src)? {
+                topic_names.push(name);
+            }
+        }
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol("Truncated timeout_ms".into()));
+        }
+        let timeout_ms = src.get_i32();
+
+        Ok(Self {
+            topic_names,
+            timeout_ms,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.topic_names.len() as i32);
+        for name in &self.topic_names {
+            KafkaEncoder::write_string(dst, Some(name));
+        }
+        dst.put_i32(self.timeout_ms);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeletableTopicResult {
+    pub name: String,
+    pub error_code: KafkaErrorCode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteTopicsResponse {
+    pub throttle_time_ms: i32,
+    pub responses: Vec<DeletableTopicResult>,
+}
+
+impl DeleteTopicsResponse {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let throttle_time_ms = if version >= 1 {
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol("Truncated throttle_time_ms".into()));
+            }
+            src.get_i32()
+        } else {
+            0
+        };
+
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol("Truncated responses count".into()));
+        }
+        let count = src.get_i32();
+        if count < 0 {
+            return Err(OxideMqError::Protocol("Negative responses count".into()));
+        }
+        let count = count as usize;
+        let mut responses = Vec::with_capacity(count);
+
+        for _ in 0..count {
+            let name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            if src.len() < 2 {
+                return Err(OxideMqError::Protocol("Truncated error_code".into()));
+            }
+            let error_code = KafkaErrorCode::from_i16(src.get_i16());
+            responses.push(DeletableTopicResult { name, error_code });
+        }
+
+        Ok(Self {
+            throttle_time_ms,
+            responses,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        if version >= 1 {
+            dst.put_i32(self.throttle_time_ms);
+        }
+        dst.put_i32(self.responses.len() as i32);
+        for r in &self.responses {
+            KafkaEncoder::write_string(dst, Some(&r.name));
+            dst.put_i16(r.error_code.code());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4173,6 +4515,129 @@ mod tests {
             assert_eq!(
                 decoded_del_resp.filter_results[0].matching_acls[0].principal,
                 "User:alice"
+            );
+        }
+
+        // CreateTopicsRequest & Response across versions [0, 1, 2, 3, 4]
+        for version in [0, 1, 2, 3, 4] {
+            let create_req = CreateTopicsRequest {
+                topics: vec![CreatableTopic {
+                    name: "analytics".into(),
+                    num_partitions: 3,
+                    replication_factor: 1,
+                    assignments: vec![CreateTopicsReplicaAssignment {
+                        partition_index: 0,
+                        broker_ids: vec![1],
+                    }],
+                    configs: vec![CreateTopicsConfig {
+                        name: "cleanup.policy".into(),
+                        value: Some("delete".into()),
+                    }],
+                }],
+                timeout_ms: 5000,
+                validate_only: true,
+            };
+            let mut buf = BytesMut::new();
+            create_req.encode(&mut buf, version);
+            let mut read_buf = buf.freeze();
+            let decoded_req = CreateTopicsRequest::decode(&mut read_buf, version).unwrap();
+            assert_eq!(decoded_req.topics.len(), 1);
+            assert_eq!(decoded_req.topics[0].name, "analytics");
+            assert_eq!(decoded_req.topics[0].num_partitions, 3);
+            assert_eq!(decoded_req.topics[0].replication_factor, 1);
+            assert_eq!(decoded_req.topics[0].assignments.len(), 1);
+            assert_eq!(decoded_req.topics[0].assignments[0].broker_ids, vec![1]);
+            assert_eq!(decoded_req.topics[0].configs.len(), 1);
+            assert_eq!(decoded_req.topics[0].configs[0].name, "cleanup.policy");
+            assert_eq!(
+                decoded_req.topics[0].configs[0].value.as_deref(),
+                Some("delete")
+            );
+            assert_eq!(decoded_req.timeout_ms, 5000);
+            if version >= 1 {
+                assert!(decoded_req.validate_only);
+            } else {
+                assert!(!decoded_req.validate_only);
+            }
+
+            let create_resp = CreateTopicsResponse {
+                throttle_time_ms: 12,
+                topics: vec![CreatableTopicResult {
+                    name: "analytics".into(),
+                    error_code: KafkaErrorCode::None,
+                    error_message: Some("success".into()),
+                }],
+            };
+            let mut resp_buf = BytesMut::new();
+            create_resp.encode(&mut resp_buf, version);
+            let mut read_resp = resp_buf.freeze();
+            let decoded_resp = CreateTopicsResponse::decode(&mut read_resp, version).unwrap();
+            if version >= 2 {
+                assert_eq!(decoded_resp.throttle_time_ms, 12);
+            } else {
+                assert_eq!(decoded_resp.throttle_time_ms, 0);
+            }
+            assert_eq!(decoded_resp.topics.len(), 1);
+            assert_eq!(decoded_resp.topics[0].name, "analytics");
+            assert_eq!(decoded_resp.topics[0].error_code, KafkaErrorCode::None);
+            if version >= 1 {
+                assert_eq!(
+                    decoded_resp.topics[0].error_message.as_deref(),
+                    Some("success")
+                );
+            } else {
+                assert_eq!(decoded_resp.topics[0].error_message, None);
+            }
+        }
+
+        // DeleteTopicsRequest & Response across versions [0, 1, 2, 3]
+        for version in [0, 1, 2, 3] {
+            let del_req = DeleteTopicsRequest {
+                topic_names: vec!["analytics".into(), "metrics".into()],
+                timeout_ms: 3000,
+            };
+            let mut buf = BytesMut::new();
+            del_req.encode(&mut buf, version);
+            let mut read_buf = buf.freeze();
+            let decoded_del_req = DeleteTopicsRequest::decode(&mut read_buf, version).unwrap();
+            assert_eq!(
+                decoded_del_req.topic_names,
+                vec!["analytics".to_string(), "metrics".to_string()]
+            );
+            assert_eq!(decoded_del_req.timeout_ms, 3000);
+
+            let del_resp = DeleteTopicsResponse {
+                throttle_time_ms: 8,
+                responses: vec![
+                    DeletableTopicResult {
+                        name: "analytics".into(),
+                        error_code: KafkaErrorCode::None,
+                    },
+                    DeletableTopicResult {
+                        name: "metrics".into(),
+                        error_code: KafkaErrorCode::UnknownTopicOrPartition,
+                    },
+                ],
+            };
+            let mut resp_buf = BytesMut::new();
+            del_resp.encode(&mut resp_buf, version);
+            let mut read_resp = resp_buf.freeze();
+            let decoded_del_resp = DeleteTopicsResponse::decode(&mut read_resp, version).unwrap();
+            if version >= 1 {
+                assert_eq!(decoded_del_resp.throttle_time_ms, 8);
+            } else {
+                assert_eq!(decoded_del_resp.throttle_time_ms, 0);
+            }
+            assert_eq!(decoded_del_resp.responses.len(), 2);
+            assert_eq!(decoded_del_resp.responses[0].name, "analytics");
+            assert_eq!(
+                decoded_del_resp.responses[0].error_code,
+                KafkaErrorCode::None
+            );
+            assert_eq!(decoded_del_resp.responses[1].name, "metrics");
+            assert_eq!(
+                decoded_del_resp.responses[1].error_code,
+                KafkaErrorCode::UnknownTopicOrPartition
             );
         }
     }

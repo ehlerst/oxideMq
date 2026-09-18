@@ -14,6 +14,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use std::sync::Arc;
 
+/// Configuration and metadata registration for an explicitly created topic.
+#[derive(Debug, Clone)]
+pub struct TopicRegistration {
+    pub name: String,
+    pub num_partitions: i32,
+    pub replication_factor: i16,
+    pub configs: HashMap<String, String>,
+}
+
 /// Central broker cluster state tracking all active topics, partitions, and S3 streams.
 pub struct ClusterState {
     node_id: i32,
@@ -21,6 +30,7 @@ pub struct ClusterState {
     port: AtomicI32,
     cluster_id: String,
     partitions: Arc<RwLock<HashMap<TopicPartition, Arc<Partition>>>>,
+    topics: Arc<RwLock<HashMap<String, TopicRegistration>>>,
     wal: Arc<dyn WalEngine>,
     storage: Arc<dyn ObjectStorage>,
     log_cache: Arc<LogCache>,
@@ -46,6 +56,7 @@ impl ClusterState {
             port: AtomicI32::new(port),
             cluster_id: cluster_id.into(),
             partitions: Arc::new(RwLock::new(HashMap::new())),
+            topics: Arc::new(RwLock::new(HashMap::new())),
             wal,
             storage,
             log_cache,
@@ -86,6 +97,123 @@ impl ClusterState {
         self.partitions.read().get(tp).cloned()
     }
 
+    /// Dynamically provisions a new topic with the specified partition count, replication factor, and configs.
+    pub fn create_topic(
+        &self,
+        name: &str,
+        num_partitions: i32,
+        replication_factor: i16,
+        configs: HashMap<String, String>,
+    ) -> std::result::Result<(), KafkaErrorCode> {
+        // 1. Topic name validation
+        if name.is_empty() || name == "." || name == ".." || name.len() > 249 {
+            return Err(KafkaErrorCode::InvalidTopicException);
+        }
+        if !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+        {
+            return Err(KafkaErrorCode::InvalidTopicException);
+        }
+
+        // 2. Partition count validation
+        let parts = if num_partitions == -1 {
+            1
+        } else {
+            num_partitions
+        };
+        if parts <= 0 || parts > 10000 {
+            return Err(KafkaErrorCode::InvalidPartitions);
+        }
+
+        // 3. Replication factor validation
+        let rf = if replication_factor == -1 {
+            1
+        } else {
+            replication_factor
+        };
+        if rf <= 0 {
+            return Err(KafkaErrorCode::InvalidReplicationFactor);
+        }
+
+        // 4. Duplicate topic check
+        {
+            let t_guard = self.topics.read();
+            if t_guard.contains_key(name) {
+                return Err(KafkaErrorCode::TopicAlreadyExists);
+            }
+            let p_guard = self.partitions.read();
+            if p_guard.keys().any(|tp| tp.topic == name) {
+                return Err(KafkaErrorCode::TopicAlreadyExists);
+            }
+        }
+
+        // 5. Pre-provision requested partitions
+        for p in 0..parts {
+            let tp = TopicPartition::new(name, p);
+            let _ = self.get_or_create_partition(&tp);
+        }
+
+        // 6. Record topic registration
+        self.topics.write().insert(
+            name.to_string(),
+            TopicRegistration {
+                name: name.to_string(),
+                num_partitions: parts,
+                replication_factor: rf,
+                configs,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Deletes a topic and removes all associated partitions.
+    pub fn delete_topic(&self, name: &str) -> std::result::Result<(), KafkaErrorCode> {
+        let mut topics_guard = self.topics.write();
+        let mut partitions_guard = self.partitions.write();
+
+        let existed_in_topics = topics_guard.remove(name).is_some();
+        let mut removed_partitions = false;
+        partitions_guard.retain(|tp, _| {
+            if tp.topic == name {
+                removed_partitions = true;
+                false
+            } else {
+                true
+            }
+        });
+
+        if !existed_in_topics && !removed_partitions {
+            return Err(KafkaErrorCode::UnknownTopicOrPartition);
+        }
+
+        Ok(())
+    }
+
+    /// Checks if a topic currently exists in the cluster state.
+    pub fn has_topic(&self, name: &str) -> bool {
+        self.topics.read().contains_key(name)
+            || self.partitions.read().keys().any(|tp| tp.topic == name)
+    }
+
+    /// Retrieves registered topic metadata if present.
+    pub fn get_topic(&self, name: &str) -> Option<TopicRegistration> {
+        self.topics.read().get(name).cloned()
+    }
+
+    /// Returns a list of all active topic names.
+    pub fn list_topics(&self) -> Vec<String> {
+        let mut set = std::collections::BTreeSet::new();
+        for k in self.topics.read().keys() {
+            set.insert(k.clone());
+        }
+        for tp in self.partitions.read().keys() {
+            set.insert(tp.topic.clone());
+        }
+        set.into_iter().collect()
+    }
+
     pub fn node_id(&self) -> i32 {
         self.node_id
     }
@@ -115,6 +243,7 @@ impl ClusterState {
     }
 
     pub fn reset(&self) {
+        self.topics.write().clear();
         self.partitions.write().clear();
         self.next_stream_id.store(100, Ordering::SeqCst);
     }
@@ -134,8 +263,17 @@ impl ClusterState {
         snapshots
     }
 
-    /// Constructs standard Kafka `MetadataResponse`.
+    /// Constructs standard Kafka `MetadataResponse` with default auto-creation enabled.
     pub fn build_metadata(&self, requested_topics: Option<&[String]>) -> MetadataResponse {
+        self.build_metadata_with_auto_create(requested_topics, true)
+    }
+
+    /// Constructs standard Kafka `MetadataResponse` allowing fine-grained control over auto-creation.
+    pub fn build_metadata_with_auto_create(
+        &self,
+        requested_topics: Option<&[String]>,
+        allow_auto_create: bool,
+    ) -> MetadataResponse {
         let brokers = vec![BrokerMetadata {
             node_id: self.node_id,
             host: self.host(),
@@ -158,18 +296,26 @@ impl ClusterState {
                     .push(tp.partition);
             }
         }
+        drop(partitions);
 
-        // If specific topics were requested that don't exist yet, auto-create partition 0
+        let mut not_found_topics = Vec::new();
         if let Some(req_t) = requested_topics {
             for t in req_t {
                 if !topic_map.contains_key(t) {
-                    topic_map.insert(t.clone(), vec![0]);
+                    if allow_auto_create {
+                        let tp = TopicPartition::new(t, 0);
+                        let _ = self.get_or_create_partition(&tp);
+                        topic_map.insert(t.clone(), vec![0]);
+                    } else {
+                        not_found_topics.push(t.clone());
+                    }
                 }
             }
         }
 
         let mut topics = Vec::new();
-        for (topic_name, p_indices) in topic_map {
+        for (topic_name, mut p_indices) in topic_map {
+            p_indices.sort_unstable();
             let mut part_metas = Vec::new();
             for p_idx in p_indices {
                 part_metas.push(PartitionMetadata {
@@ -187,6 +333,15 @@ impl ClusterState {
                 name: topic_name,
                 is_internal: false,
                 partitions: part_metas,
+            });
+        }
+
+        for nf_topic in not_found_topics {
+            topics.push(TopicMetadata {
+                error_code: KafkaErrorCode::UnknownTopicOrPartition,
+                name: nf_topic,
+                is_internal: false,
+                partitions: Vec::new(),
             });
         }
 
@@ -262,5 +417,97 @@ mod tests {
 
         state.reset();
         assert_eq!(state.partition_count(), 0);
+    }
+
+    #[test]
+    fn test_dynamic_topic_create_delete_and_metadata() {
+        let wal = Arc::new(MemoryWal::new());
+        let storage = Arc::new(MemoryObjectStorage::new());
+        let log_cache = Arc::new(LogCache::new(1024 * 1024));
+        let block_cache = Arc::new(BlockCache::new(1024 * 1024));
+
+        let state = ClusterState::new(
+            1,
+            "127.0.0.1",
+            9092,
+            "test-cluster",
+            wal,
+            storage,
+            log_cache,
+            block_cache,
+        );
+
+        // 1. Create topic with 3 partitions and configs
+        let mut configs = HashMap::new();
+        configs.insert("retention.ms".into(), "60000".into());
+        let res = state.create_topic("orders", 3, 1, configs);
+        assert_eq!(res, Ok(()));
+        assert!(state.has_topic("orders"));
+        assert_eq!(state.partition_count(), 3);
+
+        let topic_meta = state.get_topic("orders").unwrap();
+        assert_eq!(topic_meta.num_partitions, 3);
+        assert_eq!(topic_meta.replication_factor, 1);
+        assert_eq!(
+            topic_meta.configs.get("retention.ms").map(String::as_str),
+            Some("60000")
+        );
+
+        // 2. Query metadata for "orders"
+        let meta = state.build_metadata(Some(&["orders".to_string()]));
+        assert_eq!(meta.topics.len(), 1);
+        assert_eq!(meta.topics[0].name, "orders");
+        assert_eq!(meta.topics[0].error_code, KafkaErrorCode::None);
+        assert_eq!(meta.topics[0].partitions.len(), 3);
+        assert_eq!(meta.topics[0].partitions[0].partition_index, 0);
+        assert_eq!(meta.topics[0].partitions[1].partition_index, 1);
+        assert_eq!(meta.topics[0].partitions[2].partition_index, 2);
+
+        // 3. Validation errors
+        assert_eq!(
+            state.create_topic("", 1, 1, HashMap::new()),
+            Err(KafkaErrorCode::InvalidTopicException)
+        );
+        assert_eq!(
+            state.create_topic(".", 1, 1, HashMap::new()),
+            Err(KafkaErrorCode::InvalidTopicException)
+        );
+        assert_eq!(
+            state.create_topic("invalid topic spaces!", 1, 1, HashMap::new()),
+            Err(KafkaErrorCode::InvalidTopicException)
+        );
+        assert_eq!(
+            state.create_topic("orders", 1, 1, HashMap::new()),
+            Err(KafkaErrorCode::TopicAlreadyExists)
+        );
+        assert_eq!(
+            state.create_topic("new-topic", 0, 1, HashMap::new()),
+            Err(KafkaErrorCode::InvalidPartitions)
+        );
+        assert_eq!(
+            state.create_topic("new-topic", 1, 0, HashMap::new()),
+            Err(KafkaErrorCode::InvalidReplicationFactor)
+        );
+
+        // 4. Query metadata without auto-create for non-existent topic
+        let non_existent_meta =
+            state.build_metadata_with_auto_create(Some(&["nonexistent".to_string()]), false);
+        assert_eq!(non_existent_meta.topics.len(), 1);
+        assert_eq!(non_existent_meta.topics[0].name, "nonexistent");
+        assert_eq!(
+            non_existent_meta.topics[0].error_code,
+            KafkaErrorCode::UnknownTopicOrPartition
+        );
+        assert_eq!(non_existent_meta.topics[0].partitions.len(), 0);
+
+        // 5. Delete topic
+        let del_res = state.delete_topic("orders");
+        assert_eq!(del_res, Ok(()));
+        assert!(!state.has_topic("orders"));
+        assert_eq!(state.partition_count(), 0);
+
+        // 6. Second delete should fail with UnknownTopicOrPartition
+        let del_res2 = state.delete_topic("orders");
+        assert_eq!(del_res2, Err(KafkaErrorCode::UnknownTopicOrPartition));
     }
 }

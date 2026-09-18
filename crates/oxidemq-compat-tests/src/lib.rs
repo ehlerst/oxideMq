@@ -11,15 +11,17 @@ mod tests {
     use oxidemq_core::prelude::*;
     use oxidemq_protocol::header::{RequestHeader, ResponseHeader};
     use oxidemq_protocol::messages::{
-        AclCreation, ApiVersionsRequest, ApiVersionsResponse, CreateAclsRequest,
-        CreateAclsResponse, DeleteAclsFilter, DeleteAclsRequest, DeleteAclsResponse,
-        DescribeAclsRequest, DescribeAclsResponse, FetchPartition, FetchRequest, FetchResponse,
-        FetchTopic, FindCoordinatorRequest, FindCoordinatorResponse, ListOffsetsPartition,
-        ListOffsetsRequest, ListOffsetsResponse, ListOffsetsTopic, MetadataRequest,
-        MetadataResponse, OffsetCommitPartition, OffsetCommitRequest, OffsetCommitResponse,
-        OffsetCommitTopic, OffsetFetchRequest, OffsetFetchResponse, OffsetFetchTopic,
-        PartitionProduceData, ProduceRequest, ProduceResponse, SaslAuthenticateRequest,
-        SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse, TopicProduceData,
+        AclCreation, ApiVersionsRequest, ApiVersionsResponse, CreatableTopic, CreateAclsRequest,
+        CreateAclsResponse, CreateTopicsConfig, CreateTopicsRequest, CreateTopicsResponse,
+        DeleteAclsFilter, DeleteAclsRequest, DeleteAclsResponse, DeleteTopicsRequest,
+        DeleteTopicsResponse, DescribeAclsRequest, DescribeAclsResponse, FetchPartition,
+        FetchRequest, FetchResponse, FetchTopic, FindCoordinatorRequest, FindCoordinatorResponse,
+        ListOffsetsPartition, ListOffsetsRequest, ListOffsetsResponse, ListOffsetsTopic,
+        MetadataRequest, MetadataResponse, OffsetCommitPartition, OffsetCommitRequest,
+        OffsetCommitResponse, OffsetCommitTopic, OffsetFetchRequest, OffsetFetchResponse,
+        OffsetFetchTopic, PartitionProduceData, ProduceRequest, ProduceResponse,
+        SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
+        SaslHandshakeResponse, TopicProduceData,
     };
     use oxidemq_protocol::{
         AclOperation, AclPermissionType, AclResourcePatternType, AclResourceType, ApiKey,
@@ -1006,6 +1008,280 @@ mod tests {
         assert_eq!(
             p3_resp.responses[0].partitions[0].error_code,
             KafkaErrorCode::TopicAuthorizationFailed
+        );
+    }
+
+    #[tokio::test]
+    async fn test_e2e_create_and_delete_topics_over_tcp() {
+        let engine = Arc::new(setup_test_engine());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let engine_clone = Arc::clone(&engine);
+        tokio::spawn(async move {
+            loop {
+                if let Ok((stream, _)) = listener.accept().await {
+                    let eng = Arc::clone(&engine_clone);
+                    tokio::spawn(async move {
+                        let _ = eng.process_connection(stream).await;
+                    });
+                }
+            }
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        // 1. ApiVersions negotiation
+        let av_hdr = RequestHeader::new(ApiKey::ApiVersions, 0, 1, Some("topic-mgr"));
+        let mut av_buf = BytesMut::new();
+        av_hdr.encode(&mut av_buf);
+        let av_req = ApiVersionsRequest::default();
+        av_req.encode(&mut av_buf, 0);
+        let mut av_frame = BytesMut::new();
+        av_frame.put_i32(av_buf.len() as i32);
+        av_frame.put_slice(&av_buf);
+        stream.write_all(&av_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let av_len = stream.read_i32().await.unwrap() as usize;
+        let mut av_resp_buf = vec![0u8; av_len];
+        stream.read_exact(&mut av_resp_buf).await.unwrap();
+        let mut av_bytes = Bytes::from(av_resp_buf);
+        let _ = ResponseHeader::decode(&mut av_bytes).unwrap();
+        let av_resp = ApiVersionsResponse::decode(&mut av_bytes, 0).unwrap();
+        assert_eq!(av_resp.error_code, KafkaErrorCode::None);
+
+        // 2. CreateTopics: "telemetry-events" with 3 partitions
+        let ct_hdr = RequestHeader::new(ApiKey::CreateTopics, 1, 2, Some("topic-mgr"));
+        let mut ct_buf = BytesMut::new();
+        ct_hdr.encode(&mut ct_buf);
+        let ct_req = CreateTopicsRequest {
+            topics: vec![CreatableTopic {
+                name: "telemetry-events".into(),
+                num_partitions: 3,
+                replication_factor: 1,
+                assignments: Vec::new(),
+                configs: vec![CreateTopicsConfig {
+                    name: "retention.ms".into(),
+                    value: Some("300000".into()),
+                }],
+            }],
+            timeout_ms: 5000,
+            validate_only: false,
+        };
+        ct_req.encode(&mut ct_buf, 1);
+        let mut ct_frame = BytesMut::new();
+        ct_frame.put_i32(ct_buf.len() as i32);
+        ct_frame.put_slice(&ct_buf);
+        stream.write_all(&ct_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let ct_len = stream.read_i32().await.unwrap() as usize;
+        let mut ct_resp_buf = vec![0u8; ct_len];
+        stream.read_exact(&mut ct_resp_buf).await.unwrap();
+        let mut ct_bytes = Bytes::from(ct_resp_buf);
+        let _ = ResponseHeader::decode(&mut ct_bytes).unwrap();
+        let ct_resp = CreateTopicsResponse::decode(&mut ct_bytes, 1).unwrap();
+        assert_eq!(ct_resp.topics.len(), 1);
+        assert_eq!(ct_resp.topics[0].name, "telemetry-events");
+        assert_eq!(ct_resp.topics[0].error_code, KafkaErrorCode::None);
+
+        // 3. Metadata without auto-create: verify topic and its 3 partitions
+        let meta_hdr = RequestHeader::new(ApiKey::Metadata, 1, 3, Some("topic-mgr"));
+        let mut meta_buf = BytesMut::new();
+        meta_hdr.encode(&mut meta_buf);
+        let meta_req = MetadataRequest {
+            topics: Some(vec!["telemetry-events".into()]),
+            allow_auto_topic_creation: false,
+        };
+        meta_req.encode(&mut meta_buf, 1);
+        let mut meta_frame = BytesMut::new();
+        meta_frame.put_i32(meta_buf.len() as i32);
+        meta_frame.put_slice(&meta_buf);
+        stream.write_all(&meta_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let meta_len = stream.read_i32().await.unwrap() as usize;
+        let mut meta_resp_buf = vec![0u8; meta_len];
+        stream.read_exact(&mut meta_resp_buf).await.unwrap();
+        let mut meta_bytes = Bytes::from(meta_resp_buf);
+        let _ = ResponseHeader::decode(&mut meta_bytes).unwrap();
+        let meta_resp = MetadataResponse::decode(&mut meta_bytes, 1).unwrap();
+        assert_eq!(meta_resp.topics.len(), 1);
+        assert_eq!(meta_resp.topics[0].name, "telemetry-events");
+        assert_eq!(meta_resp.topics[0].error_code, KafkaErrorCode::None);
+        assert_eq!(meta_resp.topics[0].partitions.len(), 3);
+        assert_eq!(meta_resp.topics[0].partitions[0].partition_index, 0);
+        assert_eq!(meta_resp.topics[0].partitions[1].partition_index, 1);
+        assert_eq!(meta_resp.topics[0].partitions[2].partition_index, 2);
+
+        // 4. Duplicate CreateTopics -> TopicAlreadyExists
+        let dup_hdr = RequestHeader::new(ApiKey::CreateTopics, 1, 4, Some("topic-mgr"));
+        let mut dup_buf = BytesMut::new();
+        dup_hdr.encode(&mut dup_buf);
+        ct_req.encode(&mut dup_buf, 1);
+        let mut dup_frame = BytesMut::new();
+        dup_frame.put_i32(dup_buf.len() as i32);
+        dup_frame.put_slice(&dup_buf);
+        stream.write_all(&dup_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let dup_len = stream.read_i32().await.unwrap() as usize;
+        let mut dup_resp_buf = vec![0u8; dup_len];
+        stream.read_exact(&mut dup_resp_buf).await.unwrap();
+        let mut dup_bytes = Bytes::from(dup_resp_buf);
+        let _ = ResponseHeader::decode(&mut dup_bytes).unwrap();
+        let dup_resp = CreateTopicsResponse::decode(&mut dup_bytes, 1).unwrap();
+        assert_eq!(
+            dup_resp.topics[0].error_code,
+            KafkaErrorCode::TopicAlreadyExists
+        );
+
+        // 5. Produce to partition 2 of created topic
+        let prod_hdr = RequestHeader::new(ApiKey::Produce, 0, 5, Some("topic-mgr"));
+        let mut prod_buf = BytesMut::new();
+        prod_hdr.encode(&mut prod_buf);
+        let records_payload = Bytes::from_static(b"sample telemetry batch data");
+        let prod_req = ProduceRequest {
+            acks: 1,
+            timeout_ms: 1000,
+            topic_data: vec![TopicProduceData {
+                topic: "telemetry-events".into(),
+                partitions: vec![PartitionProduceData {
+                    partition: 2,
+                    records: records_payload.clone(),
+                }],
+            }],
+        };
+        prod_req.encode(&mut prod_buf, 0);
+        let mut prod_frame = BytesMut::new();
+        prod_frame.put_i32(prod_buf.len() as i32);
+        prod_frame.put_slice(&prod_buf);
+        stream.write_all(&prod_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let prod_len = stream.read_i32().await.unwrap() as usize;
+        let mut prod_resp_buf = vec![0u8; prod_len];
+        stream.read_exact(&mut prod_resp_buf).await.unwrap();
+        let mut prod_bytes = Bytes::from(prod_resp_buf);
+        let _ = ResponseHeader::decode(&mut prod_bytes).unwrap();
+        let prod_resp = ProduceResponse::decode(&mut prod_bytes, 0).unwrap();
+        assert_eq!(
+            prod_resp.responses[0].partitions[0].error_code,
+            KafkaErrorCode::None
+        );
+        assert_eq!(prod_resp.responses[0].partitions[0].partition, 2);
+
+        // 6. Fetch from partition 2
+        let fetch_hdr = RequestHeader::new(ApiKey::Fetch, 0, 6, Some("topic-mgr"));
+        let mut fetch_buf = BytesMut::new();
+        fetch_hdr.encode(&mut fetch_buf);
+        let fetch_req = FetchRequest {
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 65536,
+            isolation_level: 0,
+            topics: vec![FetchTopic {
+                topic: "telemetry-events".into(),
+                partitions: vec![FetchPartition {
+                    partition: 2,
+                    fetch_offset: 0,
+                    partition_max_bytes: 65536,
+                }],
+            }],
+        };
+        fetch_req.encode(&mut fetch_buf, 0);
+        let mut fetch_frame = BytesMut::new();
+        fetch_frame.put_i32(fetch_buf.len() as i32);
+        fetch_frame.put_slice(&fetch_buf);
+        stream.write_all(&fetch_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let fetch_len = stream.read_i32().await.unwrap() as usize;
+        let mut fetch_resp_buf = vec![0u8; fetch_len];
+        stream.read_exact(&mut fetch_resp_buf).await.unwrap();
+        let mut fetch_bytes = Bytes::from(fetch_resp_buf);
+        let _ = ResponseHeader::decode(&mut fetch_bytes).unwrap();
+        let fetch_resp = FetchResponse::decode(&mut fetch_bytes, 0).unwrap();
+        assert_eq!(
+            fetch_resp.responses[0].partitions[0].error_code,
+            KafkaErrorCode::None
+        );
+        assert_eq!(
+            fetch_resp.responses[0].partitions[0].records,
+            records_payload
+        );
+
+        // 7. DeleteTopics: remove "telemetry-events"
+        let del_hdr = RequestHeader::new(ApiKey::DeleteTopics, 1, 7, Some("topic-mgr"));
+        let mut del_buf = BytesMut::new();
+        del_hdr.encode(&mut del_buf);
+        let del_req = DeleteTopicsRequest {
+            topic_names: vec!["telemetry-events".into()],
+            timeout_ms: 5000,
+        };
+        del_req.encode(&mut del_buf, 1);
+        let mut del_frame = BytesMut::new();
+        del_frame.put_i32(del_buf.len() as i32);
+        del_frame.put_slice(&del_buf);
+        stream.write_all(&del_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let del_len = stream.read_i32().await.unwrap() as usize;
+        let mut del_resp_buf = vec![0u8; del_len];
+        stream.read_exact(&mut del_resp_buf).await.unwrap();
+        let mut del_bytes = Bytes::from(del_resp_buf);
+        let _ = ResponseHeader::decode(&mut del_bytes).unwrap();
+        let del_resp = DeleteTopicsResponse::decode(&mut del_bytes, 1).unwrap();
+        assert_eq!(del_resp.responses.len(), 1);
+        assert_eq!(del_resp.responses[0].name, "telemetry-events");
+        assert_eq!(del_resp.responses[0].error_code, KafkaErrorCode::None);
+
+        // 8. Metadata query without auto-create -> UnknownTopicOrPartition
+        let meta_hdr2 = RequestHeader::new(ApiKey::Metadata, 1, 8, Some("topic-mgr"));
+        let mut meta_buf2 = BytesMut::new();
+        meta_hdr2.encode(&mut meta_buf2);
+        meta_req.encode(&mut meta_buf2, 1);
+        let mut meta_frame2 = BytesMut::new();
+        meta_frame2.put_i32(meta_buf2.len() as i32);
+        meta_frame2.put_slice(&meta_buf2);
+        stream.write_all(&meta_frame2).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let meta2_len = stream.read_i32().await.unwrap() as usize;
+        let mut meta2_resp_buf = vec![0u8; meta2_len];
+        stream.read_exact(&mut meta2_resp_buf).await.unwrap();
+        let mut meta2_bytes = Bytes::from(meta2_resp_buf);
+        let _ = ResponseHeader::decode(&mut meta2_bytes).unwrap();
+        let meta2_resp = MetadataResponse::decode(&mut meta2_bytes, 1).unwrap();
+        assert_eq!(meta2_resp.topics.len(), 1);
+        assert_eq!(meta2_resp.topics[0].name, "telemetry-events");
+        assert_eq!(
+            meta2_resp.topics[0].error_code,
+            KafkaErrorCode::UnknownTopicOrPartition
+        );
+        assert_eq!(meta2_resp.topics[0].partitions.len(), 0);
+
+        // 9. Second DeleteTopics -> UnknownTopicOrPartition
+        let del_hdr2 = RequestHeader::new(ApiKey::DeleteTopics, 1, 9, Some("topic-mgr"));
+        let mut del_buf2 = BytesMut::new();
+        del_hdr2.encode(&mut del_buf2);
+        del_req.encode(&mut del_buf2, 1);
+        let mut del_frame2 = BytesMut::new();
+        del_frame2.put_i32(del_buf2.len() as i32);
+        del_frame2.put_slice(&del_buf2);
+        stream.write_all(&del_frame2).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let del2_len = stream.read_i32().await.unwrap() as usize;
+        let mut del2_resp_buf = vec![0u8; del2_len];
+        stream.read_exact(&mut del2_resp_buf).await.unwrap();
+        let mut del2_bytes = Bytes::from(del2_resp_buf);
+        let _ = ResponseHeader::decode(&mut del2_bytes).unwrap();
+        let del2_resp = DeleteTopicsResponse::decode(&mut del2_bytes, 1).unwrap();
+        assert_eq!(
+            del2_resp.responses[0].error_code,
+            KafkaErrorCode::UnknownTopicOrPartition
         );
     }
 }

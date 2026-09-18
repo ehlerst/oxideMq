@@ -12,13 +12,14 @@ use oxidemq_protocol::header::{RequestHeader, ResponseHeader};
 use oxidemq_protocol::messages::{
     AclCreationResult, AddOffsetsToTxnRequest, AddOffsetsToTxnResponse,
     AddPartitionsToTxnPartitionResult, AddPartitionsToTxnRequest, AddPartitionsToTxnResponse,
-    AddPartitionsToTxnTopicResult, ApiVersionsRequest, ApiVersionsResponse, CreateAclsRequest,
-    CreateAclsResponse, DeleteAclsFilterResult, DeleteAclsRequest, DeleteAclsResponse,
-    DescribeAclsRequest, DescribeAclsResponse, EndTxnRequest, EndTxnResponse,
-    FetchPartitionResponse, FetchRequest, FetchResponse, FetchTopicResponse,
-    FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
-    InitProducerIdRequest, InitProducerIdResponse, LeaveGroupRequest, LeaveGroupResponse,
-    ListOffsetsPartitionResponse, ListOffsetsRequest, ListOffsetsResponse,
+    AddPartitionsToTxnTopicResult, ApiVersionsRequest, ApiVersionsResponse, CreatableTopicResult,
+    CreateAclsRequest, CreateAclsResponse, CreateTopicsRequest, CreateTopicsResponse,
+    DeletableTopicResult, DeleteAclsFilterResult, DeleteAclsRequest, DeleteAclsResponse,
+    DeleteTopicsRequest, DeleteTopicsResponse, DescribeAclsRequest, DescribeAclsResponse,
+    EndTxnRequest, EndTxnResponse, FetchPartitionResponse, FetchRequest, FetchResponse,
+    FetchTopicResponse, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest,
+    HeartbeatResponse, InitProducerIdRequest, InitProducerIdResponse, LeaveGroupRequest,
+    LeaveGroupResponse, ListOffsetsPartitionResponse, ListOffsetsRequest, ListOffsetsResponse,
     ListOffsetsTopicResponse, MetadataRequest, OffsetCommitPartitionResponse, OffsetCommitRequest,
     OffsetCommitResponse, OffsetCommitTopicResponse, OffsetFetchPartitionResponse,
     OffsetFetchRequest, OffsetFetchResponse, OffsetFetchTopicResponse, PartitionProduceResponse,
@@ -26,6 +27,7 @@ use oxidemq_protocol::messages::{
     SaslHandshakeRequest, SaslHandshakeResponse, TopicProduceResponse,
 };
 use oxidemq_protocol::{AclOperation, AclResourceType, ApiKey, KafkaErrorCode};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, error, trace};
@@ -300,7 +302,10 @@ impl BrokerEngine {
             }
             ApiKey::Metadata => {
                 let req = MetadataRequest::decode(body, header.api_version)?;
-                let mut resp = self.cluster_state.build_metadata(req.topics.as_deref());
+                let mut resp = self.cluster_state.build_metadata_with_auto_create(
+                    req.topics.as_deref(),
+                    req.allow_auto_topic_creation,
+                );
                 for topic in &mut resp.topics {
                     if !self.authorizer.authorize(
                         principal,
@@ -984,6 +989,177 @@ impl BrokerEngine {
                 };
                 resp.encode(&mut out, header.api_version);
             }
+            ApiKey::CreateTopics => {
+                let req = CreateTopicsRequest::decode(body, header.api_version)?;
+                let mut results = Vec::with_capacity(req.topics.len());
+
+                for t in req.topics {
+                    let is_authorized = self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Topic,
+                        &t.name,
+                        AclOperation::Create,
+                    ) || self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Cluster,
+                        "kafka-cluster",
+                        AclOperation::Create,
+                    );
+
+                    if !is_authorized {
+                        results.push(CreatableTopicResult {
+                            name: t.name,
+                            error_code: KafkaErrorCode::TopicAuthorizationFailed,
+                            error_message: Some(
+                                "Topic authorization failed: Create required on Topic or Cluster"
+                                    .into(),
+                            ),
+                        });
+                        continue;
+                    }
+
+                    if req.validate_only {
+                        let res = if t.name.is_empty()
+                            || t.name == "."
+                            || t.name == ".."
+                            || t.name.len() > 249
+                            || !t.name.chars().all(|c| {
+                                c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-'
+                            }) {
+                            (
+                                KafkaErrorCode::InvalidTopicException,
+                                Some("Invalid topic name".into()),
+                            )
+                        } else if self.cluster_state.has_topic(&t.name) {
+                            (
+                                KafkaErrorCode::TopicAlreadyExists,
+                                Some("Topic already exists".into()),
+                            )
+                        } else if t.num_partitions <= 0 && t.num_partitions != -1 {
+                            (
+                                KafkaErrorCode::InvalidPartitions,
+                                Some("Number of partitions must be positive".into()),
+                            )
+                        } else if t.replication_factor <= 0 && t.replication_factor != -1 {
+                            (
+                                KafkaErrorCode::InvalidReplicationFactor,
+                                Some("Replication factor must be positive".into()),
+                            )
+                        } else {
+                            (KafkaErrorCode::None, None)
+                        };
+
+                        results.push(CreatableTopicResult {
+                            name: t.name,
+                            error_code: res.0,
+                            error_message: res.1,
+                        });
+                    } else {
+                        let mut configs_map = HashMap::with_capacity(t.configs.len());
+                        for c in t.configs {
+                            if let Some(v) = c.value {
+                                configs_map.insert(c.name, v);
+                            }
+                        }
+
+                        let parts = if !t.assignments.is_empty() {
+                            t.assignments.len() as i32
+                        } else {
+                            t.num_partitions
+                        };
+
+                        match self.cluster_state.create_topic(
+                            &t.name,
+                            parts,
+                            t.replication_factor,
+                            configs_map,
+                        ) {
+                            Ok(()) => {
+                                results.push(CreatableTopicResult {
+                                    name: t.name,
+                                    error_code: KafkaErrorCode::None,
+                                    error_message: None,
+                                });
+                            }
+                            Err(code) => {
+                                let msg = match code {
+                                    KafkaErrorCode::TopicAlreadyExists => "Topic already exists",
+                                    KafkaErrorCode::InvalidTopicException => "Invalid topic name",
+                                    KafkaErrorCode::InvalidPartitions => {
+                                        "Number of partitions must be positive"
+                                    }
+                                    KafkaErrorCode::InvalidReplicationFactor => {
+                                        "Replication factor must be positive"
+                                    }
+                                    _ => "Topic creation failed",
+                                };
+                                results.push(CreatableTopicResult {
+                                    name: t.name,
+                                    error_code: code,
+                                    error_message: Some(msg.into()),
+                                });
+                            }
+                        }
+                    }
+                }
+
+                let resp = CreateTopicsResponse {
+                    throttle_time_ms: 0,
+                    topics: results,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::DeleteTopics => {
+                let req = DeleteTopicsRequest::decode(body, header.api_version)?;
+                let mut results = Vec::with_capacity(req.topic_names.len());
+
+                for topic_name in req.topic_names {
+                    let is_authorized = self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Topic,
+                        &topic_name,
+                        AclOperation::Delete,
+                    ) || self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Cluster,
+                        "kafka-cluster",
+                        AclOperation::Delete,
+                    );
+
+                    if !is_authorized {
+                        results.push(DeletableTopicResult {
+                            name: topic_name,
+                            error_code: KafkaErrorCode::TopicAuthorizationFailed,
+                        });
+                        continue;
+                    }
+
+                    match self.cluster_state.delete_topic(&topic_name) {
+                        Ok(()) => {
+                            results.push(DeletableTopicResult {
+                                name: topic_name,
+                                error_code: KafkaErrorCode::None,
+                            });
+                        }
+                        Err(code) => {
+                            results.push(DeletableTopicResult {
+                                name: topic_name,
+                                error_code: code,
+                            });
+                        }
+                    }
+                }
+
+                let resp = DeleteTopicsResponse {
+                    throttle_time_ms: 0,
+                    responses: results,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
             _ => {
                 return Err(OxideMqError::Protocol(format!(
                     "Unsupported Kafka API Key {:?}",
@@ -1155,7 +1331,8 @@ impl BrokerEngine {
 mod tests {
     use super::*;
     use oxidemq_protocol::messages::{
-        AddPartitionsToTxnTopic, PartitionProduceData, TopicProduceData,
+        AddPartitionsToTxnTopic, CreatableTopic, CreateTopicsConfig, MetadataResponse,
+        PartitionProduceData, TopicProduceData,
     };
     use oxidemq_s3stream::block_cache::BlockCache;
     use oxidemq_s3stream::client::MemoryObjectStorage;
@@ -1373,7 +1550,7 @@ mod tests {
         assert!(!resp.is_empty());
 
         // Unsupported key
-        let bad_header = RequestHeader::new(ApiKey::CreateTopics, 1, 999, Some("test"));
+        let bad_header = RequestHeader::new(ApiKey::AlterConfigs, 1, 999, Some("test"));
         let mut empty = Bytes::new();
         assert!(engine.handle_request(&bad_header, &mut empty).is_err());
 
@@ -2150,5 +2327,196 @@ mod tests {
             produce_resp3.responses[0].partitions[0].error_code,
             KafkaErrorCode::TopicAuthorizationFailed
         );
+    }
+
+    #[test]
+    fn test_engine_create_and_delete_topics_lifecycle() {
+        let wal = Arc::new(MemoryWal::new());
+        let storage = Arc::new(MemoryObjectStorage::new());
+        let log_cache = Arc::new(LogCache::new(1024 * 1024));
+        let block_cache = Arc::new(BlockCache::new(1024 * 1024));
+        let cluster = Arc::new(ClusterState::new(
+            1,
+            "127.0.0.1",
+            9092,
+            "test-cluster",
+            wal,
+            storage,
+            log_cache,
+            block_cache,
+        ));
+        let coordinator = Arc::new(GroupCoordinator::new());
+        let engine = BrokerEngine::new(cluster.clone(), coordinator);
+
+        let mut session = ConnectionAuthState::Authenticated {
+            principal: "admin".to_string(),
+        };
+
+        // 1. CreateTopics with validate_only = true
+        let req_validate = CreateTopicsRequest {
+            topics: vec![CreatableTopic {
+                name: "app-events".into(),
+                num_partitions: 3,
+                replication_factor: 1,
+                assignments: Vec::new(),
+                configs: vec![CreateTopicsConfig {
+                    name: "cleanup.policy".into(),
+                    value: Some("compact".into()),
+                }],
+            }],
+            timeout_ms: 5000,
+            validate_only: true,
+        };
+        let hdr1 = RequestHeader::new(ApiKey::CreateTopics, 1, 100, Some("test-admin"));
+        let mut buf1 = BytesMut::new();
+        req_validate.encode(&mut buf1, 1);
+        let mut resp1 = engine
+            .handle_connection_request(&mut session, &hdr1, &mut buf1.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp1).unwrap();
+        let create_resp1 = CreateTopicsResponse::decode(&mut resp1, 1).unwrap();
+        assert_eq!(create_resp1.topics.len(), 1);
+        assert_eq!(create_resp1.topics[0].name, "app-events");
+        assert_eq!(create_resp1.topics[0].error_code, KafkaErrorCode::None);
+        // Ensure validate_only didn't create partitions
+        assert!(!cluster.has_topic("app-events"));
+
+        // 2. CreateTopics with validate_only = false (actual creation)
+        let req_create = CreateTopicsRequest {
+            topics: vec![CreatableTopic {
+                name: "app-events".into(),
+                num_partitions: 3,
+                replication_factor: 1,
+                assignments: Vec::new(),
+                configs: vec![CreateTopicsConfig {
+                    name: "cleanup.policy".into(),
+                    value: Some("compact".into()),
+                }],
+            }],
+            timeout_ms: 5000,
+            validate_only: false,
+        };
+        let hdr2 = RequestHeader::new(ApiKey::CreateTopics, 2, 101, Some("test-admin"));
+        let mut buf2 = BytesMut::new();
+        req_create.encode(&mut buf2, 2);
+        let mut resp2 = engine
+            .handle_connection_request(&mut session, &hdr2, &mut buf2.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp2).unwrap();
+        let create_resp2 = CreateTopicsResponse::decode(&mut resp2, 2).unwrap();
+        assert_eq!(create_resp2.topics.len(), 1);
+        assert_eq!(create_resp2.topics[0].name, "app-events");
+        assert_eq!(create_resp2.topics[0].error_code, KafkaErrorCode::None);
+        assert!(cluster.has_topic("app-events"));
+        assert_eq!(cluster.partition_count(), 3);
+
+        // 3. Duplicate creation attempt returns TopicAlreadyExists
+        let mut buf3 = BytesMut::new();
+        req_create.encode(&mut buf3, 2);
+        let mut resp3 = engine
+            .handle_connection_request(&mut session, &hdr2, &mut buf3.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp3).unwrap();
+        let create_resp3 = CreateTopicsResponse::decode(&mut resp3, 2).unwrap();
+        assert_eq!(
+            create_resp3.topics[0].error_code,
+            KafkaErrorCode::TopicAlreadyExists
+        );
+
+        // 4. Invalid topic requests
+        let req_invalid = CreateTopicsRequest {
+            topics: vec![
+                CreatableTopic {
+                    name: "invalid/topic/slash".into(),
+                    num_partitions: 1,
+                    replication_factor: 1,
+                    assignments: Vec::new(),
+                    configs: Vec::new(),
+                },
+                CreatableTopic {
+                    name: "zero-partitions".into(),
+                    num_partitions: 0,
+                    replication_factor: 1,
+                    assignments: Vec::new(),
+                    configs: Vec::new(),
+                },
+            ],
+            timeout_ms: 5000,
+            validate_only: false,
+        };
+        let mut buf4 = BytesMut::new();
+        req_invalid.encode(&mut buf4, 2);
+        let mut resp4 = engine
+            .handle_connection_request(&mut session, &hdr2, &mut buf4.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut resp4).unwrap();
+        let create_resp4 = CreateTopicsResponse::decode(&mut resp4, 2).unwrap();
+        assert_eq!(
+            create_resp4.topics[0].error_code,
+            KafkaErrorCode::InvalidTopicException
+        );
+        assert_eq!(
+            create_resp4.topics[1].error_code,
+            KafkaErrorCode::InvalidPartitions
+        );
+
+        // 5. Metadata verification
+        let meta_req = MetadataRequest {
+            topics: Some(vec!["app-events".into(), "nonexistent".into()]),
+            allow_auto_topic_creation: false,
+        };
+        let meta_hdr = RequestHeader::new(ApiKey::Metadata, 1, 102, Some("client"));
+        let mut meta_buf = BytesMut::new();
+        meta_req.encode(&mut meta_buf, 1);
+        let mut meta_resp = engine
+            .handle_connection_request(&mut session, &meta_hdr, &mut meta_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut meta_resp).unwrap();
+        let decoded_meta = MetadataResponse::decode(&mut meta_resp, 1).unwrap();
+        let app_events_meta = decoded_meta
+            .topics
+            .iter()
+            .find(|t| t.name == "app-events")
+            .unwrap();
+        assert_eq!(app_events_meta.error_code, KafkaErrorCode::None);
+        assert_eq!(app_events_meta.partitions.len(), 3);
+        let non_meta = decoded_meta
+            .topics
+            .iter()
+            .find(|t| t.name == "nonexistent")
+            .unwrap();
+        assert_eq!(non_meta.error_code, KafkaErrorCode::UnknownTopicOrPartition);
+
+        // 6. DeleteTopics
+        let del_req = DeleteTopicsRequest {
+            topic_names: vec!["app-events".into(), "ghost-topic".into()],
+            timeout_ms: 5000,
+        };
+        let del_hdr = RequestHeader::new(ApiKey::DeleteTopics, 1, 103, Some("admin"));
+        let mut del_buf = BytesMut::new();
+        del_req.encode(&mut del_buf, 1);
+        let mut del_resp = engine
+            .handle_connection_request(&mut session, &del_hdr, &mut del_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut del_resp).unwrap();
+        let decoded_del = DeleteTopicsResponse::decode(&mut del_resp, 1).unwrap();
+        assert_eq!(decoded_del.responses.len(), 2);
+        assert_eq!(decoded_del.responses[0].name, "app-events");
+        assert_eq!(decoded_del.responses[0].error_code, KafkaErrorCode::None);
+        assert_eq!(decoded_del.responses[1].name, "ghost-topic");
+        assert_eq!(
+            decoded_del.responses[1].error_code,
+            KafkaErrorCode::UnknownTopicOrPartition
+        );
+
+        // Verify topic is gone from cluster
+        assert!(!cluster.has_topic("app-events"));
+        assert_eq!(cluster.partition_count(), 0);
     }
 }

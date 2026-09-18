@@ -21,6 +21,7 @@
 - **🔒 Wire-Protocol TLS/SSL Encryption**: Hardware-accelerated zero-overhead TLS termination on port `9093` using pure-Rust `tokio-rustls`.
 - **🔐 SASL Wire Authentication**: Standard Kafka SASL support (**PLAIN**, **SCRAM-SHA-256**, **SCRAM-SHA-512**) with strict enforcement over plaintext and TLS.
 - **🛡️ Kafka ACLs & RBAC Authorization**: Wire-level access control (`CreateAcls`, `DescribeAcls`, `DeleteAcls`) supporting Literal & Prefixed patterns, super-user bypass, and Deny precedence.
+- **🗂️ Dynamic Topic Management**: Wire-protocol topic provisioning (`CreateTopics`, `DeleteTopics`) compatible with `kafka-topics.sh` and Kafka Admin SDKs with dynamic partition provisioning and ACL checks.
 - **🚀 Line-Rate 2.5GbE Benchmarking**: Over 1,190,000+ msg/s sustained throughput with sub-millisecond p99 latency across 100 partitions.
 - **🌐 Embedded Dark-Mode Web Console**: Single-binary dashboard served directly at `http://localhost:8082/` with partition visualizer, consumer group monitor, and live chaos injection.
 - **🧪 Testcontainers Native**: Purpose-built for blazing-fast integration testing with Java, Rust, Go, or Python testcontainers.

@@ -303,6 +303,38 @@ kafka-acls.sh --bootstrap-server localhost:9092 \
 
 ---
 
+## 🗂️ Dynamic Topic Management (`CreateTopics` & `DeleteTopics`)
+
+oxideMq provides full Kafka wire-protocol dynamic topic and partition provisioning:
+- **Wire APIs Supported**:
+  - `CreateTopics` (ApiKey 19, v0–v4)
+  - `DeleteTopics` (ApiKey 20, v0–v3)
+- **Standard Kafka Tooling**: 100% compatible with `kafka-topics.sh` (`--create`, `--delete`, `--list`, `--describe`) and client Admin APIs (`AdminClient.createTopics()`, `AdminClient.deleteTopics()`).
+- **Dynamic Partition & Config Provisioning**:
+  - Configurable partition count, replication factor, and topic configs (e.g. `cleanup.policy`, `retention.ms`).
+  - Supports `validate_only` dry-run verification mode (ApiKey 19, v1+).
+  - Clean partition lifecycle teardown and memory cleanup on topic deletion.
+- **RBAC & Authorization Integration**:
+  - `CreateTopics` enforces `Create` operation on `Topic` or `Cluster:kafka-cluster`.
+  - `DeleteTopics` enforces `Delete` operation on `Topic` or `Cluster:kafka-cluster`.
+- **Accurate Error Semantics**: Precise Kafka error reporting (`TopicAlreadyExists`, `UnknownTopicOrPartition`, `InvalidTopicException`, `InvalidPartitions`, `InvalidReplicationFactor`, `TopicAuthorizationFailed`).
+
+```bash
+# Create a topic with 3 partitions using official kafka-topics.sh CLI:
+kafka-topics.sh --bootstrap-server localhost:9092 \
+  --create --topic orders-stream --partitions 3 --replication-factor 1
+
+# Describe topic to verify partition metadata:
+kafka-topics.sh --bootstrap-server localhost:9092 \
+  --describe --topic orders-stream
+
+# Delete topic:
+kafka-topics.sh --bootstrap-server localhost:9092 \
+  --delete --topic orders-stream
+```
+
+---
+
 ## 🚀 Line-Rate 2.5GbE Network Benchmark (`oxidemq-bench`)
 
 oxideMq includes a dedicated, multi-threaded stress-test tool capable of saturating 2.5GbE network links across hundreds of partitions:
