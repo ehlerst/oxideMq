@@ -13,10 +13,12 @@ mod tests {
     use oxidemq_protocol::messages::{
         AclCreation, AlterConfigsRequest, AlterConfigsResource, AlterConfigsResponse,
         AlterableConfig, ApiVersionsRequest, ApiVersionsResponse, CreatableTopic,
-        CreateAclsRequest, CreateAclsResponse, CreateTopicsConfig, CreateTopicsRequest,
-        CreateTopicsResponse, DeleteAclsFilter, DeleteAclsRequest, DeleteAclsResponse,
-        DeleteGroupsRequest, DeleteGroupsResponse, DeleteTopicsRequest, DeleteTopicsResponse,
-        DescribeAclsRequest, DescribeAclsResponse, DescribeConfigsRequest, DescribeConfigsResource,
+        CreateAclsRequest, CreateAclsResponse, CreatePartitionsRequest, CreatePartitionsResponse,
+        CreatePartitionsTopic, CreateTopicsConfig, CreateTopicsRequest, CreateTopicsResponse,
+        DeleteAclsFilter, DeleteAclsRequest, DeleteAclsResponse, DeleteGroupsRequest,
+        DeleteGroupsResponse, DeleteRecordsPartition, DeleteRecordsRequest, DeleteRecordsResponse,
+        DeleteRecordsTopic, DeleteTopicsRequest, DeleteTopicsResponse, DescribeAclsRequest,
+        DescribeAclsResponse, DescribeConfigsRequest, DescribeConfigsResource,
         DescribeConfigsResponse, DescribeGroupsRequest, DescribeGroupsResponse, FetchPartition,
         FetchRequest, FetchResponse, FetchTopic, FindCoordinatorRequest, FindCoordinatorResponse,
         LeaveGroupRequest, LeaveGroupResponse, ListGroupsRequest, ListGroupsResponse,
@@ -1651,5 +1653,524 @@ mod tests {
             del_resp3.results[0].error_code,
             KafkaErrorCode::GroupIdNotFound
         );
+    }
+
+    #[tokio::test]
+    async fn test_create_partitions_e2e_over_tcp() {
+        let engine = setup_test_engine();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+
+        let engine_clone = engine.clone();
+        let server_task = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let eng = engine_clone.clone();
+                tokio::spawn(async move {
+                    let (reader, writer) = socket.into_split();
+                    let _ = eng
+                        .process_connection(tokio::io::join(reader, writer))
+                        .await;
+                });
+            }
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        // 1. CreateTopic 'scalable-stream' with 2 partitions
+        let ct_hdr = RequestHeader::new(ApiKey::CreateTopics, 0, 1, Some("admin-client"));
+        let mut ct_buf = BytesMut::new();
+        ct_hdr.encode(&mut ct_buf);
+        let ct_req = CreateTopicsRequest {
+            topics: vec![CreatableTopic {
+                name: "scalable-stream".into(),
+                num_partitions: 2,
+                replication_factor: 1,
+                assignments: vec![],
+                configs: vec![],
+            }],
+            timeout_ms: 5000,
+            validate_only: false,
+        };
+        ct_req.encode(&mut ct_buf, 0);
+        let mut ct_frame = BytesMut::new();
+        ct_frame.put_i32(ct_buf.len() as i32);
+        ct_frame.put_slice(&ct_buf);
+        stream.write_all(&ct_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let ct_len = stream.read_i32().await.unwrap() as usize;
+        let mut ct_resp_buf = vec![0u8; ct_len];
+        stream.read_exact(&mut ct_resp_buf).await.unwrap();
+        let mut ct_bytes = Bytes::from(ct_resp_buf);
+        let _ = ResponseHeader::decode(&mut ct_bytes).unwrap();
+        let ct_resp = CreateTopicsResponse::decode(&mut ct_bytes, 0).unwrap();
+        assert_eq!(ct_resp.topics[0].error_code, KafkaErrorCode::None);
+
+        // 2. Query Metadata -> verify 2 partitions
+        let meta_hdr = RequestHeader::new(ApiKey::Metadata, 0, 2, Some("admin-client"));
+        let mut meta_buf = BytesMut::new();
+        meta_hdr.encode(&mut meta_buf);
+        let meta_req = MetadataRequest {
+            topics: Some(vec!["scalable-stream".into()]),
+            allow_auto_topic_creation: false,
+        };
+        meta_req.encode(&mut meta_buf, 0);
+        let mut meta_frame = BytesMut::new();
+        meta_frame.put_i32(meta_buf.len() as i32);
+        meta_frame.put_slice(&meta_buf);
+        stream.write_all(&meta_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let meta_len = stream.read_i32().await.unwrap() as usize;
+        let mut meta_resp_buf = vec![0u8; meta_len];
+        stream.read_exact(&mut meta_resp_buf).await.unwrap();
+        let mut meta_bytes = Bytes::from(meta_resp_buf);
+        let _ = ResponseHeader::decode(&mut meta_bytes).unwrap();
+        let meta_resp = MetadataResponse::decode(&mut meta_bytes, 0).unwrap();
+        assert_eq!(meta_resp.topics[0].partitions.len(), 2);
+
+        // 3. CreatePartitions: shrink or same count -> InvalidPartitions
+        let cp_hdr1 = RequestHeader::new(ApiKey::CreatePartitions, 0, 3, Some("admin-client"));
+        let mut cp_buf1 = BytesMut::new();
+        cp_hdr1.encode(&mut cp_buf1);
+        let cp_req1 = CreatePartitionsRequest {
+            topic_partitions: vec![CreatePartitionsTopic {
+                name: "scalable-stream".into(),
+                count: 1,
+                assignments: None,
+            }],
+            timeout_ms: 5000,
+            validate_only: false,
+        };
+        cp_req1.encode(&mut cp_buf1, 0);
+        let mut cp_frame1 = BytesMut::new();
+        cp_frame1.put_i32(cp_buf1.len() as i32);
+        cp_frame1.put_slice(&cp_buf1);
+        stream.write_all(&cp_frame1).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let cp_len1 = stream.read_i32().await.unwrap() as usize;
+        let mut cp_resp_buf1 = vec![0u8; cp_len1];
+        stream.read_exact(&mut cp_resp_buf1).await.unwrap();
+        let mut cp_bytes1 = Bytes::from(cp_resp_buf1);
+        let _ = ResponseHeader::decode(&mut cp_bytes1).unwrap();
+        let cp_resp1 = CreatePartitionsResponse::decode(&mut cp_bytes1, 0).unwrap();
+        assert_eq!(
+            cp_resp1.results[0].error_code,
+            KafkaErrorCode::InvalidPartitions
+        );
+
+        // 4. CreatePartitions: expand to 5 with validate_only = true -> success, partition count remains 2
+        let cp_hdr2 = RequestHeader::new(ApiKey::CreatePartitions, 0, 4, Some("admin-client"));
+        let mut cp_buf2 = BytesMut::new();
+        cp_hdr2.encode(&mut cp_buf2);
+        let cp_req2 = CreatePartitionsRequest {
+            topic_partitions: vec![CreatePartitionsTopic {
+                name: "scalable-stream".into(),
+                count: 5,
+                assignments: None,
+            }],
+            timeout_ms: 5000,
+            validate_only: true,
+        };
+        cp_req2.encode(&mut cp_buf2, 0);
+        let mut cp_frame2 = BytesMut::new();
+        cp_frame2.put_i32(cp_buf2.len() as i32);
+        cp_frame2.put_slice(&cp_buf2);
+        stream.write_all(&cp_frame2).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let cp_len2 = stream.read_i32().await.unwrap() as usize;
+        let mut cp_resp_buf2 = vec![0u8; cp_len2];
+        stream.read_exact(&mut cp_resp_buf2).await.unwrap();
+        let mut cp_bytes2 = Bytes::from(cp_resp_buf2);
+        let _ = ResponseHeader::decode(&mut cp_bytes2).unwrap();
+        let cp_resp2 = CreatePartitionsResponse::decode(&mut cp_bytes2, 0).unwrap();
+        assert_eq!(cp_resp2.results[0].error_code, KafkaErrorCode::None);
+
+        // Verify still 2 partitions
+        let mut meta_buf2 = BytesMut::new();
+        meta_hdr.encode(&mut meta_buf2);
+        meta_req.encode(&mut meta_buf2, 0);
+        let mut meta_frame2 = BytesMut::new();
+        meta_frame2.put_i32(meta_buf2.len() as i32);
+        meta_frame2.put_slice(&meta_buf2);
+        stream.write_all(&meta_frame2).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let meta_len2 = stream.read_i32().await.unwrap() as usize;
+        let mut meta_resp_buf2 = vec![0u8; meta_len2];
+        stream.read_exact(&mut meta_resp_buf2).await.unwrap();
+        let mut meta_bytes2 = Bytes::from(meta_resp_buf2);
+        let _ = ResponseHeader::decode(&mut meta_bytes2).unwrap();
+        let meta_resp2 = MetadataResponse::decode(&mut meta_bytes2, 0).unwrap();
+        assert_eq!(meta_resp2.topics[0].partitions.len(), 2);
+
+        // 5. CreatePartitions: expand to 5 with validate_only = false -> commits expansion
+        let cp_hdr3 = RequestHeader::new(ApiKey::CreatePartitions, 0, 5, Some("admin-client"));
+        let mut cp_buf3 = BytesMut::new();
+        cp_hdr3.encode(&mut cp_buf3);
+        let cp_req3 = CreatePartitionsRequest {
+            topic_partitions: vec![CreatePartitionsTopic {
+                name: "scalable-stream".into(),
+                count: 5,
+                assignments: None,
+            }],
+            timeout_ms: 5000,
+            validate_only: false,
+        };
+        cp_req3.encode(&mut cp_buf3, 0);
+        let mut cp_frame3 = BytesMut::new();
+        cp_frame3.put_i32(cp_buf3.len() as i32);
+        cp_frame3.put_slice(&cp_buf3);
+        stream.write_all(&cp_frame3).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let cp_len3 = stream.read_i32().await.unwrap() as usize;
+        let mut cp_resp_buf3 = vec![0u8; cp_len3];
+        stream.read_exact(&mut cp_resp_buf3).await.unwrap();
+        let mut cp_bytes3 = Bytes::from(cp_resp_buf3);
+        let _ = ResponseHeader::decode(&mut cp_bytes3).unwrap();
+        let cp_resp3 = CreatePartitionsResponse::decode(&mut cp_bytes3, 0).unwrap();
+        assert_eq!(cp_resp3.results[0].error_code, KafkaErrorCode::None);
+
+        // Verify now 5 partitions
+        let mut meta_buf3 = BytesMut::new();
+        meta_hdr.encode(&mut meta_buf3);
+        meta_req.encode(&mut meta_buf3, 0);
+        let mut meta_frame3 = BytesMut::new();
+        meta_frame3.put_i32(meta_buf3.len() as i32);
+        meta_frame3.put_slice(&meta_buf3);
+        stream.write_all(&meta_frame3).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let meta_len3 = stream.read_i32().await.unwrap() as usize;
+        let mut meta_resp_buf3 = vec![0u8; meta_len3];
+        stream.read_exact(&mut meta_resp_buf3).await.unwrap();
+        let mut meta_bytes3 = Bytes::from(meta_resp_buf3);
+        let _ = ResponseHeader::decode(&mut meta_bytes3).unwrap();
+        let meta_resp3 = MetadataResponse::decode(&mut meta_bytes3, 0).unwrap();
+        assert_eq!(meta_resp3.topics[0].partitions.len(), 5);
+
+        // 6. Produce to newly created partition 4 and verify success
+        let prod_hdr = RequestHeader::new(ApiKey::Produce, 0, 6, Some("producer"));
+        let mut prod_buf = BytesMut::new();
+        prod_hdr.encode(&mut prod_buf);
+        let prod_req = ProduceRequest {
+            acks: 1,
+            timeout_ms: 1000,
+            topic_data: vec![TopicProduceData {
+                topic: "scalable-stream".into(),
+                partitions: vec![PartitionProduceData {
+                    partition: 4,
+                    records: Bytes::from_static(b"part4-val-payload"),
+                }],
+            }],
+        };
+        prod_req.encode(&mut prod_buf, 0);
+        let mut prod_frame = BytesMut::new();
+        prod_frame.put_i32(prod_buf.len() as i32);
+        prod_frame.put_slice(&prod_buf);
+        stream.write_all(&prod_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let prod_len = stream.read_i32().await.unwrap() as usize;
+        let mut prod_resp_buf = vec![0u8; prod_len];
+        stream.read_exact(&mut prod_resp_buf).await.unwrap();
+        let mut prod_bytes = Bytes::from(prod_resp_buf);
+        let _ = ResponseHeader::decode(&mut prod_bytes).unwrap();
+        let prod_resp = ProduceResponse::decode(&mut prod_bytes, 0).unwrap();
+        assert_eq!(
+            prod_resp.responses[0].partitions[0].error_code,
+            KafkaErrorCode::None
+        );
+        assert_eq!(prod_resp.responses[0].partitions[0].base_offset, 0);
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    async fn test_delete_records_e2e_over_tcp() {
+        let engine = setup_test_engine();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+
+        let engine_clone = engine.clone();
+        let server_task = tokio::spawn(async move {
+            while let Ok((socket, _)) = listener.accept().await {
+                let eng = engine_clone.clone();
+                tokio::spawn(async move {
+                    let (reader, writer) = socket.into_split();
+                    let _ = eng
+                        .process_connection(tokio::io::join(reader, writer))
+                        .await;
+                });
+            }
+        });
+
+        let mut stream = TcpStream::connect(addr).await.unwrap();
+
+        // 1. CreateTopic 'truncatable-stream' with 1 partition
+        let ct_hdr = RequestHeader::new(ApiKey::CreateTopics, 0, 1, Some("admin-client"));
+        let mut ct_buf = BytesMut::new();
+        ct_hdr.encode(&mut ct_buf);
+        let ct_req = CreateTopicsRequest {
+            topics: vec![CreatableTopic {
+                name: "truncatable-stream".into(),
+                num_partitions: 1,
+                replication_factor: 1,
+                assignments: vec![],
+                configs: vec![],
+            }],
+            timeout_ms: 5000,
+            validate_only: false,
+        };
+        ct_req.encode(&mut ct_buf, 0);
+        let mut ct_frame = BytesMut::new();
+        ct_frame.put_i32(ct_buf.len() as i32);
+        ct_frame.put_slice(&ct_buf);
+        stream.write_all(&ct_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let ct_len = stream.read_i32().await.unwrap() as usize;
+        let mut ct_resp_buf = vec![0u8; ct_len];
+        stream.read_exact(&mut ct_resp_buf).await.unwrap();
+        let mut ct_bytes = Bytes::from(ct_resp_buf);
+        let _ = ResponseHeader::decode(&mut ct_bytes).unwrap();
+        let ct_resp = CreateTopicsResponse::decode(&mut ct_bytes, 0).unwrap();
+        assert_eq!(ct_resp.topics[0].error_code, KafkaErrorCode::None);
+
+        // 2. Produce 6 records to partition 0
+        for i in 0..6 {
+            let prod_hdr = RequestHeader::new(ApiKey::Produce, 0, 10 + i, Some("producer"));
+            let mut prod_buf = BytesMut::new();
+            prod_hdr.encode(&mut prod_buf);
+            let prod_req = ProduceRequest {
+                acks: 1,
+                timeout_ms: 1000,
+                topic_data: vec![TopicProduceData {
+                    topic: "truncatable-stream".into(),
+                    partitions: vec![PartitionProduceData {
+                        partition: 0,
+                        records: Bytes::from(format!("payload-{}", i)),
+                    }],
+                }],
+            };
+            prod_req.encode(&mut prod_buf, 0);
+            let mut prod_frame = BytesMut::new();
+            prod_frame.put_i32(prod_buf.len() as i32);
+            prod_frame.put_slice(&prod_buf);
+            stream.write_all(&prod_frame).await.unwrap();
+            stream.flush().await.unwrap();
+
+            let prod_len = stream.read_i32().await.unwrap() as usize;
+            let mut prod_resp_buf = vec![0u8; prod_len];
+            stream.read_exact(&mut prod_resp_buf).await.unwrap();
+        }
+
+        // 3. ListOffsets: earliest (-2) -> 0
+        let lo_hdr = RequestHeader::new(ApiKey::ListOffsets, 0, 20, Some("client"));
+        let mut lo_buf = BytesMut::new();
+        lo_hdr.encode(&mut lo_buf);
+        let lo_req = ListOffsetsRequest {
+            replica_id: -1,
+            isolation_level: 0,
+            topics: vec![ListOffsetsTopic {
+                topic: "truncatable-stream".into(),
+                partitions: vec![ListOffsetsPartition {
+                    partition: 0,
+                    current_leader_epoch: -1,
+                    timestamp: -2,
+                }],
+            }],
+        };
+        lo_req.encode(&mut lo_buf, 0);
+        let mut lo_frame = BytesMut::new();
+        lo_frame.put_i32(lo_buf.len() as i32);
+        lo_frame.put_slice(&lo_buf);
+        stream.write_all(&lo_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let lo_len = stream.read_i32().await.unwrap() as usize;
+        let mut lo_resp_buf = vec![0u8; lo_len];
+        stream.read_exact(&mut lo_resp_buf).await.unwrap();
+        let mut lo_bytes = Bytes::from(lo_resp_buf);
+        let _ = ResponseHeader::decode(&mut lo_bytes).unwrap();
+        let lo_resp = ListOffsetsResponse::decode(&mut lo_bytes, 0).unwrap();
+        assert_eq!(lo_resp.topics[0].partitions[0].offset, 0);
+
+        // 4. DeleteRecords: offset 10 (> HW 6) -> OffsetOutOfRange
+        let dr_hdr1 = RequestHeader::new(ApiKey::DeleteRecords, 0, 21, Some("admin"));
+        let mut dr_buf1 = BytesMut::new();
+        dr_hdr1.encode(&mut dr_buf1);
+        let dr_req1 = DeleteRecordsRequest {
+            topics: vec![DeleteRecordsTopic {
+                name: "truncatable-stream".into(),
+                partitions: vec![DeleteRecordsPartition {
+                    partition_index: 0,
+                    offset: 10,
+                }],
+            }],
+            timeout_ms: 5000,
+        };
+        dr_req1.encode(&mut dr_buf1, 0);
+        let mut dr_frame1 = BytesMut::new();
+        dr_frame1.put_i32(dr_buf1.len() as i32);
+        dr_frame1.put_slice(&dr_buf1);
+        stream.write_all(&dr_frame1).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let dr_len1 = stream.read_i32().await.unwrap() as usize;
+        let mut dr_resp_buf1 = vec![0u8; dr_len1];
+        stream.read_exact(&mut dr_resp_buf1).await.unwrap();
+        let mut dr_bytes1 = Bytes::from(dr_resp_buf1);
+        let _ = ResponseHeader::decode(&mut dr_bytes1).unwrap();
+        let dr_resp1 = DeleteRecordsResponse::decode(&mut dr_bytes1, 0).unwrap();
+        assert_eq!(
+            dr_resp1.topics[0].partitions[0].error_code,
+            KafkaErrorCode::OffsetOutOfRange
+        );
+        assert_eq!(dr_resp1.topics[0].partitions[0].low_watermark, -1);
+
+        // 5. DeleteRecords: offset 4 -> None, low_watermark = 4
+        let dr_hdr2 = RequestHeader::new(ApiKey::DeleteRecords, 0, 22, Some("admin"));
+        let mut dr_buf2 = BytesMut::new();
+        dr_hdr2.encode(&mut dr_buf2);
+        let dr_req2 = DeleteRecordsRequest {
+            topics: vec![DeleteRecordsTopic {
+                name: "truncatable-stream".into(),
+                partitions: vec![DeleteRecordsPartition {
+                    partition_index: 0,
+                    offset: 4,
+                }],
+            }],
+            timeout_ms: 5000,
+        };
+        dr_req2.encode(&mut dr_buf2, 0);
+        let mut dr_frame2 = BytesMut::new();
+        dr_frame2.put_i32(dr_buf2.len() as i32);
+        dr_frame2.put_slice(&dr_buf2);
+        stream.write_all(&dr_frame2).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let dr_len2 = stream.read_i32().await.unwrap() as usize;
+        let mut dr_resp_buf2 = vec![0u8; dr_len2];
+        stream.read_exact(&mut dr_resp_buf2).await.unwrap();
+        let mut dr_bytes2 = Bytes::from(dr_resp_buf2);
+        let _ = ResponseHeader::decode(&mut dr_bytes2).unwrap();
+        let dr_resp2 = DeleteRecordsResponse::decode(&mut dr_bytes2, 0).unwrap();
+        assert_eq!(
+            dr_resp2.topics[0].partitions[0].error_code,
+            KafkaErrorCode::None
+        );
+        assert_eq!(dr_resp2.topics[0].partitions[0].low_watermark, 4);
+
+        // 6. ListOffsets: earliest (-2) now returns 4!
+        let mut lo_buf2 = BytesMut::new();
+        lo_hdr.encode(&mut lo_buf2);
+        lo_req.encode(&mut lo_buf2, 0);
+        let mut lo_frame2 = BytesMut::new();
+        lo_frame2.put_i32(lo_buf2.len() as i32);
+        lo_frame2.put_slice(&lo_buf2);
+        stream.write_all(&lo_frame2).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let lo_len2 = stream.read_i32().await.unwrap() as usize;
+        let mut lo_resp_buf2 = vec![0u8; lo_len2];
+        stream.read_exact(&mut lo_resp_buf2).await.unwrap();
+        let mut lo_bytes2 = Bytes::from(lo_resp_buf2);
+        let _ = ResponseHeader::decode(&mut lo_bytes2).unwrap();
+        let lo_resp2 = ListOffsetsResponse::decode(&mut lo_bytes2, 0).unwrap();
+        assert_eq!(lo_resp2.topics[0].partitions[0].offset, 4);
+
+        // 7. Fetch from offset 4 -> returns valid records starting at offset 4
+        let fetch_hdr = RequestHeader::new(ApiKey::Fetch, 0, 23, Some("consumer"));
+        let mut fetch_buf = BytesMut::new();
+        fetch_hdr.encode(&mut fetch_buf);
+        let fetch_req = FetchRequest {
+            max_wait_ms: 500,
+            min_bytes: 1,
+            max_bytes: 1024 * 1024,
+            isolation_level: 0,
+            topics: vec![FetchTopic {
+                topic: "truncatable-stream".into(),
+                partitions: vec![FetchPartition {
+                    partition: 0,
+                    fetch_offset: 4,
+                    partition_max_bytes: 65536,
+                }],
+            }],
+        };
+        fetch_req.encode(&mut fetch_buf, 0);
+        let mut fetch_frame = BytesMut::new();
+        fetch_frame.put_i32(fetch_buf.len() as i32);
+        fetch_frame.put_slice(&fetch_buf);
+        stream.write_all(&fetch_frame).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let fetch_len = stream.read_i32().await.unwrap() as usize;
+        let mut fetch_resp_buf = vec![0u8; fetch_len];
+        stream.read_exact(&mut fetch_resp_buf).await.unwrap();
+        let mut fetch_bytes = Bytes::from(fetch_resp_buf);
+        let _ = ResponseHeader::decode(&mut fetch_bytes).unwrap();
+        let fetch_resp = FetchResponse::decode(&mut fetch_bytes, 0).unwrap();
+        assert_eq!(
+            fetch_resp.responses[0].partitions[0].error_code,
+            KafkaErrorCode::None
+        );
+        assert!(!fetch_resp.responses[0].partitions[0].records.is_empty());
+
+        // 8. DeleteRecords: offset -1 -> deletes up to high watermark (6)
+        let dr_hdr3 = RequestHeader::new(ApiKey::DeleteRecords, 0, 24, Some("admin"));
+        let mut dr_buf3 = BytesMut::new();
+        dr_hdr3.encode(&mut dr_buf3);
+        let dr_req3 = DeleteRecordsRequest {
+            topics: vec![DeleteRecordsTopic {
+                name: "truncatable-stream".into(),
+                partitions: vec![DeleteRecordsPartition {
+                    partition_index: 0,
+                    offset: -1,
+                }],
+            }],
+            timeout_ms: 5000,
+        };
+        dr_req3.encode(&mut dr_buf3, 0);
+        let mut dr_frame3 = BytesMut::new();
+        dr_frame3.put_i32(dr_buf3.len() as i32);
+        dr_frame3.put_slice(&dr_buf3);
+        stream.write_all(&dr_frame3).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let dr_len3 = stream.read_i32().await.unwrap() as usize;
+        let mut dr_resp_buf3 = vec![0u8; dr_len3];
+        stream.read_exact(&mut dr_resp_buf3).await.unwrap();
+        let mut dr_bytes3 = Bytes::from(dr_resp_buf3);
+        let _ = ResponseHeader::decode(&mut dr_bytes3).unwrap();
+        let dr_resp3 = DeleteRecordsResponse::decode(&mut dr_bytes3, 0).unwrap();
+        assert_eq!(
+            dr_resp3.topics[0].partitions[0].error_code,
+            KafkaErrorCode::None
+        );
+        assert_eq!(dr_resp3.topics[0].partitions[0].low_watermark, 6);
+
+        // 9. ListOffsets: earliest (-2) now returns 6!
+        let mut lo_buf3 = BytesMut::new();
+        lo_hdr.encode(&mut lo_buf3);
+        lo_req.encode(&mut lo_buf3, 0);
+        let mut lo_frame3 = BytesMut::new();
+        lo_frame3.put_i32(lo_buf3.len() as i32);
+        lo_frame3.put_slice(&lo_buf3);
+        stream.write_all(&lo_frame3).await.unwrap();
+        stream.flush().await.unwrap();
+
+        let lo_len3 = stream.read_i32().await.unwrap() as usize;
+        let mut lo_resp_buf3 = vec![0u8; lo_len3];
+        stream.read_exact(&mut lo_resp_buf3).await.unwrap();
+        let mut lo_bytes3 = Bytes::from(lo_resp_buf3);
+        let _ = ResponseHeader::decode(&mut lo_bytes3).unwrap();
+        let lo_resp3 = ListOffsetsResponse::decode(&mut lo_bytes3, 0).unwrap();
+        assert_eq!(lo_resp3.topics[0].partitions[0].offset, 6);
+
+        server_task.abort();
     }
 }

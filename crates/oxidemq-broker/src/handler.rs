@@ -14,21 +14,23 @@ use oxidemq_protocol::messages::{
     AddPartitionsToTxnPartitionResult, AddPartitionsToTxnRequest, AddPartitionsToTxnResponse,
     AddPartitionsToTxnTopicResult, AlterConfigsRequest, AlterConfigsResourceResponse,
     AlterConfigsResponse, ApiVersionsRequest, ApiVersionsResponse, CreatableTopicResult,
-    CreateAclsRequest, CreateAclsResponse, CreateTopicsRequest, CreateTopicsResponse,
-    DeletableGroupResult, DeletableTopicResult, DeleteAclsFilterResult, DeleteAclsRequest,
-    DeleteAclsResponse, DeleteGroupsRequest, DeleteGroupsResponse, DeleteTopicsRequest,
-    DeleteTopicsResponse, DescribeAclsRequest, DescribeAclsResponse, DescribeConfigsRequest,
-    DescribeConfigsResponse, DescribeConfigsResult, DescribeGroupsRequest, DescribeGroupsResponse,
-    EndTxnRequest, EndTxnResponse, FetchPartitionResponse, FetchRequest, FetchResponse,
-    FetchTopicResponse, FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest,
-    HeartbeatResponse, InitProducerIdRequest, InitProducerIdResponse, LeaveGroupRequest,
-    LeaveGroupResponse, ListGroupsRequest, ListGroupsResponse, ListOffsetsPartitionResponse,
-    ListOffsetsRequest, ListOffsetsResponse, ListOffsetsTopicResponse, MetadataRequest,
-    OffsetCommitPartitionResponse, OffsetCommitRequest, OffsetCommitResponse,
-    OffsetCommitTopicResponse, OffsetFetchPartitionResponse, OffsetFetchRequest,
-    OffsetFetchResponse, OffsetFetchTopicResponse, PartitionProduceResponse, ProduceRequest,
-    ProduceResponse, SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest,
-    SaslHandshakeResponse, TopicProduceResponse,
+    CreateAclsRequest, CreateAclsResponse, CreatePartitionsRequest, CreatePartitionsResponse,
+    CreatePartitionsTopicResult, CreateTopicsRequest, CreateTopicsResponse, DeletableGroupResult,
+    DeletableTopicResult, DeleteAclsFilterResult, DeleteAclsRequest, DeleteAclsResponse,
+    DeleteGroupsRequest, DeleteGroupsResponse, DeleteRecordsPartitionResult, DeleteRecordsRequest,
+    DeleteRecordsResponse, DeleteRecordsTopicResult, DeleteTopicsRequest, DeleteTopicsResponse,
+    DescribeAclsRequest, DescribeAclsResponse, DescribeConfigsRequest, DescribeConfigsResponse,
+    DescribeConfigsResult, DescribeGroupsRequest, DescribeGroupsResponse, EndTxnRequest,
+    EndTxnResponse, FetchPartitionResponse, FetchRequest, FetchResponse, FetchTopicResponse,
+    FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
+    InitProducerIdRequest, InitProducerIdResponse, LeaveGroupRequest, LeaveGroupResponse,
+    ListGroupsRequest, ListGroupsResponse, ListOffsetsPartitionResponse, ListOffsetsRequest,
+    ListOffsetsResponse, ListOffsetsTopicResponse, MetadataRequest, OffsetCommitPartitionResponse,
+    OffsetCommitRequest, OffsetCommitResponse, OffsetCommitTopicResponse,
+    OffsetFetchPartitionResponse, OffsetFetchRequest, OffsetFetchResponse,
+    OffsetFetchTopicResponse, PartitionProduceResponse, ProduceRequest, ProduceResponse,
+    SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse,
+    TopicProduceResponse,
 };
 use oxidemq_protocol::{AclOperation, AclResourceType, ApiKey, KafkaErrorCode};
 use std::collections::HashMap;
@@ -1504,6 +1506,136 @@ impl BrokerEngine {
                 };
                 resp.encode(&mut out, header.api_version);
             }
+            ApiKey::DeleteRecords => {
+                let req = DeleteRecordsRequest::decode(body, header.api_version)?;
+                let mut topic_results = Vec::with_capacity(req.topics.len());
+
+                for t in req.topics {
+                    let is_authorized = self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Topic,
+                        &t.name,
+                        AclOperation::Delete,
+                    ) || self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Cluster,
+                        "kafka-cluster",
+                        AclOperation::Delete,
+                    );
+
+                    let mut part_results = Vec::with_capacity(t.partitions.len());
+                    for p in t.partitions {
+                        if !is_authorized {
+                            part_results.push(DeleteRecordsPartitionResult {
+                                partition_index: p.partition_index,
+                                low_watermark: -1,
+                                error_code: KafkaErrorCode::TopicAuthorizationFailed,
+                            });
+                            continue;
+                        }
+
+                        let tp = TopicPartition::new(&t.name, p.partition_index);
+                        match self.cluster_state.delete_records(&tp, p.offset) {
+                            Ok(new_lw) => {
+                                part_results.push(DeleteRecordsPartitionResult {
+                                    partition_index: p.partition_index,
+                                    low_watermark: new_lw,
+                                    error_code: KafkaErrorCode::None,
+                                });
+                            }
+                            Err(err) => {
+                                part_results.push(DeleteRecordsPartitionResult {
+                                    partition_index: p.partition_index,
+                                    low_watermark: -1,
+                                    error_code: err,
+                                });
+                            }
+                        }
+                    }
+                    topic_results.push(DeleteRecordsTopicResult {
+                        name: t.name,
+                        partitions: part_results,
+                    });
+                }
+
+                let resp = DeleteRecordsResponse {
+                    throttle_time_ms: 0,
+                    topics: topic_results,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::CreatePartitions => {
+                let req = CreatePartitionsRequest::decode(body, header.api_version)?;
+                let mut results = Vec::with_capacity(req.topic_partitions.len());
+
+                for t in req.topic_partitions {
+                    let is_authorized = self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Topic,
+                        &t.name,
+                        AclOperation::Alter,
+                    ) || self.authorizer.authorize(
+                        principal,
+                        client_host,
+                        AclResourceType::Cluster,
+                        "kafka-cluster",
+                        AclOperation::Alter,
+                    );
+
+                    if !is_authorized {
+                        results.push(CreatePartitionsTopicResult {
+                            name: t.name,
+                            error_code: KafkaErrorCode::TopicAuthorizationFailed,
+                            error_message: Some(
+                                "Topic authorization failed: Alter required on Topic or Cluster"
+                                    .into(),
+                            ),
+                        });
+                        continue;
+                    }
+
+                    match self.cluster_state.create_partitions(
+                        &t.name,
+                        t.count,
+                        t.assignments.as_deref(),
+                        req.validate_only,
+                    ) {
+                        Ok(()) => {
+                            results.push(CreatePartitionsTopicResult {
+                                name: t.name,
+                                error_code: KafkaErrorCode::None,
+                                error_message: None,
+                            });
+                        }
+                        Err(err) => {
+                            let msg = match err {
+                                KafkaErrorCode::UnknownTopicOrPartition => "Topic does not exist",
+                                KafkaErrorCode::InvalidPartitions => {
+                                    "Number of partitions must be greater than existing number of partitions"
+                                }
+                                KafkaErrorCode::InvalidRequest => {
+                                    "Invalid partition replica assignments"
+                                }
+                                _ => "Failed to expand partitions",
+                            };
+                            results.push(CreatePartitionsTopicResult {
+                                name: t.name,
+                                error_code: err,
+                                error_message: Some(msg.into()),
+                            });
+                        }
+                    }
+                }
+
+                let resp = CreatePartitionsResponse {
+                    throttle_time_ms: 0,
+                    results,
+                };
+                resp.encode(&mut out, header.api_version);
+            }
             _ => {
                 return Err(OxideMqError::Protocol(format!(
                     "Unsupported Kafka API Key {:?}",
@@ -1676,8 +1808,8 @@ mod tests {
     use super::*;
     use oxidemq_protocol::messages::{
         AddPartitionsToTxnTopic, AlterConfigsResource, AlterableConfig, CreatableTopic,
-        CreateTopicsConfig, DescribeConfigsResource, MetadataResponse, PartitionProduceData,
-        TopicProduceData,
+        CreatePartitionsTopic, CreateTopicsConfig, DeleteRecordsPartition, DeleteRecordsTopic,
+        DescribeConfigsResource, MetadataResponse, PartitionProduceData, TopicProduceData,
     };
     use oxidemq_s3stream::block_cache::BlockCache;
     use oxidemq_s3stream::client::MemoryObjectStorage;
@@ -3134,5 +3266,233 @@ mod tests {
             del_resp3.results[0].error_code,
             KafkaErrorCode::GroupIdNotFound
         );
+    }
+
+    #[test]
+    fn test_delete_records_and_create_partitions_handler() {
+        let engine = create_test_engine();
+        let mut session = ConnectionAuthState::Authenticated {
+            principal: "admin".to_string(),
+        };
+
+        // 1. Create topic 'scale-topic' with 2 partitions
+        let create_topic_req = CreateTopicsRequest {
+            topics: vec![CreatableTopic {
+                name: "scale-topic".into(),
+                num_partitions: 2,
+                replication_factor: 1,
+                assignments: vec![],
+                configs: vec![],
+            }],
+            timeout_ms: 1000,
+            validate_only: false,
+        };
+        let mut ct_buf = BytesMut::new();
+        create_topic_req.encode(&mut ct_buf, 0);
+        let ct_hdr = RequestHeader::new(ApiKey::CreateTopics, 0, 700, Some("client"));
+        let mut ct_resp_bytes = engine
+            .handle_connection_request(&mut session, &ct_hdr, &mut ct_buf.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut ct_resp_bytes).unwrap();
+        let ct_resp = CreateTopicsResponse::decode(&mut ct_resp_bytes, 0).unwrap();
+        assert_eq!(ct_resp.topics[0].error_code, KafkaErrorCode::None);
+
+        // 2. CreatePartitions: expand to 1 (less than current 2) -> InvalidPartitions
+        let cp_req_invalid = CreatePartitionsRequest {
+            topic_partitions: vec![CreatePartitionsTopic {
+                name: "scale-topic".into(),
+                count: 1,
+                assignments: None,
+            }],
+            timeout_ms: 1000,
+            validate_only: false,
+        };
+        let mut cp_buf1 = BytesMut::new();
+        cp_req_invalid.encode(&mut cp_buf1, 0);
+        let cp_hdr = RequestHeader::new(ApiKey::CreatePartitions, 0, 701, Some("client"));
+        let mut cp_resp_bytes1 = engine
+            .handle_connection_request(&mut session, &cp_hdr, &mut cp_buf1.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut cp_resp_bytes1).unwrap();
+        let cp_resp1 = CreatePartitionsResponse::decode(&mut cp_resp_bytes1, 0).unwrap();
+        assert_eq!(
+            cp_resp1.results[0].error_code,
+            KafkaErrorCode::InvalidPartitions
+        );
+
+        // 3. CreatePartitions: nonexistent topic -> UnknownTopicOrPartition
+        let cp_req_unknown = CreatePartitionsRequest {
+            topic_partitions: vec![CreatePartitionsTopic {
+                name: "nonexistent-topic".into(),
+                count: 5,
+                assignments: None,
+            }],
+            timeout_ms: 1000,
+            validate_only: false,
+        };
+        let mut cp_buf2 = BytesMut::new();
+        cp_req_unknown.encode(&mut cp_buf2, 0);
+        let mut cp_resp_bytes2 = engine
+            .handle_connection_request(&mut session, &cp_hdr, &mut cp_buf2.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut cp_resp_bytes2).unwrap();
+        let cp_resp2 = CreatePartitionsResponse::decode(&mut cp_resp_bytes2, 0).unwrap();
+        assert_eq!(
+            cp_resp2.results[0].error_code,
+            KafkaErrorCode::UnknownTopicOrPartition
+        );
+
+        // 4. CreatePartitions: expand to 4 with validate_only = true -> success, but partition count unchanged
+        let cp_req_val = CreatePartitionsRequest {
+            topic_partitions: vec![CreatePartitionsTopic {
+                name: "scale-topic".into(),
+                count: 4,
+                assignments: None,
+            }],
+            timeout_ms: 1000,
+            validate_only: true,
+        };
+        let mut cp_buf3 = BytesMut::new();
+        cp_req_val.encode(&mut cp_buf3, 0);
+        let mut cp_resp_bytes3 = engine
+            .handle_connection_request(&mut session, &cp_hdr, &mut cp_buf3.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut cp_resp_bytes3).unwrap();
+        let cp_resp3 = CreatePartitionsResponse::decode(&mut cp_resp_bytes3, 0).unwrap();
+        assert_eq!(cp_resp3.results[0].error_code, KafkaErrorCode::None);
+        assert_eq!(
+            engine
+                .cluster_state
+                .get_topic("scale-topic")
+                .unwrap()
+                .num_partitions,
+            2
+        );
+
+        // 5. CreatePartitions: expand to 4 with validate_only = false -> success, partition count updated to 4
+        let cp_req_apply = CreatePartitionsRequest {
+            topic_partitions: vec![CreatePartitionsTopic {
+                name: "scale-topic".into(),
+                count: 4,
+                assignments: None,
+            }],
+            timeout_ms: 1000,
+            validate_only: false,
+        };
+        let mut cp_buf4 = BytesMut::new();
+        cp_req_apply.encode(&mut cp_buf4, 0);
+        let mut cp_resp_bytes4 = engine
+            .handle_connection_request(&mut session, &cp_hdr, &mut cp_buf4.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut cp_resp_bytes4).unwrap();
+        let cp_resp4 = CreatePartitionsResponse::decode(&mut cp_resp_bytes4, 0).unwrap();
+        assert_eq!(cp_resp4.results[0].error_code, KafkaErrorCode::None);
+        assert_eq!(
+            engine
+                .cluster_state
+                .get_topic("scale-topic")
+                .unwrap()
+                .num_partitions,
+            4
+        );
+        // Verify newly created partition 3 is accessible
+        assert!(engine
+            .cluster_state
+            .get_partition(&TopicPartition::new("scale-topic", 3))
+            .is_some());
+
+        // 6. Produce 5 records to partition 0 (offsets 0..5)
+        let tp0 = TopicPartition::new("scale-topic", 0);
+        let p0 = engine.cluster_state.get_or_create_partition(&tp0);
+        for i in 0..5 {
+            let _ = p0
+                .append_records(Bytes::from(format!("record-{}", i)))
+                .unwrap();
+        }
+        assert_eq!(p0.high_watermark(), 5);
+        assert_eq!(p0.log_start_offset(), 0);
+
+        // 7. DeleteRecords: offset 10 (> HW 5) -> OffsetOutOfRange, low_watermark: -1
+        let del_rec_req1 = DeleteRecordsRequest {
+            topics: vec![DeleteRecordsTopic {
+                name: "scale-topic".into(),
+                partitions: vec![DeleteRecordsPartition {
+                    partition_index: 0,
+                    offset: 10,
+                }],
+            }],
+            timeout_ms: 1000,
+        };
+        let del_rec_hdr = RequestHeader::new(ApiKey::DeleteRecords, 0, 702, Some("client"));
+        let mut dr_buf1 = BytesMut::new();
+        del_rec_req1.encode(&mut dr_buf1, 0);
+        let mut dr_resp_bytes1 = engine
+            .handle_connection_request(&mut session, &del_rec_hdr, &mut dr_buf1.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut dr_resp_bytes1).unwrap();
+        let dr_resp1 = DeleteRecordsResponse::decode(&mut dr_resp_bytes1, 0).unwrap();
+        assert_eq!(
+            dr_resp1.topics[0].partitions[0].error_code,
+            KafkaErrorCode::OffsetOutOfRange
+        );
+        assert_eq!(dr_resp1.topics[0].partitions[0].low_watermark, -1);
+
+        // 8. DeleteRecords: offset 3 -> None, low_watermark: 3
+        let del_rec_req2 = DeleteRecordsRequest {
+            topics: vec![DeleteRecordsTopic {
+                name: "scale-topic".into(),
+                partitions: vec![DeleteRecordsPartition {
+                    partition_index: 0,
+                    offset: 3,
+                }],
+            }],
+            timeout_ms: 1000,
+        };
+        let mut dr_buf2 = BytesMut::new();
+        del_rec_req2.encode(&mut dr_buf2, 0);
+        let mut dr_resp_bytes2 = engine
+            .handle_connection_request(&mut session, &del_rec_hdr, &mut dr_buf2.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut dr_resp_bytes2).unwrap();
+        let dr_resp2 = DeleteRecordsResponse::decode(&mut dr_resp_bytes2, 0).unwrap();
+        assert_eq!(
+            dr_resp2.topics[0].partitions[0].error_code,
+            KafkaErrorCode::None
+        );
+        assert_eq!(dr_resp2.topics[0].partitions[0].low_watermark, 3);
+        assert_eq!(p0.log_start_offset(), 3);
+
+        // 9. DeleteRecords: offset -1 (delete up to HW) -> None, low_watermark: 5
+        let del_rec_req3 = DeleteRecordsRequest {
+            topics: vec![DeleteRecordsTopic {
+                name: "scale-topic".into(),
+                partitions: vec![DeleteRecordsPartition {
+                    partition_index: 0,
+                    offset: -1,
+                }],
+            }],
+            timeout_ms: 1000,
+        };
+        let mut dr_buf3 = BytesMut::new();
+        del_rec_req3.encode(&mut dr_buf3, 0);
+        let mut dr_resp_bytes3 = engine
+            .handle_connection_request(&mut session, &del_rec_hdr, &mut dr_buf3.freeze())
+            .unwrap()
+            .freeze();
+        let _ = ResponseHeader::decode(&mut dr_resp_bytes3).unwrap();
+        let dr_resp3 = DeleteRecordsResponse::decode(&mut dr_resp_bytes3, 0).unwrap();
+        assert_eq!(
+            dr_resp3.topics[0].partitions[0].error_code,
+            KafkaErrorCode::None
+        );
+        assert_eq!(dr_resp3.topics[0].partitions[0].low_watermark, 5);
+        assert_eq!(p0.log_start_offset(), 5);
     }
 }

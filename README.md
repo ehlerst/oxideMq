@@ -404,6 +404,56 @@ kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
 
 ---
 
+## 📈 Dynamic Partition Expansion (`CreatePartitions`, ApiKey 37)
+
+oxideMq supports live scaling of topic partition counts without restarting the broker or recreating topics:
+- **Wire APIs Supported**: `CreatePartitions` (ApiKey 37, v0–v2).
+- **Standard Kafka Tooling Compatibility**: 100% compatible with `kafka-topics.sh` (`--alter --partitions <count>`) and Kafka `AdminClient.createPartitions()`.
+- **Validation & Dry-Run Verification**: Supports `validate_only` mode to test partition expansion validity before committing.
+- **Strict Error Handling**:
+  - Rejects attempts to decrease or maintain existing partition counts with `InvalidPartitions` (error code 37).
+  - Returns `UnknownTopicOrPartition` (error code 3) if the target topic does not exist.
+  - Returns `InvalidRequest` (error code 42) if replica assignments are malformed.
+- **ACL Authorization**: Enforces `AclOperation::Alter` on `Topic` or `Cluster:kafka-cluster`.
+
+```bash
+# Dynamically scale an existing topic to 10 partitions using official kafka-topics.sh CLI:
+kafka-topics.sh --bootstrap-server localhost:9092 \
+  --alter --topic orders-stream --partitions 10
+```
+
+---
+
+## 🗑️ Record Deletion & Log Truncation (`DeleteRecords`, ApiKey 21)
+
+oxideMq provides granular log truncation and retention management adhering directly to Apache Kafka KIP-107:
+- **Wire APIs Supported**: `DeleteRecords` (ApiKey 21, v0–v2).
+- **Standard Kafka CLI Compatibility**: Fully compatible with `kafka-delete-records.sh` and Kafka Java/Rust `AdminClient.deleteRecords()`.
+- **Low Watermark Advancement**:
+  - Sets the partition's `log_start_offset` (low watermark) forward to the requested offset.
+  - Automatically evicts truncated records from the in-memory LogCache and marks historical S3Stream segments for compaction.
+  - Requesting offset `-1` advances the low watermark directly to the partition's current high watermark, purging all existing records.
+- **Offset Bounds & Error Reporting**:
+  - Returns `OffsetOutOfRange` (error code 1) if the requested offset exceeds the high watermark.
+  - Returns `UnknownTopicOrPartition` (error code 3) if the topic or partition does not exist.
+- **ACL Authorization**: Enforces `AclOperation::Delete` on `Topic` or `Cluster:kafka-cluster`.
+
+```bash
+# JSON specification for kafka-delete-records.sh (delete_spec.json):
+# {
+#   "partitions": [
+#     {"topic": "orders-stream", "partition": 0, "offset": 1000}
+#   ],
+#   "version": 1
+# }
+
+# Execute log truncation using official kafka-delete-records.sh CLI:
+kafka-delete-records.sh --bootstrap-server localhost:9092 \
+  --offset-json-file delete_spec.json
+```
+
+---
+
 ## 🚀 Line-Rate 2.5GbE Network Benchmark (`oxidemq-bench`)
 
 oxideMq includes a dedicated, multi-threaded stress-test tool capable of saturating 2.5GbE network links across hundreds of partitions:

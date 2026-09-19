@@ -44,6 +44,26 @@ impl S3Stream {
     pub fn next_offset(&self) -> i64 {
         self.next_offset.load(Ordering::Relaxed)
     }
+
+    /// Advances the stream's start offset (low watermark), truncating records prior to `new_start_offset`.
+    pub fn advance_start_offset(&self, new_start_offset: i64) -> i64 {
+        let mut current = self.start_offset.load(Ordering::SeqCst);
+        while new_start_offset > current {
+            match self.start_offset.compare_exchange_weak(
+                current,
+                new_start_offset,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => {
+                    self.log_cache.trim(self.stream_id, new_start_offset);
+                    return new_start_offset;
+                }
+                Err(actual) => current = actual,
+            }
+        }
+        current
+    }
     pub fn new(
         stream_id: u64,
         start_offset: i64,

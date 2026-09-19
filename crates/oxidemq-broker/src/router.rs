@@ -1,8 +1,8 @@
 use crate::partition::Partition;
 use oxidemq_core::types::TopicPartition;
 use oxidemq_protocol::messages::{
-    BrokerMetadata, DescribeConfigsResourceResult, DescribeConfigsSynonym, MetadataResponse,
-    PartitionMetadata, TopicMetadata,
+    BrokerMetadata, CreatePartitionsAssignment, DescribeConfigsResourceResult,
+    DescribeConfigsSynonym, MetadataResponse, PartitionMetadata, TopicMetadata,
 };
 use oxidemq_protocol::KafkaErrorCode;
 use oxidemq_s3stream::block_cache::BlockCache;
@@ -213,6 +213,105 @@ impl ClusterState {
             set.insert(tp.topic.clone());
         }
         set.into_iter().collect()
+    }
+
+    /// Expands the number of partitions for an existing topic.
+    pub fn create_partitions(
+        &self,
+        name: &str,
+        new_count: i32,
+        assignments: Option<&[CreatePartitionsAssignment]>,
+        validate_only: bool,
+    ) -> std::result::Result<(), KafkaErrorCode> {
+        if !self.has_topic(name) {
+            return Err(KafkaErrorCode::UnknownTopicOrPartition);
+        }
+
+        let current_count = {
+            if let Some(t) = self.topics.read().get(name) {
+                t.num_partitions
+            } else {
+                self.partitions
+                    .read()
+                    .keys()
+                    .filter(|tp| tp.topic == name)
+                    .map(|tp| tp.partition + 1)
+                    .max()
+                    .unwrap_or(0)
+            }
+        };
+
+        if new_count <= current_count {
+            return Err(KafkaErrorCode::InvalidPartitions);
+        }
+
+        if new_count <= 0 || new_count > 10000 {
+            return Err(KafkaErrorCode::InvalidPartitions);
+        }
+
+        if let Some(assigns) = assignments {
+            let needed = (new_count - current_count) as usize;
+            if assigns.len() != needed {
+                return Err(KafkaErrorCode::InvalidRequest);
+            }
+        }
+
+        if validate_only {
+            return Ok(());
+        }
+
+        // Provision new partitions
+        for p in current_count..new_count {
+            let tp = TopicPartition::new(name, p);
+            let _ = self.get_or_create_partition(&tp);
+        }
+
+        // Update TopicRegistration
+        let mut topics = self.topics.write();
+        if let Some(reg) = topics.get_mut(name) {
+            reg.num_partitions = new_count;
+        } else {
+            topics.insert(
+                name.to_string(),
+                TopicRegistration {
+                    name: name.to_string(),
+                    num_partitions: new_count,
+                    replication_factor: 1,
+                    configs: HashMap::new(),
+                },
+            );
+        }
+
+        Ok(())
+    }
+
+    /// Advances the partition's log_start_offset up to `before_offset`, purging older records.
+    /// If `before_offset` is -1, truncates all records up to the high watermark.
+    pub fn delete_records(
+        &self,
+        tp: &TopicPartition,
+        before_offset: i64,
+    ) -> std::result::Result<i64, KafkaErrorCode> {
+        let partition = self
+            .get_partition(tp)
+            .ok_or(KafkaErrorCode::UnknownTopicOrPartition)?;
+
+        let hw = partition.high_watermark();
+        let target_offset = if before_offset == -1 {
+            hw
+        } else if before_offset < 0 || before_offset > hw {
+            return Err(KafkaErrorCode::OffsetOutOfRange);
+        } else {
+            before_offset
+        };
+
+        let current_start = partition.log_start_offset();
+        if target_offset <= current_start {
+            Ok(current_start)
+        } else {
+            let new_lw = partition.advance_log_start_offset(target_offset);
+            Ok(new_lw)
+        }
     }
 
     /// Updates topic configurations in the cluster state.

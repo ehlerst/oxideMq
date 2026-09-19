@@ -24,6 +24,8 @@
 - **🗂️ Dynamic Topic Management**: Wire-protocol topic provisioning (`CreateTopics`, `DeleteTopics`) compatible with `kafka-topics.sh` and Kafka Admin SDKs with dynamic partition provisioning and ACL checks.
 - **⚙️ Dynamic Configuration Management**: Wire-protocol `DescribeConfigs` and `AlterConfigs` compatible with `kafka-configs.sh` and AdminClient, supporting `validate_only` dry-runs and ACL checks.
 - **👥 Consumer Group Administration**: Native wire-protocol group management (`ListGroups`, `DescribeGroups`, `DeleteGroups`) compatible with `kafka-consumer-groups.sh` with active member protections and ACL controls.
+- **📈 Dynamic Partition Expansion**: Wire-protocol `CreatePartitions` (ApiKey 37) allowing live scaling of topic partition counts with dry-run validation and ACL enforcement.
+- **🗑️ Record Deletion & Log Truncation**: Kafka KIP-107 `DeleteRecords` (ApiKey 21) advancing low watermarks, evicting cache records, and triggering S3 compaction.
 - **🚀 Line-Rate 2.5GbE Benchmarking**: Over 1,190,000+ msg/s sustained throughput with sub-millisecond p99 latency across 100 partitions.
 - **🌐 Embedded Dark-Mode Web Console**: Single-binary dashboard served directly at `http://localhost:8082/` with partition visualizer, consumer group monitor, and live chaos injection.
 - **🧪 Testcontainers Native**: Purpose-built for blazing-fast integration testing with Java, Rust, Go, or Python testcontainers.

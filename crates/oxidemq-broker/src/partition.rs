@@ -159,6 +159,10 @@ impl Partition {
         self.stream.start_offset()
     }
 
+    pub fn advance_log_start_offset(&self, new_offset: i64) -> i64 {
+        self.stream.advance_start_offset(new_offset)
+    }
+
     pub fn complete_txn(&self, producer_id: i64) {
         self.ongoing_txns.write().remove(&producer_id);
     }

@@ -145,6 +145,11 @@ impl ApiVersionsResponse {
                 max_version: 3,
             }, // DeleteTopics
             ApiVersionKey {
+                api_key: 21,
+                min_version: 0,
+                max_version: 2,
+            }, // DeleteRecords
+            ApiVersionKey {
                 api_key: 22,
                 min_version: 0,
                 max_version: 4,
@@ -194,6 +199,11 @@ impl ApiVersionsResponse {
                 min_version: 0,
                 max_version: 2,
             }, // SaslAuthenticate
+            ApiVersionKey {
+                api_key: 37,
+                min_version: 0,
+                max_version: 2,
+            }, // CreatePartitions
             ApiVersionKey {
                 api_key: 42,
                 min_version: 0,
@@ -4424,6 +4434,357 @@ impl DeleteGroupsResponse {
     }
 }
 
+// ---------------------------------------------------------------------------
+// ApiKey 21: DeleteRecords
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRecordsPartition {
+    pub partition_index: i32,
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRecordsTopic {
+    pub name: String,
+    pub partitions: Vec<DeleteRecordsPartition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRecordsRequest {
+    pub topics: Vec<DeleteRecordsTopic>,
+    pub timeout_ms: i32,
+}
+
+impl DeleteRecordsRequest {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol(
+                "Truncated DeleteRecords topics count".into(),
+            ));
+        }
+        let topics_count = src.get_i32();
+        if topics_count < 0 {
+            return Err(OxideMqError::Protocol(
+                "Negative DeleteRecords topics count".into(),
+            ));
+        }
+        let mut topics = Vec::with_capacity(topics_count as usize);
+        for _ in 0..topics_count {
+            let name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol(
+                    "Truncated DeleteRecords partitions count".into(),
+                ));
+            }
+            let part_count = src.get_i32();
+            if part_count < 0 {
+                return Err(OxideMqError::Protocol(
+                    "Negative DeleteRecords partitions count".into(),
+                ));
+            }
+            let mut partitions = Vec::with_capacity(part_count as usize);
+            for _ in 0..part_count {
+                if src.len() < 12 {
+                    return Err(OxideMqError::Protocol(
+                        "Truncated DeleteRecords partition item".into(),
+                    ));
+                }
+                let partition_index = src.get_i32();
+                let offset = src.get_i64();
+                partitions.push(DeleteRecordsPartition {
+                    partition_index,
+                    offset,
+                });
+            }
+            topics.push(DeleteRecordsTopic { name, partitions });
+        }
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol(
+                "Truncated DeleteRecords timeout_ms".into(),
+            ));
+        }
+        let timeout_ms = src.get_i32();
+        Ok(Self { topics, timeout_ms })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.topics.len() as i32);
+        for t in &self.topics {
+            KafkaEncoder::write_string(dst, Some(&t.name));
+            dst.put_i32(t.partitions.len() as i32);
+            for p in &t.partitions {
+                dst.put_i32(p.partition_index);
+                dst.put_i64(p.offset);
+            }
+        }
+        dst.put_i32(self.timeout_ms);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRecordsPartitionResult {
+    pub partition_index: i32,
+    pub low_watermark: i64,
+    pub error_code: KafkaErrorCode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRecordsTopicResult {
+    pub name: String,
+    pub partitions: Vec<DeleteRecordsPartitionResult>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeleteRecordsResponse {
+    pub throttle_time_ms: i32,
+    pub topics: Vec<DeleteRecordsTopicResult>,
+}
+
+impl DeleteRecordsResponse {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        if src.len() < 8 {
+            return Err(OxideMqError::Protocol(
+                "Truncated DeleteRecordsResponse header".into(),
+            ));
+        }
+        let throttle_time_ms = src.get_i32();
+        let topics_count = src.get_i32();
+        if topics_count < 0 {
+            return Err(OxideMqError::Protocol(
+                "Negative DeleteRecordsResponse topics count".into(),
+            ));
+        }
+        let mut topics = Vec::with_capacity(topics_count as usize);
+        for _ in 0..topics_count {
+            let name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            if src.len() < 4 {
+                return Err(OxideMqError::Protocol(
+                    "Truncated DeleteRecordsResponse partitions count".into(),
+                ));
+            }
+            let part_count = src.get_i32();
+            if part_count < 0 {
+                return Err(OxideMqError::Protocol(
+                    "Negative DeleteRecordsResponse partitions count".into(),
+                ));
+            }
+            let mut partitions = Vec::with_capacity(part_count as usize);
+            for _ in 0..part_count {
+                if src.len() < 14 {
+                    return Err(OxideMqError::Protocol(
+                        "Truncated DeleteRecordsResponse partition item".into(),
+                    ));
+                }
+                let partition_index = src.get_i32();
+                let low_watermark = src.get_i64();
+                let error_code = KafkaErrorCode::from_i16(src.get_i16());
+                partitions.push(DeleteRecordsPartitionResult {
+                    partition_index,
+                    low_watermark,
+                    error_code,
+                });
+            }
+            topics.push(DeleteRecordsTopicResult { name, partitions });
+        }
+        Ok(Self {
+            throttle_time_ms,
+            topics,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.throttle_time_ms);
+        dst.put_i32(self.topics.len() as i32);
+        for t in &self.topics {
+            KafkaEncoder::write_string(dst, Some(&t.name));
+            dst.put_i32(t.partitions.len() as i32);
+            for p in &t.partitions {
+                dst.put_i32(p.partition_index);
+                dst.put_i64(p.low_watermark);
+                dst.put_i16(p.error_code.code());
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ApiKey 37: CreatePartitions
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePartitionsAssignment {
+    pub broker_ids: Vec<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePartitionsTopic {
+    pub name: String,
+    pub count: i32,
+    pub assignments: Option<Vec<CreatePartitionsAssignment>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePartitionsRequest {
+    pub topic_partitions: Vec<CreatePartitionsTopic>,
+    pub timeout_ms: i32,
+    pub validate_only: bool,
+}
+
+impl CreatePartitionsRequest {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol(
+                "Truncated CreatePartitionsRequest topics count".into(),
+            ));
+        }
+        let topics_count = src.get_i32();
+        if topics_count < 0 {
+            return Err(OxideMqError::Protocol(
+                "Negative CreatePartitionsRequest topics count".into(),
+            ));
+        }
+        let mut topic_partitions = Vec::with_capacity(topics_count as usize);
+        for _ in 0..topics_count {
+            let name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            if src.len() < 8 {
+                return Err(OxideMqError::Protocol(
+                    "Truncated CreatePartitionsTopic count or assignments".into(),
+                ));
+            }
+            let count = src.get_i32();
+            let assign_count = src.get_i32();
+            let assignments = if assign_count < 0 {
+                None
+            } else {
+                let mut list = Vec::with_capacity(assign_count as usize);
+                for _ in 0..assign_count {
+                    if src.len() < 4 {
+                        return Err(OxideMqError::Protocol(
+                            "Truncated CreatePartitions assignment broker count".into(),
+                        ));
+                    }
+                    let b_count = src.get_i32();
+                    let b_count = if b_count < 0 { 0 } else { b_count as usize };
+                    if src.len() < b_count * 4 {
+                        return Err(OxideMqError::Protocol(
+                            "Truncated CreatePartitions assignment broker ids".into(),
+                        ));
+                    }
+                    let mut broker_ids = Vec::with_capacity(b_count);
+                    for _ in 0..b_count {
+                        broker_ids.push(src.get_i32());
+                    }
+                    list.push(CreatePartitionsAssignment { broker_ids });
+                }
+                Some(list)
+            };
+            topic_partitions.push(CreatePartitionsTopic {
+                name,
+                count,
+                assignments,
+            });
+        }
+        if src.len() < 4 {
+            return Err(OxideMqError::Protocol(
+                "Truncated CreatePartitions timeout_ms".into(),
+            ));
+        }
+        let timeout_ms = src.get_i32();
+        let validate_only = if src.has_remaining() {
+            src.get_u8() != 0
+        } else {
+            false
+        };
+        Ok(Self {
+            topic_partitions,
+            timeout_ms,
+            validate_only,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.topic_partitions.len() as i32);
+        for t in &self.topic_partitions {
+            KafkaEncoder::write_string(dst, Some(&t.name));
+            dst.put_i32(t.count);
+            if let Some(assignments) = &t.assignments {
+                dst.put_i32(assignments.len() as i32);
+                for a in assignments {
+                    dst.put_i32(a.broker_ids.len() as i32);
+                    for b in &a.broker_ids {
+                        dst.put_i32(*b);
+                    }
+                }
+            } else {
+                dst.put_i32(-1);
+            }
+        }
+        dst.put_i32(self.timeout_ms);
+        dst.put_u8(if self.validate_only { 1 } else { 0 });
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePartitionsTopicResult {
+    pub name: String,
+    pub error_code: KafkaErrorCode,
+    pub error_message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CreatePartitionsResponse {
+    pub throttle_time_ms: i32,
+    pub results: Vec<CreatePartitionsTopicResult>,
+}
+
+impl CreatePartitionsResponse {
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        if src.len() < 8 {
+            return Err(OxideMqError::Protocol(
+                "Truncated CreatePartitionsResponse header".into(),
+            ));
+        }
+        let throttle_time_ms = src.get_i32();
+        let results_count = src.get_i32();
+        if results_count < 0 {
+            return Err(OxideMqError::Protocol(
+                "Negative CreatePartitionsResponse results count".into(),
+            ));
+        }
+        let mut results = Vec::with_capacity(results_count as usize);
+        for _ in 0..results_count {
+            let name = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            if src.len() < 2 {
+                return Err(OxideMqError::Protocol(
+                    "Truncated CreatePartitionsResponse error_code".into(),
+                ));
+            }
+            let error_code = KafkaErrorCode::from_i16(src.get_i16());
+            let error_message = KafkaDecoder::read_string(src)?;
+            results.push(CreatePartitionsTopicResult {
+                name,
+                error_code,
+                error_message,
+            });
+        }
+        Ok(Self {
+            throttle_time_ms,
+            results,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i32(self.throttle_time_ms);
+        dst.put_i32(self.results.len() as i32);
+        for r in &self.results {
+            KafkaEncoder::write_string(dst, Some(&r.name));
+            dst.put_i16(r.error_code.code());
+            KafkaEncoder::write_string(dst, r.error_message.as_deref());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5726,6 +6087,183 @@ mod tests {
             assert_eq!(
                 decoded.results[1].error_code,
                 KafkaErrorCode::GroupIdNotFound
+            );
+        }
+    }
+
+    #[test]
+    fn test_delete_records_and_create_partitions_codec() {
+        // DeleteRecords
+        let del_rec_req = DeleteRecordsRequest {
+            topics: vec![
+                DeleteRecordsTopic {
+                    name: "orders".into(),
+                    partitions: vec![
+                        DeleteRecordsPartition {
+                            partition_index: 0,
+                            offset: 100,
+                        },
+                        DeleteRecordsPartition {
+                            partition_index: 1,
+                            offset: 250,
+                        },
+                    ],
+                },
+                DeleteRecordsTopic {
+                    name: "payments".into(),
+                    partitions: vec![DeleteRecordsPartition {
+                        partition_index: 0,
+                        offset: -1,
+                    }],
+                },
+            ],
+            timeout_ms: 5000,
+        };
+
+        for v in [0, 1, 2] {
+            let mut buf = BytesMut::new();
+            del_rec_req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = DeleteRecordsRequest::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.timeout_ms, 5000);
+            assert_eq!(decoded.topics.len(), 2);
+            assert_eq!(decoded.topics[0].name, "orders");
+            assert_eq!(decoded.topics[0].partitions.len(), 2);
+            assert_eq!(decoded.topics[0].partitions[0].partition_index, 0);
+            assert_eq!(decoded.topics[0].partitions[0].offset, 100);
+            assert_eq!(decoded.topics[0].partitions[1].partition_index, 1);
+            assert_eq!(decoded.topics[0].partitions[1].offset, 250);
+            assert_eq!(decoded.topics[1].name, "payments");
+            assert_eq!(decoded.topics[1].partitions[0].offset, -1);
+        }
+
+        let del_rec_resp = DeleteRecordsResponse {
+            throttle_time_ms: 12,
+            topics: vec![DeleteRecordsTopicResult {
+                name: "orders".into(),
+                partitions: vec![
+                    DeleteRecordsPartitionResult {
+                        partition_index: 0,
+                        low_watermark: 100,
+                        error_code: KafkaErrorCode::None,
+                    },
+                    DeleteRecordsPartitionResult {
+                        partition_index: 1,
+                        low_watermark: -1,
+                        error_code: KafkaErrorCode::OffsetOutOfRange,
+                    },
+                ],
+            }],
+        };
+
+        for v in [0, 1, 2] {
+            let mut buf = BytesMut::new();
+            del_rec_resp.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = DeleteRecordsResponse::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.throttle_time_ms, 12);
+            assert_eq!(decoded.topics.len(), 1);
+            assert_eq!(decoded.topics[0].name, "orders");
+            assert_eq!(decoded.topics[0].partitions.len(), 2);
+            assert_eq!(decoded.topics[0].partitions[0].low_watermark, 100);
+            assert_eq!(
+                decoded.topics[0].partitions[0].error_code,
+                KafkaErrorCode::None
+            );
+            assert_eq!(decoded.topics[0].partitions[1].low_watermark, -1);
+            assert_eq!(
+                decoded.topics[0].partitions[1].error_code,
+                KafkaErrorCode::OffsetOutOfRange
+            );
+        }
+
+        // CreatePartitions
+        let cp_req = CreatePartitionsRequest {
+            topic_partitions: vec![
+                CreatePartitionsTopic {
+                    name: "orders".into(),
+                    count: 5,
+                    assignments: Some(vec![
+                        CreatePartitionsAssignment {
+                            broker_ids: vec![0],
+                        },
+                        CreatePartitionsAssignment {
+                            broker_ids: vec![0],
+                        },
+                    ]),
+                },
+                CreatePartitionsTopic {
+                    name: "analytics".into(),
+                    count: 8,
+                    assignments: None,
+                },
+            ],
+            timeout_ms: 3000,
+            validate_only: true,
+        };
+
+        for v in [0, 1, 2] {
+            let mut buf = BytesMut::new();
+            cp_req.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = CreatePartitionsRequest::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.timeout_ms, 3000);
+            assert!(decoded.validate_only);
+            assert_eq!(decoded.topic_partitions.len(), 2);
+            assert_eq!(decoded.topic_partitions[0].name, "orders");
+            assert_eq!(decoded.topic_partitions[0].count, 5);
+            assert_eq!(
+                decoded.topic_partitions[0].assignments,
+                Some(vec![
+                    CreatePartitionsAssignment {
+                        broker_ids: vec![0]
+                    },
+                    CreatePartitionsAssignment {
+                        broker_ids: vec![0]
+                    },
+                ])
+            );
+            assert_eq!(decoded.topic_partitions[1].name, "analytics");
+            assert_eq!(decoded.topic_partitions[1].count, 8);
+            assert_eq!(decoded.topic_partitions[1].assignments, None);
+        }
+
+        let cp_resp = CreatePartitionsResponse {
+            throttle_time_ms: 45,
+            results: vec![
+                CreatePartitionsTopicResult {
+                    name: "orders".into(),
+                    error_code: KafkaErrorCode::None,
+                    error_message: None,
+                },
+                CreatePartitionsTopicResult {
+                    name: "analytics".into(),
+                    error_code: KafkaErrorCode::InvalidPartitions,
+                    error_message: Some(
+                        "Number of partitions must be greater than existing".into(),
+                    ),
+                },
+            ],
+        };
+
+        for v in [0, 1, 2] {
+            let mut buf = BytesMut::new();
+            cp_resp.encode(&mut buf, v);
+            let mut read_buf = buf.freeze();
+            let decoded = CreatePartitionsResponse::decode(&mut read_buf, v).unwrap();
+            assert_eq!(decoded.throttle_time_ms, 45);
+            assert_eq!(decoded.results.len(), 2);
+            assert_eq!(decoded.results[0].name, "orders");
+            assert_eq!(decoded.results[0].error_code, KafkaErrorCode::None);
+            assert_eq!(decoded.results[0].error_message, None);
+            assert_eq!(decoded.results[1].name, "analytics");
+            assert_eq!(
+                decoded.results[1].error_code,
+                KafkaErrorCode::InvalidPartitions
+            );
+            assert_eq!(
+                decoded.results[1].error_message.as_deref(),
+                Some("Number of partitions must be greater than existing")
             );
         }
     }
