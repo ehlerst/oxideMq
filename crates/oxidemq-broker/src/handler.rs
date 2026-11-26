@@ -24,13 +24,16 @@ use oxidemq_protocol::messages::{
     EndTxnResponse, FetchPartitionResponse, FetchRequest, FetchResponse, FetchTopicResponse,
     FindCoordinatorRequest, FindCoordinatorResponse, HeartbeatRequest, HeartbeatResponse,
     InitProducerIdRequest, InitProducerIdResponse, LeaveGroupRequest, LeaveGroupResponse,
+    LeaderAndIsrRequest, LeaderAndIsrResponse, LiveLeader, 
     ListGroupsRequest, ListGroupsResponse, ListOffsetsPartitionResponse, ListOffsetsRequest,
     ListOffsetsResponse, ListOffsetsTopicResponse, MetadataRequest, OffsetCommitPartitionResponse,
     OffsetCommitRequest, OffsetCommitResponse, OffsetCommitTopicResponse,
     OffsetFetchPartitionResponse, OffsetFetchRequest, OffsetFetchResponse,
     OffsetFetchTopicResponse, PartitionProduceResponse, ProduceRequest, ProduceResponse,
     SaslAuthenticateRequest, SaslAuthenticateResponse, SaslHandshakeRequest, SaslHandshakeResponse,
-    TopicProduceResponse,
+    StopReplicaRequest, StopReplicaResponse, 
+    TopicProduceResponse, UpdateMetadataRequest, UpdateMetadataResponse,
+    ControlledShutdownRequest, ControlledShutdownResponse,
 };
 use oxidemq_protocol::{AclOperation, AclResourceType, ApiKey, KafkaErrorCode};
 use std::collections::HashMap;
@@ -324,6 +327,76 @@ impl BrokerEngine {
                         topic.partitions.clear();
                     }
                 }
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::LeaderAndIsr => {
+                // TODO: Implement LeaderAndIsr handling logic
+                // This is a placeholder - actual implementation would:
+                // 1. Process the LeaderAndIsr request with partition state information
+                // 2. Update cluster state with new leader information
+                // 3. Return appropriate response with error codes
+                let req = LeaderAndIsrRequest::decode(body, header.api_version)?;
+                let mut partition_errors = Vec::new();
+                
+                // Placeholder response - in a real implementation this would:
+                // - Validate the controller ID and epoch
+                // - Update partition leadership information in cluster state
+                // - Handle offline replicas
+                let resp = LeaderAndIsrResponse::new(
+                    KafkaErrorCode::None,
+                    partition_errors,
+                );
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::StopReplica => {
+                // TODO: Implement StopReplica handling logic  
+                // This is a placeholder - actual implementation would:
+                // 1. Process replica stop requests
+                // 2. Handle partition state changes for stopping replicas
+                // 3. Return appropriate response with error codes
+                let req = StopReplicaRequest::decode(body, header.api_version)?;
+                let mut partition_errors = Vec::new();
+                
+                // Placeholder response - in a real implementation this would:
+                // - Validate the controller ID and epoch  
+                // - Process stop replica requests for specified partitions
+                // - Update partition state accordingly
+                let resp = StopReplicaResponse::new(
+                    KafkaErrorCode::None,
+                    partition_errors,
+                );
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::UpdateMetadata => {
+                // TODO: Implement UpdateMetadata handling logic
+                // This is a placeholder - actual implementation would:
+                // 1. Process metadata update requests  
+                // 2. Update cluster state with new broker and topic information
+                // 3. Return appropriate response with error codes
+                let req = UpdateMetadataRequest::decode(body, header.api_version)?;
+                
+                // Placeholder response - in a real implementation this would:
+                // - Validate the controller ID and epoch
+                // - Process metadata updates for brokers and topics
+                let resp = UpdateMetadataResponse::new(KafkaErrorCode::None);
+                resp.encode(&mut out, header.api_version);
+            }
+            ApiKey::ControlledShutdown => {
+                // TODO: Implement ControlledShutdown handling logic
+                // This is a placeholder - actual implementation would:
+                // 1. Process controlled shutdown requests
+                // 2. Handle graceful broker shutdown sequence
+                // 3. Return appropriate response with shutdown status
+                let req = ControlledShutdownRequest::decode(body, header.api_version)?;
+                
+                // Placeholder response - in a real implementation this would:
+                // - Validate the broker ID and controller epoch
+                // - Process shutdown request for the broker
+                // - Indicate if shutdown is complete
+                let resp = ControlledShutdownResponse::new(
+                    KafkaErrorCode::None,
+                    false, // shutdown_complete - would be set based on actual shutdown state
+                );
                 resp.encode(&mut out, header.api_version);
             }
             ApiKey::Produce => {
