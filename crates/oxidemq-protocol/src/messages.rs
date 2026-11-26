@@ -309,6 +309,537 @@ impl ApiVersionsResponse {
 }
 
 // ==========================================
+// Controller APIs (Keys 4-7)
+// ==========================================
+
+// LeaderAndIsr (Key 4)
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderAndIsrPartitionState {
+    pub topic: String,
+    pub partition: i32,
+    pub controller_epoch: i32,
+    pub leader: i32,
+    pub leader_epoch: i32,
+    pub isr: Vec<i32>,
+    pub zk_version: i32,
+    pub replicas: Vec<i32>,
+    pub offline_replicas: Vec<i32>,
+    pub is_new: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveLeaderEndpoint {
+    pub id: i32,
+    pub host: String,
+    pub port: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderAndIsrRequest {
+    pub controller_id: i32,
+    pub controller_epoch: i32,
+    pub partition_states: Vec<LeaderAndIsrPartitionState>,
+    pub live_leaders: Vec<LiveLeaderEndpoint>,
+}
+
+impl LeaderAndIsrRequest {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let controller_id = src.get_i32();
+        let controller_epoch = src.get_i32();
+
+        let state_count = src.get_i32() as usize;
+        let mut partition_states = Vec::with_capacity(state_count);
+        for _ in 0..state_count {
+            let topic = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            let partition = src.get_i32();
+            let controller_epoch = src.get_i32();
+            let leader = src.get_i32();
+            let leader_epoch = if version >= 2 { src.get_i32() } else { 0 };
+            let isr_count = src.get_i32() as usize;
+            let isr = (0..isr_count).map(|_| src.get_i32()).collect();
+            let zk_version = src.get_i32();
+            let replica_count = src.get_i32() as usize;
+            let replicas = (0..replica_count).map(|_| src.get_i32()).collect();
+            let offline_replicas = if version >= 3 {
+                let count = src.get_i32() as usize;
+                (0..count).map(|_| src.get_i32()).collect()
+            } else {
+                Vec::new()
+            };
+            let is_new = if version >= 1 {
+                src.get_u8() != 0
+            } else {
+                false
+            };
+            partition_states.push(LeaderAndIsrPartitionState {
+                topic,
+                partition,
+                controller_epoch,
+                leader,
+                leader_epoch,
+                isr,
+                zk_version,
+                replicas,
+                offline_replicas,
+                is_new,
+            });
+        }
+
+        let live_leaders = if version == 0 {
+            let leader_count = src.get_i32() as usize;
+            let mut live_leaders = Vec::with_capacity(leader_count);
+            for _ in 0..leader_count {
+                let id = src.get_i32();
+                let host = KafkaDecoder::read_string(src)?.unwrap_or_default();
+                let port = src.get_i32();
+                live_leaders.push(LiveLeaderEndpoint { id, host, port });
+            }
+            live_leaders
+        } else {
+            Vec::new()
+        };
+
+        Ok(Self {
+            controller_id,
+            controller_epoch,
+            partition_states,
+            live_leaders,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        dst.put_i32(self.controller_id);
+        dst.put_i32(self.controller_epoch);
+        dst.put_i32(self.partition_states.len() as i32);
+        for state in &self.partition_states {
+            KafkaEncoder::write_string(dst, Some(&state.topic));
+            dst.put_i32(state.partition);
+            dst.put_i32(state.controller_epoch);
+            dst.put_i32(state.leader);
+            if version >= 2 {
+                dst.put_i32(state.leader_epoch);
+            }
+            dst.put_i32(state.isr.len() as i32);
+            for id in &state.isr {
+                dst.put_i32(*id);
+            }
+            dst.put_i32(state.zk_version);
+            dst.put_i32(state.replicas.len() as i32);
+            for id in &state.replicas {
+                dst.put_i32(*id);
+            }
+            if version >= 3 {
+                dst.put_i32(state.offline_replicas.len() as i32);
+                for id in &state.offline_replicas {
+                    dst.put_i32(*id);
+                }
+            }
+            if version >= 1 {
+                dst.put_u8(state.is_new as u8);
+            }
+        }
+        if version == 0 {
+            dst.put_i32(self.live_leaders.len() as i32);
+            for leader in &self.live_leaders {
+                dst.put_i32(leader.id);
+                KafkaEncoder::write_string(dst, Some(&leader.host));
+                dst.put_i32(leader.port);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaderAndIsrResponse {
+    pub error_code: KafkaErrorCode,
+}
+
+impl LeaderAndIsrResponse {
+    pub fn new(error_code: KafkaErrorCode) -> Self {
+        Self { error_code }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i16(self.error_code.code());
+    }
+
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        let error_code = KafkaErrorCode::from_i16(src.get_i16());
+        Ok(Self { error_code })
+    }
+}
+
+// StopReplica (Key 5)
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopReplicaPartition {
+    pub topic: String,
+    pub partition: i32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopReplicaRequest {
+    pub controller_id: i32,
+    pub controller_epoch: i32,
+    pub delete_partitions: bool,
+    pub partitions: Vec<StopReplicaPartition>,
+}
+
+impl StopReplicaRequest {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let controller_id = src.get_i32();
+        let controller_epoch = src.get_i32();
+        let delete_partitions = if version >= 1 {
+            src.get_u8() != 0
+        } else {
+            false
+        };
+        let count = src.get_i32() as usize;
+        let mut partitions = Vec::with_capacity(count);
+        for _ in 0..count {
+            let topic = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            let partition = src.get_i32();
+            partitions.push(StopReplicaPartition { topic, partition });
+        }
+        Ok(Self {
+            controller_id,
+            controller_epoch,
+            delete_partitions,
+            partitions,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        dst.put_i32(self.controller_id);
+        dst.put_i32(self.controller_epoch);
+        if version >= 1 {
+            dst.put_u8(self.delete_partitions as u8);
+        }
+        dst.put_i32(self.partitions.len() as i32);
+        for partition in &self.partitions {
+            KafkaEncoder::write_string(dst, Some(&partition.topic));
+            dst.put_i32(partition.partition);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopReplicaPartitionError {
+    pub topic: String,
+    pub partition: i32,
+    pub error_code: KafkaErrorCode,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StopReplicaResponse {
+    pub error_code: KafkaErrorCode,
+    pub partition_errors: Vec<StopReplicaPartitionError>,
+}
+
+impl StopReplicaResponse {
+    pub fn new(
+        error_code: KafkaErrorCode,
+        partition_errors: Vec<StopReplicaPartitionError>,
+    ) -> Self {
+        Self {
+            error_code,
+            partition_errors,
+        }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        dst.put_i16(self.error_code.code());
+        if version >= 1 {
+            dst.put_i32(self.partition_errors.len() as i32);
+            for error in &self.partition_errors {
+                KafkaEncoder::write_string(dst, Some(&error.topic));
+                dst.put_i32(error.partition);
+                dst.put_i16(error.error_code.code());
+            }
+        }
+    }
+
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let error_code = KafkaErrorCode::from_i16(src.get_i16());
+        let partition_errors = if version >= 1 {
+            let count = src.get_i32() as usize;
+            let mut partition_errors = Vec::with_capacity(count);
+            for _ in 0..count {
+                let topic = KafkaDecoder::read_string(src)?.unwrap_or_default();
+                let partition = src.get_i32();
+                let error_code = KafkaErrorCode::from_i16(src.get_i16());
+                partition_errors.push(StopReplicaPartitionError {
+                    topic,
+                    partition,
+                    error_code,
+                });
+            }
+            partition_errors
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            error_code,
+            partition_errors,
+        })
+    }
+}
+
+// UpdateMetadata (Key 6)
+
+/// Leader of a partition in an UpdateMetadata request: -1 means there is no
+/// elected leader yet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveLeader {
+    Broker(i32),
+    NoLeader,
+}
+
+impl LiveLeader {
+    fn from_i32(leader: i32) -> Self {
+        if leader < 0 {
+            Self::NoLeader
+        } else {
+            Self::Broker(leader)
+        }
+    }
+
+    fn to_i32(self) -> i32 {
+        match self {
+            Self::Broker(id) => id,
+            Self::NoLeader => -1,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateMetadataPartitionState {
+    pub topic: String,
+    pub partition: i32,
+    pub controller_epoch: i32,
+    pub leader: LiveLeader,
+    pub leader_epoch: i32,
+    pub isr: Vec<i32>,
+    pub zk_version: i32,
+    pub offline_replicas: Vec<i32>,
+    pub replicas: Vec<i32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateMetadataEndpoint {
+    pub host: String,
+    pub port: i32,
+    pub security_protocol: i8,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateMetadataBroker {
+    pub id: i32,
+    pub endpoints: Vec<UpdateMetadataEndpoint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateMetadataRequest {
+    pub controller_id: i32,
+    pub controller_epoch: i32,
+    pub partition_states: Vec<UpdateMetadataPartitionState>,
+    pub live_brokers: Vec<UpdateMetadataBroker>,
+}
+
+impl UpdateMetadataRequest {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let controller_id = src.get_i32();
+        let controller_epoch = src.get_i32();
+
+        let state_count = src.get_i32() as usize;
+        let mut partition_states = Vec::with_capacity(state_count);
+        for _ in 0..state_count {
+            let topic = KafkaDecoder::read_string(src)?.unwrap_or_default();
+            let partition = src.get_i32();
+            let controller_epoch = src.get_i32();
+            let leader = LiveLeader::from_i32(src.get_i32());
+            let leader_epoch = if version >= 2 { src.get_i32() } else { 0 };
+            let isr_count = src.get_i32() as usize;
+            let isr = (0..isr_count).map(|_| src.get_i32()).collect();
+            let zk_version = src.get_i32();
+            let offline_replicas = if version >= 2 {
+                let count = src.get_i32() as usize;
+                (0..count).map(|_| src.get_i32()).collect()
+            } else {
+                Vec::new()
+            };
+            let replica_count = src.get_i32() as usize;
+            let replicas = (0..replica_count).map(|_| src.get_i32()).collect();
+            partition_states.push(UpdateMetadataPartitionState {
+                topic,
+                partition,
+                controller_epoch,
+                leader,
+                leader_epoch,
+                isr,
+                zk_version,
+                offline_replicas,
+                replicas,
+            });
+        }
+
+        let broker_count = src.get_i32() as usize;
+        let mut live_brokers = Vec::with_capacity(broker_count);
+        for _ in 0..broker_count {
+            let id = src.get_i32();
+            let endpoint_count = src.get_i32() as usize;
+            let mut endpoints = Vec::with_capacity(endpoint_count);
+            for _ in 0..endpoint_count {
+                let host = KafkaDecoder::read_string(src)?.unwrap_or_default();
+                let port = src.get_i32();
+                let security_protocol = if version >= 1 { src.get_i8() } else { 0 };
+                endpoints.push(UpdateMetadataEndpoint {
+                    host,
+                    port,
+                    security_protocol,
+                });
+            }
+            live_brokers.push(UpdateMetadataBroker { id, endpoints });
+        }
+
+        Ok(Self {
+            controller_id,
+            controller_epoch,
+            partition_states,
+            live_brokers,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        dst.put_i32(self.controller_id);
+        dst.put_i32(self.controller_epoch);
+        dst.put_i32(self.partition_states.len() as i32);
+        for state in &self.partition_states {
+            KafkaEncoder::write_string(dst, Some(&state.topic));
+            dst.put_i32(state.partition);
+            dst.put_i32(state.controller_epoch);
+            dst.put_i32(state.leader.to_i32());
+            if version >= 2 {
+                dst.put_i32(state.leader_epoch);
+            }
+            dst.put_i32(state.isr.len() as i32);
+            for id in &state.isr {
+                dst.put_i32(*id);
+            }
+            dst.put_i32(state.zk_version);
+            if version >= 2 {
+                dst.put_i32(state.offline_replicas.len() as i32);
+                for id in &state.offline_replicas {
+                    dst.put_i32(*id);
+                }
+            }
+            dst.put_i32(state.replicas.len() as i32);
+            for id in &state.replicas {
+                dst.put_i32(*id);
+            }
+        }
+        dst.put_i32(self.live_brokers.len() as i32);
+        for broker in &self.live_brokers {
+            dst.put_i32(broker.id);
+            dst.put_i32(broker.endpoints.len() as i32);
+            for endpoint in &broker.endpoints {
+                KafkaEncoder::write_string(dst, Some(&endpoint.host));
+                dst.put_i32(endpoint.port);
+                if version >= 1 {
+                    dst.put_i8(endpoint.security_protocol);
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UpdateMetadataResponse {
+    pub error_code: KafkaErrorCode,
+}
+
+impl UpdateMetadataResponse {
+    pub fn new(error_code: KafkaErrorCode) -> Self {
+        Self { error_code }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, _version: i16) {
+        dst.put_i16(self.error_code.code());
+    }
+
+    pub fn decode(src: &mut Bytes, _version: i16) -> Result<Self> {
+        let error_code = KafkaErrorCode::from_i16(src.get_i16());
+        Ok(Self { error_code })
+    }
+}
+
+// ControlledShutdown (Key 7)
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlledShutdownRequest {
+    pub broker_id: i32,
+    pub broker_epoch: i64,
+}
+
+impl ControlledShutdownRequest {
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let broker_id = src.get_i32();
+        let broker_epoch = if version >= 1 { src.get_i64() } else { 0 };
+        Ok(Self {
+            broker_id,
+            broker_epoch,
+        })
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        dst.put_i32(self.broker_id);
+        if version >= 1 {
+            dst.put_i64(self.broker_epoch);
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlledShutdownResponse {
+    pub error_code: KafkaErrorCode,
+    pub remaining_brokers: Vec<i32>,
+}
+
+impl ControlledShutdownResponse {
+    pub fn new(error_code: KafkaErrorCode, remaining_brokers: Vec<i32>) -> Self {
+        Self {
+            error_code,
+            remaining_brokers,
+        }
+    }
+
+    pub fn encode(&self, dst: &mut BytesMut, version: i16) {
+        dst.put_i16(self.error_code.code());
+        if version >= 1 {
+            dst.put_i32(self.remaining_brokers.len() as i32);
+            for id in &self.remaining_brokers {
+                dst.put_i32(*id);
+            }
+        }
+    }
+
+    pub fn decode(src: &mut Bytes, version: i16) -> Result<Self> {
+        let error_code = KafkaErrorCode::from_i16(src.get_i16());
+        let remaining_brokers = if version >= 1 {
+            let count = src.get_i32() as usize;
+            (0..count).map(|_| src.get_i32()).collect()
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            error_code,
+            remaining_brokers,
+        })
+    }
+}
+
+// ==========================================
 // Metadata (Key 3)
 // ==========================================
 
