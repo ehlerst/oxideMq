@@ -209,6 +209,27 @@ impl ApiVersionsResponse {
                 min_version: 0,
                 max_version: 2,
             }, // DeleteGroups
+            // Added for Kafka protocol compliance
+            ApiVersionKey {
+                api_key: 4,
+                min_version: 0,
+                max_version: 3,
+            }, // LeaderAndIsr
+            ApiVersionKey {
+                api_key: 5,
+                min_version: 0,
+                max_version: 1,
+            }, // StopReplica
+            ApiVersionKey {
+                api_key: 6,
+                min_version: 0,
+                max_version: 2,
+            }, // UpdateMetadata
+            ApiVersionKey {
+                api_key: 7,
+                min_version: 0,
+                max_version: 1,
+            }, // ControlledShutdown
         ];
         Self::new(KafkaErrorCode::None, keys)
     }
