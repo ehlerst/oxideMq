@@ -349,7 +349,7 @@ impl BrokerEngine {
                 // 2. Handle partition state changes for stopping replicas
                 // 3. Return appropriate response with error codes
                 let _req = StopReplicaRequest::decode(body, header.api_version)?;
-                let mut partition_errors = Vec::new();
+                let partition_errors = Vec::new();
 
                 // Placeholder response - in a real implementation this would:
                 // - Validate the controller ID and epoch
@@ -378,7 +378,7 @@ impl BrokerEngine {
                 // 1. Process controlled shutdown requests
                 // 2. Handle graceful broker shutdown sequence
                 // 3. Return appropriate response with shutdown status
-                let req = ControlledShutdownRequest::decode(body, header.api_version)?;
+                let _req = ControlledShutdownRequest::decode(body, header.api_version)?;
 
                 // Placeholder response - in a real implementation this would:
                 // - Validate the broker ID and controller epoch
